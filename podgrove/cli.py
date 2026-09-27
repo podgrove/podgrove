@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 from contextlib import ExitStack
-import hashlib
 import json
 import os
 import shlex
@@ -18,6 +17,7 @@ from . import __version__, state
 from .compose import Compose
 from .config import default_tainted_nodes, load_cluster, load_config, storage_class_name
 from .errors import PodgroveError
+from .fingerprint import FORMAT as FINGERPRINT_FORMAT, launch_fingerprint
 from .forward import port_plan
 from .kube import Kube, context_name, manifests, namespace_name, resolve_namespace
 from .process import docker_environment
@@ -166,12 +166,7 @@ def up(args, root: Path) -> int:
     compose = Compose(config)
     model = compose.model()
     compose.validate(model)
-    fingerprint_inputs = {"model": model, "forward": config.forward,
-                          "ttl": config.ttl_seconds, "network": config.network}
-    # An absent new optional setting must not refresh an unchanged legacy stack.
-    if config.sync_exclude:
-        fingerprint_inputs["sync_exclude"] = config.sync_exclude
-    fingerprint = hashlib.sha256(json.dumps(fingerprint_inputs, sort_keys=True).encode()).hexdigest()
+    fingerprint = launch_fingerprint(model, config)
     ident = state.identity(root)
     # Validate all constraints including forwarding before any Kubernetes mutation.
     if args.mr_url:
@@ -236,7 +231,8 @@ def up(args, root: Path) -> int:
                 if ping is not None and (not isinstance(ping, dict) or ping.get("ok") is not True):
                     raise PodgroveError("Session is stopping or rejected the control request; retry up after it stops")
                 health = observed(old, connected=True, ping=ping)
-                changed = (old.get("compose_fingerprint") and old["compose_fingerprint"] != fingerprint) or args.mr_url != old.get("mr_url", "")
+                changed = (bool(old.get("compose_fingerprint")) and not fingerprint.matches(
+                    old["compose_fingerprint"], old.get("compose_fingerprint_format"))) or args.mr_url != old.get("mr_url", "")
                 if not args.refresh and not changed and health["forward_status"]["state"] != "disconnected":
                     print_state(health, args.json)
                     return 0 if health["status"] == "ready" else 1
@@ -270,7 +266,8 @@ def up(args, root: Path) -> int:
                 "network": config.network,
                 "resources": budget, "init_resources": init_budget,
                 "storage": {"size": storage_size, "storage_class": effective_storage_class},
-                "compose_fingerprint": fingerprint,
+                "compose_fingerprint": fingerprint.digest, "compose_fingerprint_format": FINGERPRINT_FORMAT,
+                "podgrove_version": __version__,
                 "created_at": time.time()}
         state.write(path, data)
         try:

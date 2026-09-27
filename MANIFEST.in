@@ -53,6 +53,7 @@ include podgrove/compose.py
 include podgrove/config.py
 include podgrove/docker_tunnel.py
 include podgrove/errors.py
+include podgrove/fingerprint.py
 include podgrove/forward.py
 include podgrove/kube.py
 include podgrove/network.py
@@ -125,6 +126,7 @@ include tests/test_dogfood_cli.py
 include tests/test_dogfood_review.py
 include tests/test_e2e_harness.py
 include tests/test_exec_half_close.py
+include tests/test_fingerprint.py
 include tests/test_forward.py
 include tests/test_forward_recovery.py
 include tests/test_install_release.py
