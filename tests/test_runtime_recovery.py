@@ -155,6 +155,8 @@ def test_verification_outage_is_visible_without_disconnecting_control_or_endpoin
     assert snapshot["forward_status"]["state"] == "ready"
     echo(session.port)
     session.api.snapshot.return_value = {**diagnostics, "verification": {"state": "verified", "age_seconds": 0}}
+    runtime.control(session.data, "touch")
+    wait_until(lambda: state.read(session.path)["status"] == "ready")
     ping = runtime.control(session.data, "ping")
     snapshot = observed(state.read(session.path), connected=True, ping=ping)
     assert snapshot["status"] == "ready"
