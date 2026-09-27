@@ -93,6 +93,7 @@ include scripts/install_release.py
 include scripts/prepare_public.py
 include scripts/publish_release.py
 include scripts/resolve_release.py
+include scripts/soak_forwarding.py
 include scripts/verify_docs.py
 include scripts/verify_loop.py
 include scripts/verify_package.py
@@ -161,6 +162,7 @@ include tests/test_resources.py
 include tests/test_runtime.py
 include tests/test_runtime_cleanup_review.py
 include tests/test_runtime_recovery.py
+include tests/test_soak_forwarding.py
 include tests/test_startup_cancel.py
 include tests/test_state.py
 include tests/test_storage_public.py
