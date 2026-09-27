@@ -22,6 +22,43 @@ SPEC.loader.exec_module(soak)
 
 
 @pytest.fixture
+def runner_clock(monkeypatch):
+    """Advance mocked runner observations on waits, independently of CI load.
+
+    Only runner-level tests request this fixture. Real socket and subprocess
+    deadline tests keep the actual time module and threading.Event behavior.
+    """
+    class ClockEvent:
+        elapsed = 0.0
+        wall = 100.0
+        stopped = False
+
+        def monotonic(self):
+            return self.elapsed
+
+        def time(self):
+            return self.wall
+
+        def is_set(self):
+            return self.stopped
+
+        def set(self):
+            self.stopped = True
+
+        def wait(self, timeout):
+            if not self.stopped:
+                assert timeout >= 0
+                self.elapsed += timeout
+                self.wall += timeout
+            return self.stopped
+
+    clock = ClockEvent()
+    # Replace this loaded script's reference, not the shared stdlib module.
+    monkeypatch.setattr(soak, "time", clock)
+    return clock
+
+
+@pytest.fixture
 def fixture(tmp_path):
     project = (tmp_path / "project").resolve()
     project.mkdir()
@@ -73,13 +110,13 @@ def read_result(args):
     return json.loads((args.output / "result.json").read_text())
 
 
-def test_short_run_records_private_evidence_without_claiming_four_hours(fixture, monkeypatch):
+def test_short_run_records_private_evidence_without_claiming_four_hours(fixture, monkeypatch, runner_clock):
     args, *_ = mocked_observations(monkeypatch, fixture)
-    assert soak.run(args, threading.Event()) == 0
+    assert soak.run(args, runner_clock) == 0
     result = read_result(args)
     assert result["passed"] and not result["four_hour_proof"]
     assert result["elapsed_seconds"] >= args.duration
-    assert result["counts"]["http"] >= 2 and result["counts"]["status"] >= 2 and result["counts"]["errors"] == 0
+    assert result["counts"]["http"] == 4 and result["counts"]["status"] == 4 and result["counts"]["errors"] == 0
     assert result["binary"]["editable"] is False and result["resource_uids"]["pod"] == "pod-uid"
     assert args.output.stat().st_mode & 0o777 == 0o700
     for path in args.output.iterdir():
@@ -89,21 +126,22 @@ def test_short_run_records_private_evidence_without_claiming_four_hours(fixture,
     rows = [json.loads(line) for line in (args.output / "samples.jsonl").read_text().splitlines()]
     assert rows[0]["kind"] == "start" and rows[-1]["kind"] == "end"
     assert all("utc" in row and "elapsed_seconds" in row for row in rows)
+    assert [row["elapsed_seconds"] for row in rows if row["kind"] == "http"] == pytest.approx([0, .02, .04, .06])
 
 
-def test_existing_evidence_directory_is_never_reused(fixture, monkeypatch):
+def test_existing_evidence_directory_is_never_reused(fixture, monkeypatch, runner_clock):
     args, *_ = fixture
     args.output.mkdir()
     (args.output / "keep").write_text("original")
     monkeypatch.setattr(soak, "binary_proof", Mock(side_effect=AssertionError("Must refuse before observations")))
     with pytest.raises(FileExistsError):
-        soak.run(args, threading.Event())
+        soak.run(args, runner_clock)
     assert (args.output / "keep").read_text() == "original"
 
 
-def test_http_failure_and_cancellation_never_pass(fixture, monkeypatch):
+def test_http_failure_and_cancellation_never_pass(fixture, monkeypatch, runner_clock):
     args, *_ = mocked_observations(monkeypatch, fixture)
-    stopped = threading.Event()
+    stopped = runner_clock
     def probe(*_):
         stopped.set()
         return False
@@ -115,7 +153,7 @@ def test_http_failure_and_cancellation_never_pass(fixture, monkeypatch):
 
 
 @pytest.mark.parametrize("kind", ["runtime", "uids", "binding"])
-def test_changed_runtime_resource_or_supervisor_fails_closed(fixture, monkeypatch, kind):
+def test_changed_runtime_resource_or_supervisor_fails_closed(fixture, monkeypatch, kind, runner_clock):
     args, data, path, proof, _ = mocked_observations(monkeypatch, fixture)
     if kind == "runtime":
         calls = iter([proof, {**proof, "package_sha256": "changed"}])
@@ -129,7 +167,7 @@ def test_changed_runtime_resource_or_supervisor_fails_closed(fixture, monkeypatc
             path.write_text(json.dumps(data))
             return fixture[-1]
         monkeypatch.setattr(soak, "process_table", processes)
-    assert soak.run(args, threading.Event()) == 1
+    assert soak.run(args, runner_clock) == 1
     assert not read_result(args)["passed"]
 
 
@@ -180,7 +218,7 @@ def test_fault_selection_refuses_any_unproven_process(fixture, change):
         soak.forward_process(table, args, data, path, proof)
 
 
-def test_fault_is_one_exact_child_signal_and_requires_new_healthy_process(fixture, monkeypatch):
+def test_fault_is_one_exact_child_signal_and_requires_new_healthy_process(fixture, monkeypatch, runner_clock):
     args, data, path, proof, table = mocked_observations(monkeypatch, fixture)
     args.duration, args.inject_after = .12, .01
     killed = []
@@ -191,7 +229,7 @@ def test_fault_is_one_exact_child_signal_and_requires_new_healthy_process(fixtur
         data["ports"][0]["status"] = "reconnecting"
         path.write_text(json.dumps(data))
     monkeypatch.setattr(soak.os, "kill", kill)
-    assert soak.run(args, threading.Event()) == 0
+    assert soak.run(args, runner_clock) == 0
     result = read_result(args)
     assert killed == [(12001, signal.SIGTERM)]
     assert result["fault"]["status"] == "recovered" and result["fault"]["replacement"]["pid"] == 13001
@@ -199,7 +237,7 @@ def test_fault_is_one_exact_child_signal_and_requires_new_healthy_process(fixtur
     assert not result["four_hour_proof"]
 
 
-def test_changed_child_between_fault_proofs_is_not_signalled(fixture, monkeypatch):
+def test_changed_child_between_fault_proofs_is_not_signalled(fixture, monkeypatch, runner_clock):
     args, *_ = mocked_observations(monkeypatch, fixture)
     args.inject_after = 0
     calls = 0
@@ -214,7 +252,7 @@ def test_changed_child_between_fault_proofs_is_not_signalled(fixture, monkeypatc
     monkeypatch.setattr(soak, "forward_process", selected)
     kill = Mock(side_effect=AssertionError("No ambiguous process signal"))
     monkeypatch.setattr(soak.os, "kill", kill)
-    assert soak.run(args, threading.Event()) == 1
+    assert soak.run(args, runner_clock) == 1
     assert read_result(args)["fault"]["status"] == "skipped"
     kill.assert_not_called()
 
@@ -474,28 +512,27 @@ def test_trickled_http_headers_have_total_deadline(monkeypatch):
         thread.join(timeout=2)
 
 
-def test_sampling_wall_clock_gap_cannot_be_counted_as_continuous_soak(fixture, monkeypatch):
+def test_sampling_wall_clock_gap_cannot_be_counted_as_continuous_soak(fixture, monkeypatch, runner_clock):
     args, *_ = mocked_observations(monkeypatch, fixture)
-    clock = SimpleNamespace(monotonic=time.monotonic, time=lambda: 100.0)
-    monkeypatch.setattr(soak, "time", clock)
     reads = 0
     def probe(*_):
         nonlocal reads
         reads += 1
         if reads == 2:
-            clock.time = lambda: 1000.0
+            runner_clock.wall += 900
         return True
     monkeypatch.setattr(soak, "http_probe", probe)
-    assert soak.run(args, threading.Event()) == 1
+    assert soak.run(args, runner_clock) == 1
     result = read_result(args)
     assert not result["passed"] and result["max_http_wall_gap_seconds"] >= 900
     assert result["counts"]["errors"] == 1
+    assert reads == 4
 
 
-def test_unexpected_observer_failure_is_recorded_without_secret_exception_payload(fixture, monkeypatch):
+def test_unexpected_observer_failure_is_recorded_without_secret_exception_payload(fixture, monkeypatch, runner_clock):
     args, *_ = mocked_observations(monkeypatch, fixture)
     monkeypatch.setattr(soak, "sample_status", Mock(side_effect=RuntimeError("token=never-persist-this")))
-    assert soak.run(args, threading.Event()) == 1
+    assert soak.run(args, runner_clock) == 1
     assert read_result(args)["counts"]["errors"] == 1
     text = (args.output / "samples.jsonl").read_text()
     assert "RuntimeError" in text and "never-persist-this" not in text
