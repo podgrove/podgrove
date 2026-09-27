@@ -1,0 +1,15 @@
+# Project-specific, non-rewriting checks. Install uv before pre-commit.
+repos:
+  - repo: local
+    hooks:
+      - id: ruff
+        name: Ruff (check only)
+        entry: uv run --locked --extra test ruff check
+        language: system
+        types: [python]
+      - id: public-source
+        name: Reviewed public source guard
+        entry: uv run --locked --extra test python -c 'from pathlib import Path; from scripts.prepare_public import snapshot_sources; snapshot_sources(Path.cwd())'
+        language: system
+        pass_filenames: false
+        always_run: true

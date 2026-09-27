@@ -1,0 +1,2 @@
+# The isolated Podgrove build backend. Runtime versions/hashes live in uv.lock.
+setuptools==84.0.0

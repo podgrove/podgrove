@@ -1,0 +1,15 @@
+name: Feature request
+description: Describe a development workflow Podgrove could improve.
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and current workflow
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired behavior and alternatives
+    validations:
+      required: true

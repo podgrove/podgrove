@@ -1,0 +1,17 @@
+services:
+  api:
+    develop:
+      watch: !override
+        - action: sync+exec
+          path: ./content
+          target: /app/content
+          exec:
+            command:
+              - python
+              - -c
+              - >-
+                import sys,time; from pathlib import Path;
+                time.sleep(2);
+                Path('/app/hook-marker').write_text('hook-completed');
+                print('podgrove-delayed-hook-stdout');
+                sys.stderr.write('podgrove-delayed-hook-stderr\n')

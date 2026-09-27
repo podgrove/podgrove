@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>Podgrove · Worktrees</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/tokens.css">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to worktree</a>
+  <div class="workspace">
+    <aside class="sidebar" aria-label="Worktree navigation">
+      <div class="sidebar-header"><div class="brand" aria-label="Podgrove"><svg class="logo-mark" aria-hidden="true" viewBox="0 0 32 32"><rect x="4" y="4" width="6" height="24" rx="3"/><path d="M14 4h5a9 9 0 0 1 0 18h-5v-6h5a3 3 0 0 0 0-6h-5z"/></svg><span>podgrove</span></div><button id="sidebar-toggle" class="button sidebar-toggle" type="button" aria-label="Collapse sidebar" title="Collapse sidebar" aria-expanded="true" aria-controls="sidebar-content"><svg aria-hidden="true" viewBox="0 0 20 20"><rect x="2" y="3" width="16" height="14" rx="2"/><path d="M7 3v14m6-10-3 3 3 3"/></svg></button></div>
+      <div id="sidebar-content" class="sidebar-content">
+      <div class="sidebar-caption">Your development workspace</div>
+      <button id="nav-toggle" class="button mobile-toggle" aria-label="Worktrees" title="Worktrees" aria-expanded="false" aria-controls="worktree-nav"><svg aria-hidden="true" viewBox="0 0 20 20"><path d="M3 5h14M3 10h14M3 15h14"/></svg></button>
+      <div id="worktree-nav" class="nav-content">
+        <label class="search-box"><svg aria-hidden="true" viewBox="0 0 20 20"><circle cx="8.5" cy="8.5" r="5.5"/><path d="m13 13 4 4"/></svg><input id="search" type="search" placeholder="Find a worktree" aria-label="Find a worktree" autocomplete="off"></label>
+        <div class="nav-heading"><span>Worktrees</span><span id="worktree-count">—</span></div>
+        <nav id="worktrees" aria-label="Worktrees"><p class="muted nav-note">Loading worktrees…</p></nav>
+      </div>
+      </div>
+      <div class="sidebar-bottom"><button id="settings-button" class="settings-button" type="button" aria-label="Configuration" title="Configuration" aria-pressed="false"><svg aria-hidden="true" viewBox="0 0 20 20"><path d="M8 2h4l.5 2 2 1 2-.5 2 3-1.5 1.5v2l1.5 1.5-2 3-2-.5-2 1-.5 2H8l-.5-2-2-1-2 .5-2-3L3 11V9L1.5 7.5l2-3 2 .5 2-1L8 2Z"/><circle cx="10" cy="10" r="3"/></svg><span>Configuration</span></button><footer class="sidebar-footer"><span class="readonly"><svg aria-hidden="true" viewBox="0 0 20 20"><rect x="5" y="9" width="10" height="8" rx="2"/><path d="M7 9V6a3 3 0 0 1 6 0v3"/></svg>Read-only workspace</span><p>Manage environments from your terminal.</p></footer>
+      </div>
+    </aside>
+    <div class="content-shell">
+      <header class="topbar"><div class="title-line"><h1 id="environment-name">Podgrove</h1><span id="environment-state" class="badge" hidden></span></div><div class="toolbar-actions"><button id="theme-toggle" class="button" type="button" aria-label="Switch to dark theme">Dark</button><button id="refresh" class="button" type="button" aria-label="Refresh" title="Refresh"><svg aria-hidden="true" viewBox="0 0 20 20"><path d="M16 7a6 6 0 1 0 .1 6M16 3v4h-4"/></svg><span>Refresh</span></button></div></header>
+      <main id="main" tabindex="-1">
+        <div id="global-error" class="notice error" role="alert" hidden></div>
+        <div id="inventory-warnings" class="notice" hidden></div>
+        <section id="welcome" class="empty-state"><div class="empty-mark" aria-hidden="true">⌘</div><h1>Your worktrees, at a glance.</h1><p id="welcome-message">Loading this machine’s Podgrove environments.</p><code id="start-hint" hidden>podgrove up</code></section>
+        <article id="environment" hidden>
+          <header class="identity-row"><div class="identity-item"><svg aria-hidden="true" viewBox="0 0 20 20"><circle cx="5" cy="4" r="2"/><circle cx="5" cy="16" r="2"/><circle cx="15" cy="4" r="2"/><path d="M5 6v8m0-3h4a6 6 0 0 0 6-5"/></svg><span class="muted">Branch</span><span id="environment-branch">Not available</span></div><div class="identity-item"><svg aria-hidden="true" viewBox="0 0 20 20"><path d="M2 6V4h6l2 2h8v10H2Z"/></svg><span class="muted">Worktree</span><span id="environment-worktree">Not available</span></div><details class="root-details"><summary>View path</summary><p id="environment-root" class="root-path mono"></p><p id="environment-repository" class="root-path"></p></details></header>
+          <div id="detail-error" class="notice error" role="alert" hidden></div>
+          <div id="detail-warnings" class="notice" hidden></div>
+          <dl class="summary"><div><dt>Cluster</dt><dd id="context">Connecting…</dd></div><div><dt>Namespace</dt><dd id="environment-namespace">—</dd></div><div><dt>Namespace mode</dt><dd id="namespace-mode">—</dd></div><div><dt>Nodes</dt><dd id="environment-mode">—</dd></div><div><dt>Running services</dt><dd id="running-count">—</dd></div><div><dt>Persistent storage</dt><dd id="storage-summary">—</dd></div><div><dt>Engine</dt><dd id="engine-summary">—</dd></div></dl>
+          <div class="view-navigation"><div class="tabs" role="tablist" aria-label="Worktree views"><button id="tab-services" class="tab" role="tab" aria-selected="true" aria-controls="panel-services">Services</button><button id="tab-endpoints" class="tab" role="tab" aria-selected="false" aria-controls="panel-endpoints" tabindex="-1">Endpoints</button><button id="tab-storage" class="tab" role="tab" aria-selected="false" aria-controls="panel-storage" tabindex="-1">Storage</button><button id="tab-logs" class="tab" role="tab" aria-selected="false" aria-controls="panel-logs" tabindex="-1">Logs</button><button id="tab-engine" class="tab" role="tab" aria-selected="false" aria-controls="panel-engine" tabindex="-1">Engine</button></div><span id="observed" class="observation">Local snapshot</span></div>
+          <section id="panel-services" class="view-panel" role="tabpanel" aria-labelledby="tab-services"><div class="section-heading"><h2>Compose services</h2><span id="service-total" class="muted"></span></div><div id="services"></div></section>
+          <section id="panel-endpoints" class="view-panel" role="tabpanel" aria-labelledby="tab-endpoints" hidden><div class="section-heading"><h2>Local endpoints</h2><span id="endpoint-total" class="muted" role="status"></span></div><p class="section-description">Saved port forwards for this worktree. Addresses are on this machine; reachability is not checked.</p><label class="search-box endpoint-search"><svg aria-hidden="true" viewBox="0 0 20 20"><circle cx="8.5" cy="8.5" r="5.5"/><path d="m13 13 4 4"/></svg><input id="endpoint-search" type="search" placeholder="Filter by service or port" aria-label="Filter endpoints" autocomplete="off"></label><div id="endpoint-list"></div></section>
+          <section id="panel-storage" class="view-panel" role="tabpanel" aria-labelledby="tab-storage" hidden><div class="section-heading"><h2>Persistent volume claim</h2></div><p class="section-description">The engine’s Docker data, named volumes, and build cache share this claim.</p><div id="storage"></div><p class="footnote">Requested and provisioned capacity are shown; disk usage is not measured.</p></section>
+          <section id="panel-logs" class="view-panel log-panel" role="tabpanel" aria-labelledby="tab-logs" hidden>
+            <div class="section-heading log-heading"><div class="log-title"><h2>Logs</h2><span id="fullscreen-worktree" class="fullscreen-identity"></span></div><button id="fullscreen-logs" class="button" type="button" aria-label="Fullscreen logs" title="Fullscreen logs"><svg aria-hidden="true" viewBox="0 0 20 20"><path d="M7 3H3v4m10-4h4v4M3 13v4h4m10-4v4h-4"/></svg><span>Fullscreen</span></button></div>
+            <div class="log-controls"><label class="source-field">Source<select id="log-source" aria-label="Source"><option value="">Choose a source</option></select></label><label>Lines<select id="log-tail" aria-label="Lines"><option value="100">100 lines</option><option value="200">200 lines</option></select></label><button id="live-logs" type="button" class="button primary" aria-pressed="false" disabled>Go live</button><button id="refresh-logs" type="button" class="button" disabled>Refresh logs</button><div class="log-preferences"><label class="wrap-control"><input id="wrap-logs" type="checkbox" checked>Wrap lines</label><label class="wrap-control"><input id="autoscroll-logs" type="checkbox" checked>Auto-scroll</label></div></div>
+            <div id="log-error" class="notice error" role="alert" hidden></div><div id="log-notice" class="notice" role="status" hidden></div>
+            <div class="log-surface"><pre id="log-output" class="log-output wrap" tabindex="0" aria-label="Log output">Select a service or the engine pod to read its logs.</pre><button id="jump-logs" type="button" class="button jump-button" hidden>Jump to latest</button></div>
+            <div class="log-footer"><span id="log-status" role="status">Logs refresh on request.</span><div class="log-footer-actions"><span id="log-buffer"></span><button id="copy-logs" type="button" class="button" disabled>Copy logs</button></div></div>
+            <p class="log-guidance">Live connections start with the selected recent lines and last up to five minutes. Resuming starts a new connection; lines may be missed or repeated.</p>
+          </section>
+          <section id="panel-engine" class="view-panel" role="tabpanel" aria-labelledby="tab-engine" hidden><div class="section-heading"><h2>Kubernetes engine</h2></div><p class="section-description">Compose services run inside this worktree’s Docker engine pod.</p><div id="engine"></div></section>
+        </article>
+        <section id="settings-page" hidden aria-labelledby="settings-title">
+          <header class="settings-intro"><h2 id="settings-title" class="sr-only">Configuration</h2><p>Cluster connection, access setup, and worktree settings.</p></header>
+          <div id="settings-error" class="notice error" role="alert" hidden></div>
+          <div id="settings-warnings" class="notice" hidden></div>
+          <label class="settings-field config-selector">Worktree<select id="config-worktree" aria-label="Configuration worktree"></select></label>
+          <div class="view-navigation"><div class="tabs settings-tabs" role="tablist" aria-label="Configuration views"><button id="config-tab-cluster" class="tab" role="tab" aria-selected="true" aria-controls="config-panel-cluster">Cluster &amp; namespace</button><button id="config-tab-access" class="tab" role="tab" aria-selected="false" aria-controls="config-panel-access" tabindex="-1">Service accounts &amp; access</button><button id="config-tab-worktree" class="tab" role="tab" aria-selected="false" aria-controls="config-panel-worktree" tabindex="-1">Worktree configuration</button><button id="config-tab-resources" class="tab" role="tab" aria-selected="false" aria-controls="config-panel-resources" tabindex="-1">Resources</button></div></div>
+          <section id="config-panel-cluster" class="settings-section" role="tabpanel" aria-labelledby="config-tab-cluster"><div class="section-heading"><h2 id="cluster-settings-title">Cluster &amp; namespace</h2><span class="muted">Read-only</span></div><div id="cluster-settings"></div><label class="settings-field">Namespace<select id="settings-namespace" aria-label="Configuration namespace"></select></label><div id="namespace-details"></div></section>
+          <section id="config-panel-access" class="settings-section" role="tabpanel" aria-labelledby="config-tab-access" hidden><div class="section-heading"><h2 id="access-settings-title">Service accounts &amp; access</h2></div><p class="section-description">Podgrove’s known service accounts, roles, and bindings in the selected namespace. These resources do not describe every permission held by your current credentials.</p><div id="access-details"></div></section>
+          <section id="config-panel-worktree" class="settings-section" role="tabpanel" aria-labelledby="config-tab-worktree" hidden><div class="section-heading"><h2 id="worktree-settings-title">Worktree configuration</h2><span class="muted">Current file</span></div><p class="section-description">Settings read from this worktree’s Podgrove YAML file. They may differ from the running environment or command-line overrides.</p><div id="configuration"></div></section>
+          <section id="config-panel-resources" class="settings-section" role="tabpanel" aria-labelledby="config-tab-resources" hidden><div class="section-heading"><h2>Resources &amp; storage</h2><span class="muted">Allocation, not usage</span></div><p class="section-description">Current file budgets and observed Kubernetes allocations are shown separately. Requests, limits and claim capacity do not measure CPU, memory or disk usage.</p><div id="resource-configuration"></div></section>
+        </section>
+      </main>
+      <footer class="statusbar"><span id="connection-state" role="status">Connecting…</span><span>Local browser · read-only</span></footer>
+    </div>
+  </div>
+</body>
+</html>

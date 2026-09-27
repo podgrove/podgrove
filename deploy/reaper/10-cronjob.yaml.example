@@ -1,0 +1,90 @@
+# Optional template: replace namespace and image, then save as YAML in a separate reviewed output directory.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: podgrove-reaper
+  namespace: PODGROVE_NAMESPACE
+spec:
+  schedule: '*/5 * * * *'
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 240
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/managed-by: podgrove
+            podgrove.dev/component: reaper
+        spec:
+          serviceAccountName: podgrove-reaper
+          automountServiceAccountToken: false
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            fsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+          - name: reaper
+            image: REPLACE_WITH_YOUR_REGISTRY/podgrove:0.1.0
+            args:
+            - reap
+            - --context
+            - podgrove-reaper
+            - --namespace
+            - PODGROVE_NAMESPACE
+            - --all
+            - --json
+            env:
+            - name: KUBECONFIG
+              value: /kube/config
+            - name: HOME
+              value: /tmp
+            - name: PODGROVE_STATE_HOME
+              value: /tmp/podgrove-state
+            securityContext:
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: true
+              capabilities:
+                drop:
+                - ALL
+            resources:
+              requests:
+                cpu: 25m
+                memory: 64Mi
+              limits:
+                cpu: 100m
+                memory: 128Mi
+            volumeMounts:
+            - name: kubeconfig
+              mountPath: /kube
+              readOnly: true
+            - name: credentials
+              mountPath: /var/run/podgrove/auth
+              readOnly: true
+            - name: temp
+              mountPath: /tmp
+          volumes:
+          - name: kubeconfig
+            configMap:
+              name: podgrove-reaper-kubeconfig
+          - name: credentials
+            projected:
+              defaultMode: 288
+              sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3600
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                  - key: ca.crt
+                    path: ca.crt
+          - name: temp
+            emptyDir:
+              sizeLimit: 16Mi

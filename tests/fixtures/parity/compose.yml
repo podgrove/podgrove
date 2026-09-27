@@ -1,0 +1,91 @@
+name: podgrove-parity
+services:
+  api:
+    image: python:3.12-alpine
+    command: [python, /app/server.py]
+    environment:
+      API_MODE: base
+      OPTIONAL_VALUE: ${PODGROVE_FIXTURE_VALUE:-default-value}
+    env_file:
+      - fixture.env
+      - path: absent-optional.env
+        required: false
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./server.py:/app/server.py:ro
+      - ./content:/app/content
+      - ./single.txt:/app/single.txt:ro
+      - state:/state
+      - /app/__pycache__
+    configs:
+      - source: greeting
+        target: /app/config.txt
+    secrets:
+      - demo
+    networks:
+      grove:
+        aliases: [api-alias]
+    depends_on:
+      redis:
+        condition: service_healthy
+      init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+    restart: unless-stopped
+  init:
+    image: python:3.12-alpine
+    command: [python, -c, "from pathlib import Path; Path('/state/initialized').write_text('ready')"]
+    volumes:
+      - state:/state
+    networks: [grove]
+    restart: "no"
+  redis:
+    image: redis:7-alpine
+    command: [redis-server, --appendonly, "yes"]
+    volumes:
+      - redis-data:/data
+    networks: [grove]
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+  profile-worker:
+    image: python:3.12-alpine
+    command: [python, -c, "import time; time.sleep(86400)"]
+    profiles: [extra]
+    networks: [grove]
+  mongodb:
+    image: mongo:7
+    profiles: [database]
+    command: [mongod, --bind_ip_all]
+    volumes:
+      - mongo-data:/data/db
+    networks: [grove]
+    ulimits:
+      nofile:
+        soft: 64000
+        hard: 64000
+    healthcheck:
+      test: [CMD, mongosh, --quiet, --eval, "db.adminCommand('ping')"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+networks:
+  grove:
+    driver: bridge
+volumes:
+  state: {}
+  redis-data: {}
+  mongo-data: {}
+configs:
+  greeting:
+    file: ./config.txt
+secrets:
+  demo:
+    file: ./demo.secret.txt

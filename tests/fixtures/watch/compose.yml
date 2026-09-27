@@ -1,0 +1,18 @@
+name: podgrove-watch
+services:
+  api:
+    build:
+      context: .
+    ports:
+      - "8081:8080"
+    develop:
+      watch:
+        - action: sync
+          path: ./content
+          target: /app/content
+          initial_sync: true
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 1s
+      timeout: 2s
+      retries: 30

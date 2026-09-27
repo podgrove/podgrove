@@ -1,0 +1,12 @@
+# Copy to the application worktree and replace these three target values.
+# Generate/apply bootstrap once for the shared namespace before the first up.
+version: 1
+cluster:
+  context: your-development-context
+  namespace: your-development-namespace
+  namespace_mode: shared
+  storage_class: your-delete-storage-class
+# Omitted compose.files uses standard Compose base/override discovery.
+# If the project has a specific invocation, preserve its exact ordered files.
+node_mode: shared
+ttl: 8h

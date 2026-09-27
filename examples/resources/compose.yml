@@ -1,0 +1,24 @@
+# Services stay in Compose. These limits share the outer engine budget.
+services:
+  web:
+    image: alpine:3.21
+    command:
+      - sh
+      - -ec
+      - |
+        mkdir -p /data/www
+        printf 'Podgrove custom resources example\n' > /data/www/index.html
+        exec httpd -f -p 8080 -h /data/www
+    cpus: 0.5
+    mem_limit: 256m
+    ports:
+      - "8080:8080"
+    volumes:
+      - site-data:/data
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, http://127.0.0.1:8080/]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+volumes:
+  site-data: {}

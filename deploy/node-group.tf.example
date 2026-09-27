@@ -1,0 +1,28 @@
+# Administrator-owned prerequisite; no Terraform was applied by this session.
+# Use an EC2 EKS managed node group, with a separate node IAM role and subnets.
+variable "cluster_name" { type = string }
+variable "podgrove_node_role_arn" { type = string }
+variable "podgrove_subnet_ids" { type = list(string) }
+
+resource "aws_eks_node_group" "podgrove" {
+  cluster_name    = var.cluster_name
+  node_group_name = "podgrove"
+  node_role_arn   = var.podgrove_node_role_arn
+  subnet_ids     = var.podgrove_subnet_ids
+  instance_types = ["m7i.xlarge"]
+  ami_type       = "AL2023_x86_64_STANDARD"
+  disk_size      = 40
+  capacity_type  = "ON_DEMAND"
+  scaling_config {
+    desired_size = 1
+    min_size     = 1
+    max_size     = 3
+  }
+  labels = { "podgrove.dev/dedicated" = "true" }
+  taint {
+    key    = "dedicated"
+    value  = "podgrove"
+    effect = "NO_SCHEDULE"
+  }
+  update_config { max_unavailable = 1 }
+}

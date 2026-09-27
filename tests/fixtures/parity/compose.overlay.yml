@@ -1,0 +1,6 @@
+services:
+  api:
+    environment:
+      API_MODE: overlay
+    volumes:
+      - ./overlay.txt:/app/overlay.txt:ro

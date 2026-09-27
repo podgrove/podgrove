@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact source commit to validate
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python ${{ matrix.python }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      # These checks need the CLI/parser, never a Docker daemon or kubeconfig.
+      DOCKER_HOST: tcp://127.0.0.1:1
+      KUBECONFIG: /dev/null
+      PODGROVE_RUN_DOCKER_E2E: '0'
+      PODGROVE_DOCKER_TESTS: '0'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-latest, python: '3.11', browser: false}
+          - {os: ubuntu-latest, python: '3.14', browser: true}
+          - {os: macos-latest, python: '3.14', browser: false}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: '0.12.18'
+          enable-cache: false
+      - name: Isolate Docker CLI configuration on the runner
+        run: echo "DOCKER_CONFIG=$RUNNER_TEMP/podgrove-docker-config" >> "$GITHUB_ENV"
+      - name: Install macOS CLI and receiver prerequisites
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+          HOMEBREW_NO_INSTALL_CLEANUP: '1'
+        run: |
+          brew install docker docker-compose coreutils
+          mkdir -p "$DOCKER_CONFIG/cli-plugins"
+          ln -s "$(command -v docker-compose)" "$DOCKER_CONFIG/cli-plugins/docker-compose"
+      - name: Require Compose parser and GNU receiver tools
+        run: |
+          mkdir -p "$DOCKER_CONFIG"
+          docker --version
+          docker compose version
+          python - <<'PY'
+          import shutil
+          import sys
+          import subprocess
+          for name in ("stat", "head", "dd"):
+              executable = shutil.which("g" + name) or (shutil.which(name) if sys.platform != "darwin" else None)
+              if executable is None:
+                  raise SystemExit(f"Required GNU receiver tool is missing: {name}")
+              subprocess.run([executable, "--version"], check=True)
+          PY
+      - name: Install locked test dependencies
+        run: uv sync --locked --extra test --extra web-test
+      - name: Lint
+        run: uv run --no-sync ruff check podgrove scripts tests
+      - name: Safe local tests
+        run: uv run --no-sync pytest -q -m 'not cluster and not integration and not browser'
+      - name: Verify public docs and render every adoption example
+        run: uv run --no-sync python scripts/verify_docs.py --output artifacts/ci/docs.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: docs-${{ matrix.os }}-python-${{ matrix.python }}
+          path: artifacts/ci/docs.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Install disposable browser
+        if: matrix.browser
+        run: uv run --no-sync playwright install --with-deps chromium
+      - name: Browser tests with inert fixtures
+        if: matrix.browser
+        run: uv run --no-sync pytest -q -m browser
+      - name: Build sdist and wheel from that sdist
+        run: uv build --no-sources --build-constraint .github/build-constraints.txt --out-dir release-dist
+      - name: Validate exact archives and isolated installation
+        env:
+          SOURCE_SHA: ${{ inputs.ref || github.sha }}
+        run: python scripts/verify_release.py --dist release-dist --source-sha "$SOURCE_SHA"

@@ -1,0 +1,28 @@
+name: Bug report
+description: Report reproducible behavior in Podgrove.
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Podgrove version and operating system
+      description: Include podgrove --version and your OS version.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include the command and sanitized configuration. Do not include kubeconfigs, tokens, private addresses or application secrets.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: Remove sensitive values from logs before sharing. Use private vulnerability reporting for security issues.

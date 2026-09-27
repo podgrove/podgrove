@@ -1,0 +1,66 @@
+:root {
+  color-scheme: light;
+  --color-bg: oklch(0.982 0 0);
+  --color-surface: oklch(1 0 0);
+  --color-sidebar: oklch(0.958 0.005 28);
+  --color-hover: oklch(0.93 0.006 28);
+  --color-selected: oklch(0.906 0.011 28);
+  --color-ink: oklch(0.255 0.008 28);
+  --color-muted: oklch(0.485 0.01 28);
+  --color-rule: oklch(0.875 0.005 28);
+  --color-control: oklch(0.63 0.009 28);
+  --color-accent: oklch(0.52 0.135 30);
+  --color-on-accent: oklch(1 0 0);
+  --color-accent-soft: oklch(0.948 0.026 30);
+  --color-success: oklch(0.43 0.073 155);
+  --color-success-soft: oklch(0.95 0.017 155);
+  --color-warning: oklch(0.45 0.09 65);
+  --color-warning-soft: oklch(0.958 0.026 75);
+  --color-error: oklch(0.45 0.15 25);
+  --color-error-soft: oklch(0.958 0.022 25);
+  --color-transparent: transparent;
+  --font-display: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino, serif;
+  --font-body: "Avenir Next", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "SFMono-Regular", Menlo, "Liberation Mono", monospace;
+  --text-xs: 0.75rem;
+  --text-sm: 0.8125rem;
+  --text-base: 0.9375rem;
+  --text-lg: 1.125rem;
+  --text-title: 2rem;
+  --space-xs: 0.25rem;
+  --space-sm: 0.5rem;
+  --space-md: 0.75rem;
+  --space-lg: 1rem;
+  --space-xl: 1.5rem;
+  --space-2xl: 2rem;
+  --space-3xl: 3rem;
+  --radius-sm: 0.375rem;
+  --radius-md: 0.625rem;
+  --radius-lg: 0.875rem;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --dur-short: 160ms;
+  --z-sticky: 10;
+  --z-fullscreen: 40;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --color-bg: oklch(.22 .006 28);
+  --color-surface: oklch(.27 .007 28);
+  --color-sidebar: oklch(.185 .005 28);
+  --color-hover: oklch(.32 .008 28);
+  --color-selected: oklch(.34 .025 28);
+  --color-ink: oklch(.92 .006 28);
+  --color-muted: oklch(.73 .009 28);
+  --color-rule: oklch(.36 .007 28);
+  --color-control: oklch(.59 .008 28);
+  --color-accent: oklch(.77 .11 40);
+  --color-on-accent: oklch(.185 .005 28);
+  --color-accent-soft: oklch(.32 .035 40);
+  --color-success: oklch(.8 .08 155);
+  --color-success-soft: oklch(.29 .025 155);
+  --color-warning: oklch(.81 .10 75);
+  --color-warning-soft: oklch(.3 .025 75);
+  --color-error: oklch(.79 .09 25);
+  --color-error-soft: oklch(.3 .035 25);
+}

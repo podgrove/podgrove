@@ -1,0 +1,17 @@
+# Local execution, build output and verification evidence.
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+/build/
+/dist/
+/release-dist/
+/artifacts/
+
+# This workspace's cluster selection and local environment overrides.
+/podgrove.yml
+/.env
+/.env.*
+.DS_Store

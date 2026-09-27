@@ -1,0 +1,42 @@
+# Complete resource-sizing example; compose.yml is alongside this file.
+# Replace the three target values with administrator-approved settings.
+# Prepare that namespace and apply its generated bootstrap before deployment.
+version: 1
+cluster:
+  context: your-development-context
+  namespace: your-development-namespace
+  namespace_mode: shared
+  storage_class: your-delete-storage-class
+compose:
+  files: [compose.yml]
+  project_directory: .
+node_mode: shared
+ttl: 8h
+
+# The engine runs Docker, builds and every service in this Compose stack.
+# This block replaces the entire size preset; omitted dimensions stay omitted.
+# Remove it to use size: medium, or explicitly choose a preset with up --size.
+resources:
+  requests:
+    cpu: "1500m"
+    memory: 6Gi
+    ephemeral-storage: 1Gi
+  limits:
+    cpu: "6"
+    memory: 12Gi
+    ephemeral-storage: 8Gi
+
+# Optional independent replacement for the storage initializer's resources.
+# Omit this block to retain its standard 10m/16Mi requests, 100m/32Mi limits.
+init_resources:
+  requests:
+    cpu: "20m"
+    memory: 32Mi
+  limits:
+    cpu: "200m"
+    memory: 64Mi
+
+# Used on every up/refresh/reconnect unless --storage overrides it.
+# Existing engines and PVCs are not resized by changing this configuration.
+storage:
+  size: 40Gi

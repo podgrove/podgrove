@@ -1,0 +1,7 @@
+# Dashboard-only directory: no Compose file or Docker daemon is required.
+# Replace the context and namespace with the target you are authorized to inspect.
+version: 1
+cluster:
+  context: your-explicit-kube-context
+  namespace: your-development-namespace
+  namespace_mode: shared

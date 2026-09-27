@@ -1,0 +1,4 @@
+services:
+  unsafe:
+    image: alpine:3.22
+    network_mode: host

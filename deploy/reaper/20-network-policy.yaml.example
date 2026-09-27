@@ -1,0 +1,38 @@
+# Optional template, NOT an apply-ready manifest. Replace namespace, reviewed
+# API-server destination CIDR and actual TCP port (usually 443 or 6443).
+# A narrow IPv4 /32 or IPv6 /128 may be appropriate; include every endpoint
+# required by the cluster/CNI's service translation behavior. Do not use
+# 0.0.0.0/0 or ::/0 as an API allowance. Review changes with the platform owner.
+# DNS assumes the same kube-system/kube-dns labels as the engine policy.
+# This policy grants no public HTTPS, GitLab or other application egress.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: podgrove-reaper-api
+  namespace: PODGROVE_NAMESPACE
+  labels:
+    app.kubernetes.io/managed-by: podgrove
+    podgrove.dev/component: reaper
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/managed-by: podgrove
+      podgrove.dev/component: reaper
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - to:
+        - ipBlock:
+            cidr: REPLACE_WITH_REVIEWED_API_SERVER_CIDR
+      ports:
+        - {protocol: TCP, port: REPLACE_WITH_REVIEWED_API_SERVER_PORT}

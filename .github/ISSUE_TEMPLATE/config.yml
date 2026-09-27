@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security policy
+    url: https://github.com/podgrove/podgrove/blob/main/SECURITY.md
+    about: Arrange private reporting before sharing vulnerability details.

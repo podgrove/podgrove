@@ -1,0 +1,8 @@
+version: 1
+compose:
+  files:
+    - compose.yml
+    - compose.overlay.yml
+  profiles: [extra]
+size: small
+ttl: 30m

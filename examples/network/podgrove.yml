@@ -1,0 +1,18 @@
+# Replace all target values and use the application's actual Compose invocation.
+version: 1
+cluster:
+  context: your-development-context
+  namespace: your-development-namespace
+  namespace_mode: shared
+  storage_class: your-delete-storage-class
+network:
+  # These are documentation addresses, already excluded by built-in defaults.
+  # Supply the administrator's actual Pod/Service/node/control-plane and
+  # protected ingress CIDRs, especially any outside private address space.
+  blocked_cidrs:
+    - 203.0.113.0/24
+    - 2001:db8::/32
+# To disable public web egress entirely, use blocked_cidrs: ["0.0.0.0/0"].
+# The explicit cluster-DNS exception remains; builds/pulls may then fail.
+node_mode: shared
+ttl: 8h
