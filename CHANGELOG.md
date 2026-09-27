@@ -2,6 +2,11 @@
 
 User-visible changes are recorded here. Release Please manages versioned entries after the first public release.
 
+## 0.2.2 (2026-09-27)
+
+- Start supervisors with Python import isolation so an older checkout in the caller's working directory cannot replace the installed runtime.
+- Verify this behavior with real subprocesses and require the isolated supervisor command in the forwarding soak.
+
 ## 0.2.1 (2026-09-27)
 
 - Stream binary exec exports directly with WebSockets, preserve exit status, and isolate failed Docker API connections without replaying commands.
