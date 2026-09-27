@@ -2,6 +2,17 @@
 
 User-visible changes are recorded here. Release Please manages versioned entries after the first public release.
 
+## 0.2.1 (2026-09-27)
+
+- Stream binary exec exports directly with WebSockets, preserve exit status, and isolate failed Docker API connections without replaying commands.
+- Retain sessions through transient status/ownership/heartbeat read failures, enforce bounded ownership-proof age, and cancel stalled verification subprocesses safely.
+- Record captured and observed engine UIDs, reporting Pod replacement during failed builds even when restart counts reset.
+- Resolve target-only and dynamically published Compose ports, preserve unchanged legacy fingerprints, and emit JSON cleanup results.
+- Derive identity from the Git worktree root and support one committed configuration across linked worktrees.
+- Add All logs and unrestricted CLI history exports, with honest dashboard display bounds, and unify focus borders in both themes.
+- Add release-bound exact-byte exec and four-hour forwarding acceptance runners. Test results are separate evidence; merely shipping a runner does not establish a completed soak.
+- Resolve authenticated draft releases without replacing published assets.
+
 ## 0.2.0 (2026-09-27)
 
 - Publish the first tagged release with verified source and wheel archives, checksums and source provenance.

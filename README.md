@@ -25,6 +25,7 @@ Copy a starting configuration, replace its example values, and adjust Compose fi
 | --- | --- |
 | [Shared namespace](examples/shared/podgrove.yml) | Several worktrees, each with its own engine and PVC, using one namespace installation. |
 | [Namespace per worktree](examples/worktree/podgrove.yml) | Each worktree gets a derived namespace and a separate bootstrap installation. |
+| [Committed worktree configuration](examples/portable/README.md) | Keep one relative config in Git and reuse it in linked worktrees. |
 | [Dashboard only](examples/dashboard/podgrove.yml) | Read an existing target without a Compose project. |
 | [Network exclusions](examples/network/podgrove.yml) | Add administrator-supplied infrastructure ranges to the worktree's egress exclusions. |
 | [Custom resources](examples/resources/podgrove.yml) and [Compose service](examples/resources/compose.yml) | Set engine/initializer requests and limits, PVC capacity, and separate per-service Compose limits. |
@@ -41,13 +42,13 @@ commands also use the GitHub CLI. Choose a version from [Releases](https://githu
 From a checkout of that tag, download its five assets into a new directory:
 
 ```sh
-git clone --branch v0.2.0 https://github.com/podgrove/podgrove.git
+git clone --branch v0.2.1 https://github.com/podgrove/podgrove.git
 cd podgrove
 PODGROVE_RELEASE_DIR="$(mktemp -d)"
-gh release download v0.2.0 --repo podgrove/podgrove --dir "$PODGROVE_RELEASE_DIR"
+gh release download v0.2.1 --repo podgrove/podgrove --dir "$PODGROVE_RELEASE_DIR"
 PODGROVE_RELEASE_SHA="$(git rev-parse HEAD)"
 python3 scripts/install_release.py --dist "$PODGROVE_RELEASE_DIR" \
-  --tag v0.2.0 --source-sha "$PODGROVE_RELEASE_SHA"
+  --tag v0.2.1 --source-sha "$PODGROVE_RELEASE_SHA"
 export PODGROVE_BIN="$HOME/.local/share/podgrove/current/bin/podgrove"
 "$PODGROVE_BIN" --version
 ```
@@ -242,7 +243,7 @@ Before declaring adoption complete:
 
 ## Endpoints and live edits
 
-By default, Podgrove forwards every published TCP port to `127.0.0.1`. Each target needs exactly one explicit published port on one active replica. `expose` alone creates no endpoint. For a Compose mapping `8080:8000`, a forwarding entry uses the **container target `8000`**:
+By default, Podgrove forwards every published TCP port to `127.0.0.1`. Target-only declarations such as `ports: ["27017"]`, zero-valued publishers, and published ranges use Docker’s observed allocation after startup. Each forwarded target must resolve to exactly one publisher on one active replica. `expose` alone creates no endpoint. If Docker changes or removes a publisher later, Podgrove disconnects those application forwards and asks for `up --refresh`; it never keeps forwarding to a stale mapping. For a Compose mapping `8080:8000`, a forwarding entry uses the **container target `8000`**:
 
 ```yaml
 forward:
@@ -263,11 +264,11 @@ sync:
 
 Slashless patterns match any path component; slash-containing patterns are relative to the selected workspace root, with `**` matching nested directories. An excluded directory excludes its descendants. Absolute paths, `..` and negation are refused. An explicitly mounted/config/secret source cannot itself be excluded. Exclusions do not change Compose build contexts or native watch rules, and do not delete already mirrored or remotely generated files. There are no implicit `.gitignore` rules; `.git` remains forbidden. Add dependency/cache directories only when your containers do not need their local contents.
 
-Files changing while a local snapshot is prepared are retried with backoff without shutting down the application forwards. A failed or uncertain remote transfer is not replayed automatically. Forwarding has an independent monitor that restarts a dropped process/listener on the **same local ports**, verifies the original engine's ownership and UIDs, and reports `reconnecting` while retrying. Three failed retries leave endpoints `disconnected` and the session `degraded`; run `up` to reconnect. Pod replacement or ownership changes are never silently adopted. A listening forward proves local tunnel availability, not application health.
+Files changing while a local snapshot is prepared are retried with backoff without shutting down the application forwards. A failed or uncertain remote transfer is not replayed automatically. Forwarding has an independent monitor that restarts a dropped process/listener on the **same local ports**, verifies the original engine's ownership and UIDs, and reports `reconnecting` while retrying. Three failed retries leave endpoints `disconnected` and the session `degraded`; run `up` to reconnect. Pod replacement or ownership changes are never silently adopted. A listening forward proves local tunnel availability, not application health. A failed ownership read marks forwarding `reconnecting` while keeping the existing verified listener during a bounded 120-second grace period. Proof expiry closes it; only a fresh matching UID check can authorize reconnection. Lease heartbeat failures are reported separately and retried from a fresh ownership read with capped backoff.
 
 ## Lifecycle and target selection
 
-Run commands from the same application worktree, or pass `--project-directory /path/to/application-worktree` after the subcommand. Replace `api` and the executable with a real service/command in your project:
+Run commands from the application worktree or any directory inside it, or pass `--project-directory /path/to/application-worktree` after the subcommand. Podgrove derives identity from the nearest Git checkout’s top level, including linked worktrees; selecting a subdirectory does not create another environment. It discovers the nearest `podgrove.yml` upward within that checkout. The selected configuration directory and Compose base remain separate from identity; an explicit `--config` is resolved against the selected directory. Outside Git, the selected directory remains the identity boundary. Replace `api` and the executable with a real service/command in your project:
 
 ```sh
 "$PODGROVE_BIN" status
@@ -278,11 +279,15 @@ Run commands from the same application worktree, or pass `--project-directory /p
 "$PODGROVE_BIN" up --refresh
 ```
 
-Calling ordinary `up` again returns an existing running session when its normalized Compose configuration is unchanged. Changed configuration re-runs Compose against the same engine/PVC. Use `--refresh` for build-only source or service env-file changes that do not change that model. Run `up` again after a disconnected session. Existing engines/PVCs retain their size and placement; flags do not resize them. Recreating with `down` destroys their data.
+Calling ordinary `up` again returns an existing running session when its normalized Compose configuration is unchanged. Fingerprints use deterministic serialization; the earlier unversioned format is also recognized when omitted network/sync settings still have their original defaults. Changed configuration re-runs Compose against the same engine/PVC. Use `--refresh` for build-only source or service env-file changes that do not change that model. Run `up` again after a disconnected session. Existing engines/PVCs retain their size and placement; flags do not resize them. Recreating with `down` destroys their data.
 
-Status includes the worktree identity/root and each forward's state, separately from Compose service health. `env` exports only ready endpoints as `PODGROVE_<SERVICE>_<TARGET_PORT>_HOST`, `_PORT` and `_URL`; `--json` returns a JSON mapping. Shell output contains quoted `export` statements. `_URL` uses HTTP as a convenience; build MongoDB/Redis/TLS connection strings using your application's protocol and test credentials. Normalized service-name collisions are refused; `status --json` retains original service names.
+Status includes the worktree identity/root and each forward's state, separately from Compose service health. `engine_identity` records captured and observed Pod/StatefulSet UIDs, so replacement remains visible even when the new Pod reports zero restarts. Failed builds make a fresh identity check and report replacement without repeating the build. Transient Docker status reads receive three bounded attempts. Exhaustion reports valid JSON with degraded/stale health and keeps the session and forwards available for a later observation. `down --json` returns a JSON cleanup result; cleanup errors return a JSON error and preserve the state needed to retry. `env` exports only ready endpoints as `PODGROVE_<SERVICE>_<TARGET_PORT>_HOST`, `_PORT` and `_URL`; `--json` returns a JSON mapping. Shell output contains quoted `export` statements. `_URL` uses HTTP as a convenience; build MongoDB/Redis/TLS connection strings using your application's protocol and test credentials. Normalized service-name collisions are refused; `status --json` retains original service names.
 
 After a failed startup disconnects, `logs SERVICE` opens a temporary, ownership-checked Docker connection to the retained engine. Newly recorded environments retain the original Compose project/service names, so logs still work when the Compose sources have since changed or disappeared; pass explicit context and namespace if YAML itself is invalid. This diagnostic command neither rebuilds nor restarts containers, and closes the temporary connection on exit. The engine must still exist. Older records without project metadata require their original valid Compose configuration.
+
+`exec` streams stdin, stdout and stderr directly through an owned Kubernetes exec using WebSockets, preserving binary output and the remote exit status. It selects the exact Compose project/service container, verifies the engine and PVC identities, and does not replay interrupted commands. Inspect the command’s effects before retrying after an interruption.
+
+Existing environments created by an older version from a Git subdirectory keep their original identity. The new resolver refuses to silently adopt or merge those records: use the recorded version and original directory to inspect or retire that environment before starting from the worktree root. Keep the previous versioned installation available during upgrades.
 
 Target precedence is per field: an explicit CLI flag **after the subcommand**, then YAML, then `PODGROVE_CONTEXT` for context only. Namespace has no implicit fallback. An explicit `--namespace` is an exact target and selects shared mode unless accompanied by `--namespace-mode worktree`; this allows recovery using an already-derived namespace without deriving it twice. The current kube context is never an implicit target; Podgrove does not select or modify Docker contexts.
 

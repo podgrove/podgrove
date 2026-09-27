@@ -31,3 +31,37 @@ Read `results.json` for each observed assertion and timing; `commands.log` retai
 The Python edit fixture executes its tiny `live.py` module per request so the test measures transport latency without depending on an external framework. The watch fixture uses Compose's watcher over the remote Docker API. Neither measurement claims Vite or uvicorn itself was tested. The WebSocket fixture performs and validates an actual RFC 6455 handshake and masked echo frame, but the transport here is local Docker port publishing rather than Kubernetes port-forward.
 
 All fixture secret values are public, inert test strings. Never substitute production credentials into these fixtures.
+
+
+## Live exec export acceptance
+
+Use an already running disposable environment in an explicitly approved namespace, an installed release executable, and a service containing Python. This probe does not start, refresh, delete or reap environments:
+
+```sh
+python3 scripts/check_exec_stream.py \
+  --binary "$PODGROVE_BIN" \
+  --project-directory /path/to/disposable-worktree \
+  --context your-development-context --namespace your-development-namespace \
+  --identity 012345abcdef --service probe --python python3 \
+  --output /path/to/new-private-exec-evidence
+```
+
+Replace the identity with the exact value from that environment's `status --json`. The probe streams and hashes 29,284-byte, 8 MiB and repeated 64 MiB binary exports, verifies stdin EOF and stderr, and checks a deliberate remote exit 7. It also requires the same ready session after each command. An unexpected result stops the matrix without replaying a command. Only hashes/counts and safe status metadata are retained; temporary binary output is removed. A successful exit alone is insufficient: byte count and SHA-256 must both match.
+
+
+## Forwarding soak of an installed release
+
+The soak runner observes one existing disposable fixture; it never runs `up`, `down` or `reap`. The fixture must serve JSON containing `{"ok": true, "marker": "<marker-file contents>"}` at its recorded loopback endpoint. Select the exact release wheel and versioned executable, not an editable checkout:
+
+```sh
+python3 scripts/soak_forwarding.py \
+  --binary "$PODGROVE_BIN" --wheel /path/to/podgrove-VERSION-py3-none-any.whl \
+  --project-directory /path/to/disposable-worktree \
+  --state-home /path/to/private-fixture-state \
+  --context your-development-context --namespace your-development-namespace \
+  --kubeconfig /path/to/private-client-kubeconfig --identity 012345abcdef \
+  --url http://127.0.0.1:43123/ --marker-file /path/to/disposable-worktree/marker.txt \
+  --output /path/to/new-private-soak-evidence --inject-after 300
+```
+
+All paths and the identity/endpoint must match that fixture. The default duration is 14,460 seconds (four hours plus one minute). Every observation verifies the selected installed payload against the receipt-bound wheel and preserves the exact resource UIDs. HTTP probes run every ten seconds and status observations every minute; status extends the fixture's TTL. The optional fault terminates one proven supervisor-owned `kubectl port-forward` child and requires recovery on the same endpoint. No node or cluster-scoped API is used. A short `--duration` is a smoke test and cannot produce `four_hour_proof: true`; interrupted runs, unexpected failures, changed identities/runtime bytes, and excessive sampling gaps fail the proof. The private JSON/JSONL evidence distinguishes injected recovery from unplanned errors.
