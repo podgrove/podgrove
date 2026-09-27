@@ -70,6 +70,17 @@ def receive(client):
     return b"".join(chunks)
 
 
+def receive_exact(client, size):
+    """TCP may split a marker across reads; retain the socket's finite timeout."""
+    data = bytearray()
+    while len(data) < size:
+        chunk = client.recv(size - len(data))
+        if not chunk:
+            break
+        data.extend(chunk)
+    return bytes(data)
+
+
 def wait_until(predicate, timeout=5):
     deadline = time.monotonic() + timeout
     while not predicate():
@@ -134,7 +145,7 @@ def test_multiple_keepalive_requests_use_one_exec_stream():
         with connect(tunnel) as client:
             for message in (b"first\n", b"second\n", b"third\n"):
                 client.sendall(message)
-                assert client.recv(1024) == b"reply:" + message
+                assert receive_exact(client, len(b"reply:" + message)) == b"reply:" + message
             client.shutdown(socket.SHUT_WR)
             assert receive(client) == b""
         assert len(kube.commands) == 1
@@ -199,19 +210,25 @@ def test_nonzero_transport_exit_resets_client_and_retains_bounded_error():
         tunnel.close()
 
 
-def test_session_close_reaps_children_and_threads_even_if_child_ignores_term():
-    kube = FakeKube("import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);print('started',flush=True);time.sleep(60)")
+@pytest.mark.parametrize("ready", [
+    "print('started',flush=True)",
+    "print('start',end='',flush=True);time.sleep(0.05);print('ed',flush=True)",
+], ids=["single-write", "fragmented-write"])
+def test_session_close_reaps_children_and_threads_even_if_child_ignores_term(ready):
+    kube = FakeKube(f"import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);{ready};time.sleep(60)")
     tunnel = DockerTunnel(kube, IDENT, 0).start()
-    client = connect(tunnel)
-    assert client.recv(1024) == b"started\n"
-    streams = list(tunnel._streams.values())
-    started = time.monotonic()
-    tunnel.close()
-    assert time.monotonic() - started < 4
-    assert all(stream.process.poll() is not None and not stream.thread.is_alive() for stream in streams)
-    assert not tunnel._streams and not tunnel._accept_thread.is_alive()
-    assert client.recv(1024) == b""
-    client.close()
+    try:
+        with connect(tunnel) as client:
+            assert receive_exact(client, len(b"started\n")) == b"started\n"
+            streams = list(tunnel._streams.values())
+            started = time.monotonic()
+            tunnel.close()
+            assert time.monotonic() - started < 4
+            assert all(stream.process.poll() is not None and not stream.thread.is_alive() for stream in streams)
+            assert not tunnel._streams and not tunnel._accept_thread.is_alive()
+            assert client.recv(1024) == b""
+    finally:
+        tunnel.close()
 
 
 def test_connection_limit_bounds_children_without_disrupting_existing_stream():
@@ -220,12 +237,12 @@ def test_connection_limit_bounds_children_without_disrupting_existing_stream():
     try:
         with connect(tunnel) as first:
             first.sendall(b"ready\n")
-            assert first.recv(1024) == b"ready\n"
+            assert receive_exact(first, len(b"ready\n")) == b"ready\n"
             with connect(tunnel) as second:
                 with pytest.raises(ConnectionResetError):
                     receive(second)
             first.sendall(b"still-connected\n")
-            assert first.recv(1024) == b"still-connected\n"
+            assert receive_exact(first, len(b"still-connected\n")) == b"still-connected\n"
             first.shutdown(socket.SHUT_WR)
             assert receive(first) == b""
         assert len(kube.commands) == 1
@@ -364,7 +381,7 @@ def test_ownership_failure_resets_existing_keepalive_streams_without_supervisor_
     try:
         for client in clients:
             client.sendall(b"before-revocation\n")
-            assert client.recv(1024) == b"before-revocation\n"
+            assert receive_exact(client, len(b"before-revocation\n")) == b"before-revocation\n"
         streams = list(tunnel._streams.values())
         kube.controller["metadata"]["labels"][MANAGED] = "foreign"
         wait_until(lambda: tunnel._error is not None)
@@ -389,7 +406,7 @@ def test_transport_failure_aborts_other_streams_without_masking_original_error()
     try:
         with connect(tunnel) as existing:
             existing.sendall(b"ready\n")
-            assert existing.recv(1024) == b"ready\n"
+            assert receive_exact(existing, len(b"ready\n")) == b"ready\n"
             kube.script = "import sys;sys.stderr.write('primary-failure');sys.exit(7)"
             with connect(tunnel) as failing:
                 with pytest.raises(ConnectionResetError):

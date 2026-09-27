@@ -126,8 +126,10 @@ def docker_client():
 ])
 def test_client_eof_reproduction(docker_client, tmp_path, client, truncate, hold_stdin, interactive):
     with fake_engine(truncate=truncate) as server:
+        # Preserve the explicitly isolated CLI config: Compose plugins may live
+        # under its cli-plugins directory, particularly on hosted macOS runners.
         env = {key: value for key, value in os.environ.items()
-               if not key.startswith("DOCKER_") and key != "BUILDX_BUILDER"}
+               if (not key.startswith("DOCKER_") or key == "DOCKER_CONFIG") and key != "BUILDX_BUILDER"}
         env.update(DOCKER_HOST=f"tcp://127.0.0.1:{server.server_port}", DOCKER_API_VERSION="1.53")
         if client == "compose":
             version = subprocess.run([docker_client, "compose", "version"], env=env,

@@ -76,7 +76,7 @@ jobs:
       - name: Lint
         run: uv run --no-sync ruff check podgrove scripts tests
       - name: Safe local tests
-        run: uv run --no-sync pytest -q -m 'not cluster and not integration and not browser'
+        run: uv run --no-sync pytest -q -ra --junitxml=artifacts/ci/unit.xml -m 'not cluster and not integration and not browser'
       - name: Verify public docs and render every adoption example
         run: uv run --no-sync python scripts/verify_docs.py --output artifacts/ci/docs.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -90,10 +90,18 @@ jobs:
         run: uv run --no-sync playwright install --with-deps chromium
       - name: Browser tests with inert fixtures
         if: matrix.browser
-        run: uv run --no-sync pytest -q -m browser
+        run: uv run --no-sync pytest -q -ra --junitxml=artifacts/ci/browser.xml -m browser
       - name: Build sdist and wheel from that sdist
         run: uv build --no-sources --build-constraint .github/build-constraints.txt --out-dir release-dist
       - name: Validate exact archives and isolated installation
         env:
           SOURCE_SHA: ${{ inputs.ref || github.sha }}
         run: python scripts/verify_release.py --dist release-dist --source-sha "$SOURCE_SHA"
+      - name: Preserve test results even after a failed check
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: tests-${{ matrix.os }}-python-${{ matrix.python }}
+          path: artifacts/ci/*.xml
+          if-no-files-found: warn
+          retention-days: 14
