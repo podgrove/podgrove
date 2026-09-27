@@ -219,7 +219,7 @@ def configuration_metadata(data: dict) -> dict:
               "warning": "Current configuration is unavailable or invalid; saved environment settings are unchanged."}
     descriptors = []
     try:
-        root = Path(data["root"])
+        root = state.configuration_root(data)
         if not root.is_absolute() or ".." in root.parts or ".git" in root.parts or len(str(root)) > 4096:
             return result
         selected = data.get("config_path")

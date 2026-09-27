@@ -22,6 +22,7 @@ from .forward import validate_port_plan
 from .kube import Kube, context_name, manifests, namespace_name, resolve_namespace
 from .process import docker_environment
 from .reaper import mr_endpoint, reap
+from .repository import configuration_root, worktree_root
 from .session_status import observed
 from .resources import engine_resources, initializer_resources, quantity_text
 
@@ -124,6 +125,34 @@ def print_state(data: dict, as_json=False) -> None:
         print(f"  Session log: {data['session_log']}")
 
 
+def _project_paths(args, selected: Path | None = None) -> Path:
+    """Resolve identity once while retaining the chosen configuration boundary."""
+    if hasattr(args, "_identity_root"):
+        return args._identity_root
+    selected = (selected or args.project_directory).expanduser().resolve()
+    root = worktree_root(selected)
+    args._identity_root = root
+    args._config_root = selected if args.config is not None else configuration_root(selected, root)
+    return root
+
+
+def _check_legacy_identity(root: Path, context: str | None) -> None:
+    if not context:
+        return
+    for entry in state.local_records(context):
+        data = entry.get("data")
+        if data is None:
+            continue
+        previous = Path(data["root"]).resolve()
+        if previous != root and previous.is_relative_to(root) and worktree_root(previous) == root:
+            version = data.get("podgrove_version", "the earlier Podgrove version that created it")
+            raise PodgroveError(
+                f"Legacy subdirectory environment {data['identity']} already exists at {previous}. "
+                f"Use {version} with that --project-directory to resolve it before using this worktree. "
+                "Podgrove will not migrate, merge or delete its existing state automatically."
+            )
+
+
 def _set_target(args, target: dict, *, required: bool = True) -> None:
     """Resolve each field: command line, project YAML, then context environment fallback."""
     args._explicit_namespace = args.namespace
@@ -144,7 +173,7 @@ def _set_target(args, target: dict, *, required: bool = True) -> None:
         args.namespace = args.namespace_base
     else:
         try:
-            root = args.project_directory.expanduser().resolve()
+            root = _project_paths(args)
         except (OSError, RuntimeError) as exc:
             raise PodgroveError("Worktree namespace mode requires a resolvable --project-directory") from exc
         args.namespace = resolve_namespace(args.namespace_base, args.namespace_mode, state.identity(root))
@@ -157,7 +186,7 @@ def _resolve_target(args, root: Path | None) -> None:
     if args.config is not None or args.context is None or args.namespace is None:
         if root is None:
             try:
-                root = args.project_directory.expanduser().resolve()
+                root = _project_paths(args)
             except (OSError, RuntimeError) as exc:
                 if args.config is not None or args.project_directory != Path("."):
                     raise PodgroveError("Cannot resolve the configuration project directory") from exc
@@ -167,7 +196,7 @@ def _resolve_target(args, root: Path | None) -> None:
             # A removed worktree must not prevent cleanup with an explicit
             # context; there is no file to read in this case.
             if root.is_dir() or args.config is not None:
-                target = load_cluster(root, args.config)
+                target = load_cluster(getattr(args, "_config_root", root), args.config)
             elif args.context is None and not os.environ.get("PODGROVE_CONTEXT"):
                 raise PodgroveError(f"Project directory does not exist: {root}")
     _set_target(args, target)
@@ -175,8 +204,11 @@ def _resolve_target(args, root: Path | None) -> None:
 
 def up(args, root: Path) -> int:
     from .runtime import control, is_running, spawn
-    _set_target(args, load_cluster(root, args.config), required=not args.dry_run)
-    config = load_config(root, args.config, args.files)
+    root = _project_paths(args, root)
+    config_root = args._config_root
+    _set_target(args, load_cluster(config_root, args.config), required=not args.dry_run)
+    _check_legacy_identity(root, args.context)
+    config = load_config(config_root, args.config, args.files)
     node_mode = args.node_mode or config.node_mode
     compose = Compose(config)
     model = compose.model()
@@ -267,10 +299,11 @@ def up(args, root: Path) -> int:
                                        if item["kind"] == "PersistentVolumeClaim")
         # Record intent before creation so partial failures remain discoverable by down.
         token = uuid.uuid4().hex
-        data = {"identity": ident, "root": str(root), "context": args.context, "namespace": namespace,
+        data = {"identity": ident, "root": str(root), "config_root": str(config_root),
+                "context": args.context, "namespace": namespace,
                 "namespace_mode": args.namespace_mode,
-                "config_path": str((root / (args.config or Path("podgrove.yml"))).resolve())
-                    if args.config is not None or (root / "podgrove.yml").exists() else None,
+                "config_path": str((config_root / (args.config or Path("podgrove.yml"))).resolve())
+                    if args.config is not None or (config_root / "podgrove.yml").exists() else None,
                 "files": [str(path) for path in config.files],
                 "compose_project": model.get("name"), "compose_services": sorted(model["services"]),
                 "timeout": args.timeout, "status": "starting", "token": token,
@@ -311,8 +344,8 @@ def up(args, root: Path) -> int:
 def execute(args) -> int:
     if args.command == "bootstrap":
         from .bootstrap import generate_bootstrap
-        root = args.project_directory.expanduser().resolve()
-        cluster = load_cluster(root, args.config)
+        root = _project_paths(args)
+        cluster = load_cluster(args._config_root, args.config)
         _set_target(args, cluster)
         storage_class = args.storage_class if args.storage_class is not None else cluster.get("storage_class")
         paths = generate_bootstrap(args.output, namespace=args.namespace, storage_class=storage_class,
@@ -333,10 +366,10 @@ def execute(args) -> int:
     if args.command == "_serve":
         from .runtime import serve
         return serve(args.state)
-    root = None if args.command == "status" and args.all else args.project_directory.expanduser().resolve()
+    root = None if args.command == "status" and args.all else _project_paths(args)
     if args.command == "validate":
-        _set_target(args, load_cluster(root, args.config), required=False)
-        config = load_config(root, args.config, args.files)
+        _set_target(args, load_cluster(args._config_root, args.config), required=False)
+        config = load_config(args._config_root, args.config, args.files)
         compose = Compose(config)
         model = compose.model()
         compose.validate(model)
@@ -379,14 +412,15 @@ def execute(args) -> int:
                     print(f"  {row['error']}")
         return 1 if any("error" in entry for entry in entries) else 0
     ident = state.identity(root)
+    _check_legacy_identity(root, args.context)
     kube = Kube(args.context, args.namespace, namespace_mode=args.namespace_mode)
     if args.command == "doctor":
         node_mode = "shared"
         tainted_nodes = default_tainted_nodes()
         size, ttl = "medium", 8 * 3600
         budget, init_budget, storage_size, storage_class = None, None, "20Gi", None
-        if args.config is not None or args.files is not None or (root / "podgrove.yml").exists():
-            config = load_config(root, args.config, args.files, require_compose=False)
+        if args.config is not None or args.files is not None or (args._config_root / "podgrove.yml").exists():
+            config = load_config(args._config_root, args.config, args.files, require_compose=False)
             node_mode, tainted_nodes = config.node_mode, config.tainted_nodes
             size, ttl = config.size, config.ttl_seconds
             budget, init_budget = config.resources, config.init_resources
@@ -489,7 +523,8 @@ def execute(args) -> int:
         control(data, "touch")
     elif args.command == "logs" and data.get("compose_project") and data.get("compose_services"):
         return retained_logs(data, kube, args)
-    config = load_config(root, Path(data["config_path"]) if data.get("config_path") else None, data.get("files"))
+    config = load_config(state.configuration_root(data), Path(data["config_path"]) if data.get("config_path") else None,
+                         data.get("files"))
     compose = Compose(config)
     if args.command == "status":
         env = docker_environment(data["docker_host"])
@@ -529,7 +564,7 @@ def execute(args) -> int:
             cleanup.callback(tunnel.close)
             tunnel.start()
             host = f"tcp://127.0.0.1:{tunnel.port}"
-        return subprocess.call(command, env=docker_environment(host), cwd=root)
+        return subprocess.call(command, env=docker_environment(host), cwd=config.root)
 
 
 def endpoint_environment(ports: list[dict]) -> dict[str, str]:

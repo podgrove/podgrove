@@ -11,6 +11,8 @@ import re
 import stat
 from collections.abc import Mapping
 
+from .errors import PodgroveError
+
 _MAX_METADATA = 4096
 
 
@@ -60,6 +62,44 @@ def _metadata(root: Path) -> tuple[Path, Path] | None:
         return None
     # Normalize '..' from linked-worktree commondir without following symlinks.
     return gitdir, Path(os.path.abspath(common_dir))
+
+
+def worktree_root(directory: Path) -> Path:
+    """Find the nearest checkout boundary, including linked worktrees.
+
+    Identity belongs to the checkout directory, never its shared Git metadata.
+    Missing paths retain their original identity for local-state cleanup. Git
+    environment variables and configuration cannot redirect this lookup.
+    """
+    selected = directory.expanduser().resolve()
+    if not selected.is_dir():
+        return selected
+    for candidate in (selected, *selected.parents):
+        marker = candidate / ".git"
+        try:
+            marker.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise PodgroveError(f"Cannot inspect Git worktree boundary: {candidate}") from exc
+        if _metadata(candidate) is None:
+            raise PodgroveError(f"Invalid or unreadable Git worktree metadata: {candidate}; refusing ambiguous identity")
+        return candidate
+    return selected
+
+
+def configuration_root(selected: Path, worktree: Path) -> Path:
+    """Find a default config inside this checkout without crossing its boundary."""
+    if not selected.is_relative_to(worktree):
+        raise PodgroveError("Configuration selection is outside its Git worktree")
+    current = selected
+    while True:
+        candidate = current / "podgrove.yml"
+        if candidate.exists() or candidate.is_symlink():
+            return current
+        if current == worktree:
+            return selected
+        current = current.parent
 
 
 def _branch(head: str | None) -> str:

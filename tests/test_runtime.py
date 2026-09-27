@@ -183,11 +183,15 @@ def supervised_session(tmp_path, monkeypatch, request):
     data["namespace"] = settings.get("namespace", data["namespace"])
     if "namespace_mode" in settings:
         data["namespace_mode"] = settings["namespace_mode"]
+    config_root = tmp_path / settings.get("config_subdirectory", ".")
+    config_root.mkdir(exist_ok=True)
+    if "config_subdirectory" in settings:
+        data["config_root"] = str(config_root)
     state_module.write(path, data)
     model = {"services": {"app": {"develop": {"watch": [{"path": str(tmp_path / "source.txt"),
                                                           "action": "sync", "target": "/app/source.txt"}]}}}}
     (tmp_path / "source.txt").write_text("source content\n")
-    config = Config(root=tmp_path, files=[], ttl_seconds=3600)
+    config = Config(root=config_root, files=[], ttl_seconds=3600)
     compose = Mock(config=config)
     compose.model.return_value = model
     compose.published_ports.return_value = []
@@ -199,7 +203,8 @@ def supervised_session(tmp_path, monkeypatch, request):
     kube = Mock()
     kube_factory = Mock(return_value=kube)
     monkeypatch.setattr(runtime, "Kube", kube_factory)
-    monkeypatch.setattr(runtime, "load_config", lambda *_: config)
+    config_loader = Mock(return_value=config)
+    monkeypatch.setattr(runtime, "load_config", config_loader)
     monkeypatch.setattr(runtime, "Compose", Mock(return_value=compose))
     monkeypatch.setattr(runtime, "run", Mock(return_value=SimpleNamespace(stdout="", stderr="")))
     rows = [{"Service": "app", "State": "running", "Health": "healthy"}]
@@ -256,7 +261,7 @@ def supervised_session(tmp_path, monkeypatch, request):
     assert current["status"] == "ready", current
     session = SimpleNamespace(data=current, path=path, events=events, thread=thread,
                               results=results, fail_tunnel=fail_tunnel, fail_watch=fail_watch, kube=kube,
-                              sync=sync, kube_factory=kube_factory)
+                              sync=sync, kube_factory=kube_factory, config_loader=config_loader)
     try:
         yield session
     finally:

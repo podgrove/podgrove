@@ -398,7 +398,7 @@ def serve(path: Path) -> int:
         persist()
         controller = threading.Thread(target=handle_control, name="podgrove-control", daemon=True)
         controller.start()
-        config = load_config(Path(data["root"]), Path(data["config_path"]) if data.get("config_path") else None,
+        config = load_config(state.configuration_root(data), Path(data["config_path"]) if data.get("config_path") else None,
                              data.get("files"))
         compose = Compose(config)
         model = compose.model()

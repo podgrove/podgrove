@@ -164,4 +164,5 @@ include tests/test_web.py
 include tests/test_web_browser.py
 include tests/test_web_settings.py
 include tests/test_web_streaming.py
+include tests/test_worktree_identity.py
 include uv.lock

@@ -51,6 +51,23 @@ def validate_binding(data: dict, root: Path, context: str) -> None:
     if data["identity"] != identity(root) or Path(data["root"]).resolve() != root.resolve() or data["context"] != context:
         raise PodgroveError("Environment state belongs to a different worktree or cluster; refusing the operation")
     namespace_mode(data)
+    configuration_root(data)
+
+
+def configuration_root(data: dict) -> Path:
+    """The persisted Compose/config boundary is contained by its worktree."""
+    value = data["root"]
+    if not isinstance(value, str) or not Path(value).is_absolute() or ".." in Path(value).parts:
+        raise PodgroveError("Invalid environment state: root must be an absolute worktree path")
+    root = Path(value)
+    value = data.get("config_root", str(root))
+    if not isinstance(value, str) or not Path(value).is_absolute():
+        raise PodgroveError("Invalid environment state: config_root must be an absolute worktree path")
+    selected = Path(value)
+    if (".." in selected.parts or ".git" in selected.parts or not selected.is_relative_to(root)
+            or not selected.resolve().is_relative_to(root.resolve())):
+        raise PodgroveError("Invalid environment state: configuration directory is outside the worktree")
+    return selected
 
 
 def namespace_mode(data: dict) -> str:
