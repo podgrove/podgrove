@@ -2,6 +2,11 @@
 
 User-visible changes are recorded here. Release Please manages versioned entries after the first public release.
 
+## 0.2.4 (2026-09-27)
+
+- Accept complete dashboard Docker HTTP responses, including `Connection: close` responses whose declared body has been fully consumed, without reading a closed socket again.
+- Reject premature EOF when a response still owes declared bytes, while preserving explicit dashboard size-limit clipping. This response-completion fix does not establish the cause or resolution of historical Docker-tunnel log resets.
+
 ## 0.2.3 (2026-09-27)
 
 - Shorten the README around the problem Podgrove solves, its operating model, and the first successful deployment.
