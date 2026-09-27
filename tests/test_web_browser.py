@@ -880,7 +880,30 @@ def test_single_focus_ring_aligned_controls_and_keyboard_configuration_tabs(page
         box, chevron = wrapper.bounding_box(), wrapper.locator("svg").bounding_box()
         assert abs((box["y"] + box["height"] / 2) - (chevron["y"] + chevron["height"] / 2)) < 1
     assert page.locator("#refresh-logs").evaluate("el => getComputedStyle(el).backgroundColor") != "rgba(0, 0, 0, 0)"
+    page.keyboard.press("Tab")  # Establish keyboard modality for button focus.
+    for selector in ("#log-source", "#log-tail", "#refresh-logs", "#live-logs", "#fullscreen-logs"):
+        control = page.locator(selector)
+        before = control.bounding_box()
+        control.focus()
+        appearance = control.evaluate("""el => {
+          const s = getComputedStyle(el);
+          return {outline:s.outlineWidth, offset:s.outlineOffset, border:s.borderColor,
+                  shadow:s.boxShadow, visible:el.matches(':focus-visible')};
+        }""")
+        assert appearance == {"outline": "2px", "offset": "0px", "border": "rgba(0, 0, 0, 0)",
+                              "shadow": "none", "visible": True}, (selector, appearance)
+        after = control.bounding_box()
+        assert (before["width"], before["height"]) == (after["width"], after["height"])
+    page.locator("#log-source").focus()
+    SCREENSHOTS.mkdir(parents=True, exist_ok=True)
+    page.locator(".log-controls").screenshot(path=str(SCREENSHOTS / f"single-border-logs-{theme}-{width}.png"))
     open_configuration(page, "Cluster & namespace")
+    page.keyboard.press("Tab")
+    for selector in ("#config-worktree", "#settings-namespace"):
+        control = page.locator(selector)
+        control.focus()
+        assert control.evaluate("el => getComputedStyle(el).outlineOffset") == "0px"
+        assert control.evaluate("el => getComputedStyle(el).borderColor") == "rgba(0, 0, 0, 0)"
     cluster = page.get_by_role("tab", name="Cluster & namespace", exact=True)
     cluster.focus()
     page.keyboard.press("End")

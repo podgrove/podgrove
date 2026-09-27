@@ -17,6 +17,7 @@
     "LICENSE",
     "MANIFEST.in",
     "Makefile",
+    "PRODUCT.md",
     "README.md",
     "SECURITY.md",
     "cmd/podgrove/podgrove",

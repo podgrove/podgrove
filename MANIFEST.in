@@ -17,6 +17,7 @@ include CONTRIBUTING.md
 include LICENSE
 include MANIFEST.in
 include Makefile
+include PRODUCT.md
 include README.md
 include SECURITY.md
 include cmd/podgrove/podgrove

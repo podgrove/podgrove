@@ -37,6 +37,7 @@
   --radius-sm: 0.375rem;
   --radius-md: 0.625rem;
   --radius-lg: 0.875rem;
+  --focus-width: 2px;
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
   --dur-short: 160ms;
   --z-sticky: 10;

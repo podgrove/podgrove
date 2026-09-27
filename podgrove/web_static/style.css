@@ -12,7 +12,7 @@ button, .button, .tab { white-space: nowrap; }
 button { background: none; border: 0; }
 button:disabled { cursor: default; opacity: .55; }
 button:active:not(:disabled) { transform: translateY(1px); }
-:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 3px; }
+:focus-visible { outline: var(--focus-width) solid var(--color-accent); outline-offset: 0; }
 [hidden] { display: none !important; }
 svg { width: 1.125rem; height: 1.125rem; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; flex-shrink: 0; }
 a { color: var(--color-accent); text-decoration-thickness: 1px; text-underline-offset: 3px; }
@@ -36,7 +36,7 @@ code, pre, .mono { font-family: var(--font-mono); }
 .nav-content.expanded { display: block; }
 .mobile-toggle { width: 100%; justify-content: space-between; }
 .search-box { margin-top: var(--space-lg); display: flex; align-items: center; gap: var(--space-sm); border: 1px solid var(--color-control); border-radius: var(--radius-md); padding: var(--space-sm) var(--space-md); }
-.search-box:focus-within { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+.search-box:focus-within { outline: var(--focus-width) solid var(--color-accent); outline-offset: 0; border-color: var(--color-transparent); }
 .search-box svg { color: var(--color-muted); }
 .search-box input { width: 100%; min-width: 0; border: 0; outline: 0; background: var(--color-transparent); font-size: var(--text-sm); }
 input::placeholder { color: var(--color-muted); opacity: 1; }
@@ -193,7 +193,6 @@ input[type="checkbox"] { width: 1rem; height: 1rem; accent-color: var(--color-ac
 .button.primary.live { background: var(--color-success-soft); border-color: var(--color-success); color: var(--color-success); }
 .button.primary.live:hover:not(:disabled) { background: var(--color-success-soft); filter: none; }
 .search-box { height: 2.25rem; padding-block: 0; border-radius: .4375rem; background: var(--color-bg); }
-.search-box:focus-within { outline-offset: 0; border-color: transparent; }
 .search-box input:focus, .search-box input:focus-visible { outline: 0; box-shadow: none; }
 .search-box input { height: 100%; }
 .topbar { min-height: 4rem; padding: 0 1.75rem; }
@@ -304,4 +303,19 @@ body.logs-fullscreen { overflow: hidden; }
 @media (pointer: coarse) {
   .button, .text-button, select, .search-box, .tab { min-height: 2.75rem; }
   .sidebar-toggle.button { min-height: 2.75rem; min-width: 2.75rem; }
+}
+
+/* One focus boundary replaces the control border; it never adds a second
+ * separated ring or changes the control's measured dimensions. */
+:root :is(button, input, select, textarea, summary, a, [tabindex]):focus-visible {
+  outline: var(--focus-width) solid var(--color-accent);
+  outline-offset: 0;
+  border-color: var(--color-transparent);
+  box-shadow: none;
+}
+:root .search-box input:focus-visible { outline: 0; }
+:root .button.primary:focus-visible {
+  background: var(--color-surface);
+  color: var(--color-ink);
+  filter: none;
 }
