@@ -86,6 +86,7 @@ include publication/public-files.json
 include pyproject.toml
 include release-please-config.json
 include schema/podgrove-v1.schema.json
+include scripts/check_exec_stream.py
 include scripts/e2e.py
 include scripts/homebrew_formula.py
 include scripts/install_release.py
@@ -133,6 +134,7 @@ include tests/test_dogfood_review.py
 include tests/test_down_json.py
 include tests/test_dynamic_ports.py
 include tests/test_e2e_harness.py
+include tests/test_exec_acceptance.py
 include tests/test_exec_half_close.py
 include tests/test_exec_transport.py
 include tests/test_fingerprint.py
