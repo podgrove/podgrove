@@ -26,6 +26,15 @@ from .reaper import reason
 from .sync import SnapshotRace, Synchronizer
 
 HEALTH_INTERVAL = 30.0
+STATUS_RETRY_DELAYS = (0.2, 0.5)
+STATUS_READ_TIMEOUT = 10
+_TRANSIENT_READ = re.compile(
+    r"connection reset by peer|connection refused|unexpected eof|\beof\b|broken pipe|"
+    r"i/o timeout|docker timed out after", re.IGNORECASE)
+
+
+class TransientDockerReadError(PodgroveError):
+    """A read-only Docker observation exhausted its bounded retry budget."""
 
 
 class SessionStopped(Exception):
@@ -118,7 +127,21 @@ class SyncWorker:
 
 
 def service_status(compose: Compose, env: dict) -> list[dict]:
-    output = run(compose.command("ps", "--all", "--format", "json"), env=env, cwd=compose.config.root).stdout.strip()
+    # Only this read is replayable. Build/up/exec and sync transfers can mutate
+    # remote state and must never inherit this retry policy.
+    for attempt in range(len(STATUS_RETRY_DELAYS) + 1):
+        try:
+            output = run(compose.command("ps", "--all", "--format", "json"), env=env,
+                         cwd=compose.config.root, timeout=STATUS_READ_TIMEOUT).stdout.strip()
+            break
+        except PodgroveError as exc:
+            if not _TRANSIENT_READ.search(str(exc)):
+                raise
+            if attempt == len(STATUS_RETRY_DELAYS):
+                raise TransientDockerReadError(
+                    f"Docker status temporarily unavailable after {attempt + 1} read attempts; "
+                    "retry status. The read did not stop the session.") from exc
+            time.sleep(STATUS_RETRY_DELAYS[attempt])
     if not output:
         return []
     try:

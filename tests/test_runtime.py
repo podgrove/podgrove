@@ -17,6 +17,46 @@ from podgrove.config import Config
 from podgrove.process import docker_environment
 
 
+@pytest.mark.parametrize("failure", ["connection reset by peer", "unexpected EOF", "EOF",
+                                     "broken pipe", "docker timed out after 10s"])
+def test_status_retries_a_transient_read_without_replaying_mutations(monkeypatch, tmp_path, failure):
+    compose = Mock(config=SimpleNamespace(root=tmp_path))
+    compose.command.return_value = ["docker", "compose", "ps", "--all", "--format", "json"]
+    read = Mock(side_effect=[PodgroveError(failure),
+                            SimpleNamespace(stdout='[{"Service":"api","State":"running"}]')])
+    sleep = Mock()
+    monkeypatch.setattr(runtime, "run", read)
+    monkeypatch.setattr(runtime.time, "sleep", sleep)
+    env = {"DOCKER_HOST": "tcp://127.0.0.1:43210"}
+    assert runtime.service_status(compose, env) == [{"Service": "api", "State": "running"}]
+    assert read.call_count == 2
+    for call in read.call_args_list:
+        assert call.args == (compose.command.return_value,)
+        assert call.kwargs == {"env": env, "cwd": tmp_path, "timeout": runtime.STATUS_READ_TIMEOUT}
+    assert all(call.args == ("ps", "--all", "--format", "json") for call in compose.command.call_args_list)
+    sleep.assert_called_once_with(runtime.STATUS_RETRY_DELAYS[0])
+
+
+def test_status_read_retry_exhaustion_is_bounded_and_identified_as_transient(monkeypatch, tmp_path):
+    read = Mock(side_effect=PodgroveError("connection reset by peer"))
+    sleep = Mock()
+    monkeypatch.setattr(runtime, "run", read)
+    monkeypatch.setattr(runtime.time, "sleep", sleep)
+    with pytest.raises(runtime.TransientDockerReadError, match="temporarily unavailable after 3 read attempts"):
+        runtime.service_status(Mock(config=SimpleNamespace(root=tmp_path)), {})
+    assert read.call_count == 3
+    assert [call.args[0] for call in sleep.call_args_list] == list(runtime.STATUS_RETRY_DELAYS)
+
+
+@pytest.mark.parametrize("failure", ["permission denied", "unknown flag", "invalid compose file"])
+def test_status_does_not_retry_permanent_errors(monkeypatch, tmp_path, failure):
+    read = Mock(side_effect=PodgroveError(failure))
+    monkeypatch.setattr(runtime, "run", read)
+    with pytest.raises(PodgroveError, match=failure):
+        runtime.service_status(Mock(config=SimpleNamespace(root=tmp_path)), {})
+    assert read.call_count == 1
+
+
 def stack():
     return {"services": {
         "init": {"image": "busybox"},
