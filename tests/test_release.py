@@ -377,3 +377,149 @@ def test_uv_build_marker_removed_without_accepting_unknown_content(tmp_path):
     with pytest.raises(ValueError):
         verify.remove_build_marker(tmp_path)
     assert marker.read_text() == "unexpected"
+
+
+@pytest.fixture
+def release_api(monkeypatch):
+    replies, calls = {}, []
+    def run(command, **kwargs):
+        assert command[:2] == ["gh", "api"] and command[-1] == "--include"
+        assert kwargs == {"check": False, "capture_output": True, "text": True, "timeout": 60}
+        endpoint = command[2]
+        calls.append(endpoint)
+        status, body = replies[endpoint]
+        return resolver.subprocess.CompletedProcess(command, 0 if status == 200 else 1,
+            f"HTTP/2.0 {status} Fixture\r\nContent-Type: application/json\r\n\r\n{json.dumps(body)}",
+            "" if status == 200 else f"gh: fixture (HTTP {status})")
+    monkeypatch.setattr(resolver.subprocess, "run", run)
+    return replies, calls
+
+
+def draft_lookup(replies):
+    base = "repos/podgrove/podgrove"
+    release = {"id": 123, "tag_name": "v0.2.0", "draft": True, "prerelease": False, "assets": []}
+    replies[f"{base}/releases/tags/v0.2.0"] = 404, {"message": "Not Found"}
+    replies[f"{base}/releases?per_page=100&page=1"] = 200, [release]
+    replies[f"{base}/releases/123"] = 200, release
+    replies[f"{base}/commits/v0.2.0"] = 200, {"sha": "e" * 40}
+    return base, release
+
+
+def test_resolver_published_tag_uses_direct_endpoint_without_listing(release_api):
+    replies, calls = release_api
+    base, release = draft_lookup(replies)
+    release["draft"] = False
+    replies[f"{base}/releases/tags/v0.2.0"] = 200, release
+    assert resolver.resolve("podgrove/podgrove", "v0.2.0") == (release, "e" * 40)
+    assert calls == [f"{base}/releases/tags/v0.2.0", f"{base}/commits/v0.2.0"]
+
+
+def test_resolver_draft_404_falls_back_to_paginated_exact_tag_then_id(release_api):
+    replies, calls = release_api
+    base, release = draft_lookup(replies)
+    # A prefix match, API-provided foreign URL and other pages cannot redirect
+    # resolution. Only the exact tag's constructed endpoint is read.
+    release["url"] = "https://attacker.invalid/releases/123"
+    first = [{"id": 1000 + index, "tag_name": f"v0.2.{index + 1}"} for index in range(100)]
+    replies[f"{base}/releases?per_page=100&page=1"] = 200, first
+    replies[f"{base}/releases?per_page=100&page=2"] = 200, [release]
+    assert resolver.resolve("podgrove/podgrove", "v0.2.0") == (release, "e" * 40)
+    assert calls == [f"{base}/releases/tags/v0.2.0", f"{base}/releases?per_page=100&page=1",
+                     f"{base}/releases?per_page=100&page=2", f"{base}/releases/123", f"{base}/commits/v0.2.0"]
+
+
+@pytest.mark.parametrize("status", [401, 403, 429, 500])
+def test_resolver_non_404_never_falls_back_even_if_body_mentions_404(release_api, status):
+    replies, calls = release_api
+    endpoint = "repos/podgrove/podgrove/releases/tags/v0.2.0"
+    replies[endpoint] = status, {"message": "Not Found (HTTP 404)"}
+    with pytest.raises(resolver.GitHubAPIError) as caught:
+        resolver.resolve("podgrove/podgrove", "v0.2.0")
+    assert caught.value.status == status and calls == [endpoint]
+
+
+def test_resolver_transport_failure_with_404_text_is_not_http_404(monkeypatch):
+    calls = []
+    def run(command, **kwargs):
+        calls.append(command)
+        return resolver.subprocess.CompletedProcess(command, 1, "", "proxy connection failed (HTTP 404)")
+    monkeypatch.setattr(resolver.subprocess, "run", run)
+    with pytest.raises(resolver.GitHubAPIError) as caught:
+        resolver.resolve("podgrove/podgrove", "v0.2.0")
+    assert caught.value.status is None and len(calls) == 1
+
+
+@pytest.mark.parametrize("entries,message", [([], "not found"),
+    ([{"id": 1, "tag_name": "v0.2.01"}], "not found"),
+    ([{"id": 1, "tag_name": "v0.2.0"}, {"id": 2, "tag_name": "v0.2.0"}], "ambiguous"),
+    ({"message": "not a page"}, "malformed"),
+    ([{"id": True, "tag_name": "v0.2.0"}], "malformed"),
+    ([{"id": 1, "tag_name": None}], "malformed"),
+])
+def test_resolver_missing_ambiguous_or_malformed_fallback_refuses_commit_reads(release_api, entries, message):
+    replies, calls = release_api
+    base, _ = draft_lookup(replies)
+    replies[f"{base}/releases?per_page=100&page=1"] = 200, entries
+    with pytest.raises(ValueError, match=message):
+        resolver.resolve("podgrove/podgrove", "v0.2.0")
+    assert len(calls) == 2
+
+
+def test_resolver_duplicate_on_later_page_is_not_hidden_by_early_match(release_api):
+    replies, calls = release_api
+    base, release = draft_lookup(replies)
+    first = [release, *({"id": 1000 + index, "tag_name": f"v1.0.{index}"} for index in range(99))]
+    replies[f"{base}/releases?per_page=100&page=1"] = 200, first
+    replies[f"{base}/releases?per_page=100&page=2"] = 200, [{**release, "id": 456}]
+    with pytest.raises(ValueError, match="ambiguous"):
+        resolver.resolve("podgrove/podgrove", "v0.2.0")
+    assert len(calls) == 3
+
+
+def test_resolver_incomplete_pagination_refuses_even_one_found_match(release_api, monkeypatch):
+    replies, calls = release_api
+    base, release = draft_lookup(replies)
+    monkeypatch.setattr(resolver, "MAX_RELEASE_PAGES", 2)
+    for page in (1, 2):
+        rows = [{"id": page * 1000 + index, "tag_name": f"v{page}.0.{index}"} for index in range(100)]
+        if page == 1:
+            rows[0] = release
+        replies[f"{base}/releases?per_page=100&page={page}"] = 200, rows
+    with pytest.raises(ValueError, match="bounded lookup"):
+        resolver.resolve("podgrove/podgrove", "v0.2.0")
+    assert len(calls) == 3
+
+
+def test_resolver_listing_auth_failure_is_not_treated_as_missing_release(release_api):
+    replies, calls = release_api
+    base, _ = draft_lookup(replies)
+    replies[f"{base}/releases?per_page=100&page=1"] = 403, {"message": "Forbidden"}
+    with pytest.raises(resolver.GitHubAPIError) as caught:
+        resolver.resolve("podgrove/podgrove", "v0.2.0")
+    assert caught.value.status == 403 and len(calls) == 2
+
+
+@pytest.mark.parametrize("change,message", [({"id": 456}, "ID changed"),
+                                            ({"tag_name": "v0.2.1"}, "requested stable"),
+                                            ({"prerelease": True}, "requested stable")])
+def test_resolver_fallback_reread_retains_tag_and_stable_release_checks(release_api, change, message):
+    replies, calls = release_api
+    base, release = draft_lookup(replies)
+    replies[f"{base}/releases/123"] = 200, {**release, **change}
+    with pytest.raises(ValueError, match=message):
+        resolver.resolve("podgrove/podgrove", "v0.2.0")
+    assert len(calls) == 3
+
+
+def test_resolver_fallback_still_requires_real_commit_and_expected_sha(release_api, monkeypatch):
+    replies, _ = release_api
+    base, _ = draft_lookup(replies)
+    replies[f"{base}/commits/v0.2.0"] = 200, {"sha": "not-a-commit"}
+    with pytest.raises(ValueError, match="resolve to a commit"):
+        resolver.resolve("podgrove/podgrove", "v0.2.0")
+    replies[f"{base}/commits/v0.2.0"] = 200, {"sha": "e" * 40}
+    monkeypatch.setattr(sys, "argv", ["resolve_release.py", "--repository", "podgrove/podgrove",
+                                    "--tag", "v0.2.0", "--expected-sha", "f" * 40])
+    with pytest.raises(SystemExit) as caught:
+        resolver.main()
+    assert caught.value.code == 2
