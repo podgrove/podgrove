@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -272,6 +273,77 @@ def test_bounded_subprocess_and_post_eof_cancellation():
     assert time.monotonic() - started < 2
     with pytest.raises(soak.Refused, match="output limit"):
         soak.read_command([sys.executable, "-c", "print('x'*10000)"], dict(os.environ), threading.Event(), limit=100)
+
+
+@pytest.mark.parametrize("limit", [10, 4096])
+def test_exited_group_permission_race_keeps_observation_result_and_closes_pipe(monkeypatch, limit):
+    original_popen = subprocess.Popen
+    processes = []
+
+    def launch(*args, **kwargs):
+        process = original_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    def exited_group(pid, sig):
+        process, = processes
+        assert pid == process.pid and sig == signal.SIGKILL
+        process.wait(timeout=2)
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(soak.subprocess, "Popen", launch)
+    monkeypatch.setattr(soak.os, "killpg", exited_group)
+    command = [sys.executable, "-c", "print('x'*1000)"]
+    if limit == 10:
+        with pytest.raises(soak.Refused, match="output limit") as failure:
+            soak.read_command(command, dict(os.environ), threading.Event(), limit=limit)
+        assert not getattr(failure.value, "__notes__", [])
+    else:
+        assert soak.read_command(command, dict(os.environ), threading.Event(), limit=limit) == (0, b"x" * 1000 + b"\n")
+    process, = processes
+    assert process.poll() == 0 and process.stdout.closed
+
+
+def test_live_group_permission_denial_is_not_treated_as_completed_cleanup(monkeypatch):
+    process = Mock(pid=12345)
+    process.poll.return_value = None
+    monkeypatch.setattr(soak.os, "killpg", Mock(side_effect=PermissionError(1, "Operation not permitted")))
+    with pytest.raises(PermissionError):
+        soak.stop_process(process)
+    process.wait.assert_not_called()
+
+
+@pytest.mark.parametrize("primary_error", [False, True])
+def test_cleanup_failure_always_closes_pipe_and_preserves_safe_primary_diagnostic(monkeypatch, primary_error):
+    original_popen, original_killpg = subprocess.Popen, os.killpg
+    processes = []
+
+    def launch(*args, **kwargs):
+        process = original_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(soak.subprocess, "Popen", launch)
+    monkeypatch.setattr(soak.os, "killpg", Mock(side_effect=OSError(5, "private-cleanup-diagnostic")))
+    try:
+        script = "import time;print('x'*1000,flush=True)" + (";time.sleep(60)" if primary_error else "")
+        expected = "output limit" if primary_error else "cleanup could not be confirmed"
+        with pytest.raises(soak.Refused, match=expected) as failure:
+            soak.read_command([sys.executable, "-c", script], dict(os.environ), threading.Event(),
+                              limit=10 if primary_error else 4096)
+        process, = processes
+        assert process.stdout.closed
+        if primary_error:
+            assert process.poll() is None
+            assert failure.value.__notes__ == ["Observation command cleanup could not be confirmed"]
+        assert "private" not in str(failure.value)
+    finally:
+        for process in processes:
+            try:
+                original_killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            process.wait(timeout=2)
 
 
 def test_real_http_fixture_probe_checks_marker_without_following_redirects():

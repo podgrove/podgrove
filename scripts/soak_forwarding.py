@@ -66,6 +66,11 @@ def stop_process(process):
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+    except PermissionError:
+        # Darwin can reject a group signal after its leader has exited. A live
+        # leader still makes this an unconfirmed cleanup, never a success.
+        if process.poll() is None:
+            raise
     process.wait(timeout=3)
 
 
@@ -95,8 +100,15 @@ def read_command(command, env, stop, *, timeout=40, limit=MAX_BYTES):
                         raise Refused("Observation command exceeded its output limit")
         return process.wait(), bytes(output)
     finally:
-        stop_process(process)
-        process.stdout.close()
+        primary_error = sys.exception()
+        try:
+            stop_process(process)
+        except (OSError, subprocess.TimeoutExpired) as cleanup_error:
+            if primary_error is None:
+                raise Refused("Observation command cleanup could not be confirmed") from cleanup_error
+            primary_error.add_note("Observation command cleanup could not be confirmed")
+        finally:
+            process.stdout.close()
 
 
 BINARY_PROBE = r'''
