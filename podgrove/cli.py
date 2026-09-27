@@ -558,7 +558,10 @@ def execute(args) -> int:
             raise PodgroveError("exec requires a command after --")
         from .exec_transport import run_exec
         project = data.get("compose_project") or model.get("name")
-        return run_exec(kube, ident, project, args.service, cmd_args, tty=sys.stdin.isatty())
+        # Redirected exports need separate, byte-preserving completion proofs,
+        # even when input is still attached to the user's terminal.
+        tty = sys.stdin.isatty() and sys.stdout.isatty() and sys.stderr.isatty()
+        return run_exec(kube, ident, project, args.service, cmd_args, tty=tty)
     with ExitStack() as cleanup:
         host = data.get("docker_host")
         if not connected:
