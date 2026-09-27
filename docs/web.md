@@ -51,11 +51,22 @@ Allocation values are configured resources and PVC capacity, not live CPU, memor
 
 ## Logs
 
-Choose the engine, a Compose service or an individual service container in the **Logs** tab. **Refresh logs** reads a snapshot; **Go live** opens a continuing connection using `kubectl logs --follow` or the existing authenticated Docker connection. The interface offers an initial tail of 100 or 200 lines per container; the API accepts 1–200. Quiet streams remain connected and send heartbeats; the page does not repeatedly fetch snapshots to simulate live logs.
+Choose the engine, a Compose service or an individual service container in the **Logs** tab. **Refresh logs** reads a snapshot; **Go live** opens a continuing connection using `kubectl logs --follow` or the existing authenticated Docker connection. The interface offers an initial tail of 100 or 200 lines per container, or **All logs** for all available retained history from the selected source. The API accepts 1–200 or the exact `all` value. This does not combine unrelated sources or recover rotated logs. Quiet streams remain connected and send heartbeats; the page does not repeatedly fetch snapshots to simulate live logs.
 
 Live connections last up to five minutes. **Pause live** closes the connection; **Resume live** opens another connection with a fresh tail. The page reports disconnects, expiry, unavailable sources and changed ownership. Resuming can repeat lines or leave gaps; there is no durable cursor or exactly-once guarantee. A connection follows the selected container identities, so replacement containers require a new connection. Live service streams aggregate at most eight containers; larger services require a specific container selection rather than silently omitting replicas. Service snapshots read at most 16 containers within a shared 15-second budget and report truncation when a bound is reached. Aggregated output is not a globally timestamp-sorted log.
 
+**All logs** still uses the dashboard limits: snapshots read at most 64 KiB and show an incomplete-output message when clipped. Docker snapshots can include the beginning of retained history before reaching that cap; they are not guaranteed to show its newest 64 KiB.
+
 The reader keeps at most 2,000 lines and 256 KiB, discarding the oldest displayed lines with a notice. Auto-scroll can be disabled while reading; **Jump to latest** returns to the newest output. Wrapping and copying apply to the retained text. **Fullscreen** expands the reader, using browser fullscreen where supported and an in-page fallback otherwise. Escape exits. Changing the worktree, log source, tab or configuration page stops the active stream.
+
+For retained service history without dashboard byte or line limits, export directly from the same worktree and context:
+
+```sh
+podgrove logs SERVICE --tail all > service.log
+podgrove logs SERVICE --tail all --follow
+```
+
+These commands stream Compose output directly to stdout, preserve its exit status, and use the recorded environment even when the session is disconnected. CLI output does not apply dashboard redaction. Engine-container history can be exported with an explicitly targeted `kubectl logs --tail=-1` command. Neither path can recover logs already removed by the runtime's retention policy.
 
 Only complete live-log lines are emitted. Lines larger than 16 KiB and incomplete final lines are discarded; the page reports these limits. Both snapshot and live reads redact common single-line password/token/authorization patterns, including Basic and Bearer credentials. Live reads also suppress private-key blocks across transport chunks and timestamp-prefixed lines, including when a delimiter occurs in an oversized discarded line. Snapshot redaction does not assemble multiline private-key blocks. None of these filters guarantees that application logs contain no secrets.
 
@@ -85,7 +96,7 @@ Each server process generates a random API token in the URL fragment. The fronte
 
 Responses omit session tokens, control sockets, Docker connection addresses, container command/env payloads, and private authentication configuration. Application logs are intentionally displayed: common password/token/authorization patterns are redacted, but **arbitrary secrets in application logs cannot be reliably identified**. Review application logging practices before sharing a screenshot or log excerpt.
 
-The snapshot log-tail setting accepts 1–200 lines per selected container; combined output is capped at 64 KiB per request, with truncation reported. JSON responses are capped at 1 MiB. Live logs use an authenticated NDJSON endpoint, with two stream slots separate from four ordinary request slots, a bounded server queue and a five-minute connection lifetime. Ownership is revalidated before exposing logs and periodically during a stream. Disconnects and shutdown cancel upstream subprocesses/sockets. Cluster subprocesses, Docker reads, and concurrent HTTP requests have explicit limits; no mutation controls are exposed.
+The snapshot log-tail setting accepts 1–200 lines per selected container or `all` retained history; combined output is capped at 64 KiB per request, with truncation reported. JSON responses are capped at 1 MiB. Live logs use an authenticated NDJSON endpoint, with two stream slots separate from four ordinary request slots, a bounded server queue and a five-minute connection lifetime. Ownership is revalidated before exposing logs and periodically during a stream. Disconnects and shutdown cancel upstream subprocesses/sockets. Cluster subprocesses, Docker reads, and concurrent HTTP requests have explicit limits; no mutation controls are exposed.
 
 ## Local verification
 
