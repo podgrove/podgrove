@@ -18,7 +18,7 @@ from .compose import Compose
 from .config import default_tainted_nodes, load_cluster, load_config, storage_class_name
 from .errors import PodgroveError
 from .fingerprint import FORMAT as FINGERPRINT_FORMAT, launch_fingerprint
-from .forward import port_plan
+from .forward import validate_port_plan
 from .kube import Kube, context_name, manifests, namespace_name, resolve_namespace
 from .process import docker_environment
 from .reaper import mr_endpoint, reap
@@ -246,7 +246,7 @@ def up(args, root: Path) -> int:
                     time.sleep(0.1)
                 if Path(old["socket"]).exists():
                     raise PodgroveError("Existing session is still stopping; retry up after it finishes")
-        port_plan(compose.published_ports(model), config.forward, ident)
+        validate_port_plan(compose.published_ports(model), config.forward, ident)
         kube.preflight(node_mode=node_mode, tainted_nodes=config.tainted_nodes)
         kube.check_storage(resources)
         kube.ensure_namespace(ident, resources[0]["metadata"]["labels"])
@@ -327,7 +327,7 @@ def execute(args) -> int:
         compose = Compose(config)
         model = compose.model()
         compose.validate(model)
-        port_plan(compose.published_ports(model), config.forward, state.identity(root))
+        validate_port_plan(compose.published_ports(model), config.forward, state.identity(root))
         print(json.dumps({"valid": True, "services": sorted(model["services"]), "sync_paths": [str(p) for p in compose.sync_paths(model)]}, indent=2))
         return 0
     if args.command == "up":

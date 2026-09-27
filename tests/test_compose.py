@@ -156,8 +156,7 @@ def test_env_file_required_and_optional(project):
 def test_ports_dynamic_range_and_invalid_protocol(project):
     model = base_model()
     model["services"]["app"]["ports"] = [{"target": 8080}, {"target": 8081, "published": "30000-30100"}]
-    with pytest.raises(PodgroveError, match="explicit published port"):
-        project.validate(model)
+    project.validate(model)
     project.config.forward = []
     project.validate(model)
     assert project.published_ports(model) == [

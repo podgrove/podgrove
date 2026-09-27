@@ -256,8 +256,6 @@ class Compose:
             matching = [port for port in ports if port["service"] == name and port["target"] == target]
             if len(matching) != 1:
                 self._refuse("forward.port", f"{name}:{target} must have exactly one published TCP port")
-            if not isinstance(matching[0]["published"], int) or matching[0]["published"] == 0:
-                self._refuse(f"services.{name}.ports", "forwarding requires an explicit published port, without ranges")
             service = model["services"][name]
             replicas = service.get("scale", service.get("deploy", {}).get("replicas", 1))
             if replicas != 1:

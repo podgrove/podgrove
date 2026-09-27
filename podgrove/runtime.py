@@ -19,7 +19,7 @@ from .compose import Compose
 from .config import load_config
 from .docker_tunnel import DockerTunnel
 from .errors import PodgroveError
-from .forward import Tunnel, free_port, port_plan
+from .forward import PortMappingError, Tunnel, free_port, port_plan, verify_port_mappings
 from .kube import Kube
 from .process import docker_environment, run
 from .reaper import reason
@@ -410,7 +410,8 @@ def serve(path: Path) -> int:
         # Explicitly target the engine throughout. Never select or mutate a Docker context.
         run(["docker", "info"], env=env, timeout=30)
         sync, elapsed, rows = launch_stack(compose, model, env, data["identity"], data["timeout"])
-        ports = port_plan(compose.published_ports(model), config.forward, data["identity"])
+        ports = port_plan(compose.published_ports(model), config.forward, data["identity"],
+                          observed=rows, project=model.get("name"))
         if ports:
             app_tunnel = Tunnel(kube, data["identity"], [(p["local"], p["published"]) for p in ports])
             app_tunnel.on_change = forward_changed
@@ -486,6 +487,23 @@ def serve(path: Path) -> int:
                         data["problems"] = [str(exc)]
                     else:
                         data["services"] = rows
+                        if app_tunnel is not None:
+                            try:
+                                verify_port_mappings(ports, rows, model.get("name"))
+                            except PortMappingError as exc:
+                                # A recreated container can have a different
+                                # Docker-assigned port. Never keep a ready
+                                # endpoint aimed at that old port. Retain the
+                                # engine and sync, but require explicit refresh.
+                                app_tunnel.close()
+                                with activity_lock:
+                                    app_tunnel = None
+                                    data["forward_status"] = {
+                                        "state": "disconnected", "attempts": 0,
+                                        "changed_at": time.time(), "checked_at": time.time(),
+                                        "error": f"{exc} Local forwarding stopped; run podgrove up --refresh to reconnect."}
+                                    for port in ports:
+                                        port["status"] = "disconnected"
                         ready, problems = readiness(model, rows)
                         services_ready = ready
                         data["health_status"] = {"state": "ready", "checked_at": time.time(),

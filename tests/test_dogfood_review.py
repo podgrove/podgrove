@@ -24,7 +24,7 @@ def recorded(tmp_path, monkeypatch):
     monkeypatch.setenv("PODGROVE_STATE_HOME", str(tmp_path / "state"))
     model = {"name": "review-project", "services": {"api": {"image": "busybox:1.37"}}}
     monkeypatch.setattr(Compose, "model", lambda _: deepcopy(model))
-    monkeypatch.setattr(cli, "port_plan", Mock(return_value=[]))
+    monkeypatch.setattr(cli, "validate_port_plan", Mock())
     config = cli.load_config(root)
     fingerprint = hashlib.sha256(json.dumps({"model": model, "forward": config.forward,
         "ttl": config.ttl_seconds, "network": config.network}, sort_keys=True).encode()).hexdigest()

@@ -124,6 +124,7 @@ include tests/test_deploy.py
 include tests/test_docker_tunnel.py
 include tests/test_dogfood_cli.py
 include tests/test_dogfood_review.py
+include tests/test_dynamic_ports.py
 include tests/test_e2e_harness.py
 include tests/test_exec_half_close.py
 include tests/test_fingerprint.py

@@ -55,13 +55,15 @@ def session(tmp_path, monkeypatch, request):
     config = Config(root=root, files=[], ttl_seconds=3600,
                     forward=[{"service": "api", "port": 8080, "local": port}])
     compose = Mock(config=config)
-    compose.model.return_value = {"services": {"api": {"image": "offline-fixture"}}}
-    compose.published_ports.return_value = [{"service": "api", "target": 8080, "published": 8080}]
+    compose.model.return_value = {"name": "offline-fixture", "services": {"api": {"image": "offline-fixture"}}}
+    compose.published_ports.return_value = [{"service": "api", "target": 8080,
+                                            "published": settings.get("published", 8080)}]
     compose.has_watch.return_value = False
     monkeypatch.setattr(runtime, "load_config", lambda *_: config)
     monkeypatch.setattr(runtime, "Compose", lambda *_: compose)
     monkeypatch.setattr(runtime, "run", Mock())
-    rows = [{"Service": "api", "State": "running", "Health": "healthy"}]
+    rows = [{"Service": "api", "Project": "offline-fixture", "State": "running", "Health": "healthy",
+             "Publishers": [{"TargetPort": 8080, "PublishedPort": 8080, "Protocol": "tcp", "URL": "0.0.0.0"}]}]
     sync = FakeSynchronizer(root, [source], identity=ident)
     sync.start()
     sync_close = Mock(wraps=sync.close)
@@ -83,7 +85,7 @@ def session(tmp_path, monkeypatch, request):
     wait_until(lambda: state.read(path)["status"] in ("ready", "error"))
     assert state.read(path)["status"] == "ready", state.read(path)
     current = SimpleNamespace(path=path, data=data, source=source, sync=sync, kube=kube, api=api,
-                              tunnel=tunnels[0], port=port, thread=thread, result=result)
+                              tunnel=tunnels[0], port=port, thread=thread, result=result, rows=rows)
     try:
         yield current
     finally:
@@ -92,7 +94,7 @@ def session(tmp_path, monkeypatch, request):
             thread.join(timeout=5)
         assert not thread.is_alive()
         assert not socket_path.exists()
-        assert tunnels[0].process.poll() is not None and not tunnels[0]._thread.is_alive()
+        assert (tunnels[0].process is None or tunnels[0].process.poll() is not None) and not tunnels[0]._thread.is_alive()
         assert tunnels[0].log is None
         api.close.assert_called_once()
         kube.destroy.assert_not_called()
@@ -139,6 +141,7 @@ def test_idle_forward_exit_publishes_reconnecting_then_recovers_same_address(ses
     echo(session.port)
 
 
+@pytest.mark.parametrize("session", [{}, {"published": 0}], indirect=True)
 def test_health_read_outage_keeps_control_sync_and_forward_alive_then_recovers(session, monkeypatch):
     available = threading.Event()
     original = session.tunnel.process
@@ -146,7 +149,7 @@ def test_health_read_outage_keeps_control_sync_and_forward_alive_then_recovers(s
     def health(*_):
         if not available.is_set():
             raise runtime.TransientDockerReadError("Docker status temporarily unavailable after EOF")
-        return [{"Service": "api", "State": "running", "Health": "healthy"}]
+        return session.rows
 
     monkeypatch.setattr(runtime, "HEALTH_INTERVAL", 0)
     monkeypatch.setattr(runtime, "service_status", health)

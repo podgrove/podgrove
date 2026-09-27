@@ -124,6 +124,7 @@
     "tests/test_docker_tunnel.py",
     "tests/test_dogfood_cli.py",
     "tests/test_dogfood_review.py",
+    "tests/test_dynamic_ports.py",
     "tests/test_e2e_harness.py",
     "tests/test_exec_half_close.py",
     "tests/test_fingerprint.py",

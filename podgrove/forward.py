@@ -22,23 +22,54 @@ def free_port(preferred: int = 0) -> int:
         return sock.getsockname()[1]
 
 
-def port_plan(published: list[dict], configured: list[dict] | None, ident: str) -> list[dict]:
-    chosen = published if configured is None else []
+def _selected_ports(published: list[dict], configured: list[dict] | None) -> list[dict]:
+    chosen = [dict(port) for port in published] if configured is None else []
     if configured is not None:
         for rule in configured:
             matches = [p for p in published if p["service"] == rule["service"] and p["target"] == rule["port"]]
             if len(matches) != 1:
                 raise PodgroveError(f"forward: {rule['service']}:{rule['port']} must identify exactly one published TCP port")
             chosen.append({**matches[0], "local": rule.get("local")})
+    seen = set()
+    for port in chosen:
+        key = (port["service"], port["target"])
+        if key in seen:
+            raise PodgroveError(f"forward: {key[0]}:{key[1]} must identify exactly one published TCP port")
+        seen.add(key)
+        if port.get("protocol", "tcp") != "tcp":
+            raise PodgroveError(f"services.{port['service']}.ports: UDP forwarding is unsupported")
+        _declared_bounds(port)
+    return chosen
+
+
+def _declared_bounds(port: dict) -> tuple[int, int]:
+    declared = port.get("declared_published", port["published"])
+    try:
+        if type(declared) is int:
+            bounds = (1, 65535) if declared == 0 else (declared, declared)
+        elif isinstance(declared, str) and "-" in declared:
+            bounds = tuple(int(part) for part in declared.split("-"))
+        else:
+            raise ValueError
+        if len(bounds) != 2 or not 1 <= bounds[0] <= bounds[1] <= 65535:
+            raise ValueError
+    except (TypeError, ValueError) as exc:
+        raise PodgroveError(f"services.{port['service']}.ports: invalid published port or range") from exc
+    if declared != 0 and bounds[0] <= 2375 <= bounds[1]:
+        raise PodgroveError(f"services.{port['service']}.ports: 2375 is reserved for the Docker API")
+    return bounds
+
+
+def _dynamic(port: dict) -> bool:
+    declared = port.get("declared_published", port["published"])
+    return declared == 0 or isinstance(declared, str)
+
+
+def _local_ports(chosen: list[dict], ident: str) -> list[int]:
     offset = int(ident[:8], 16) % 20000
     used = set()
     result = []
     for port in chosen:
-        if port.get("protocol", "tcp") != "tcp":
-            raise PodgroveError(f"services.{port['service']}.ports: UDP forwarding is unsupported")
-        remote = int(port["published"])
-        if not 1 <= remote <= 65535:
-            raise PodgroveError(f"services.{port['service']}.ports: an explicit published port is required")
         local = port.get("local")
         if local is not None:
             local = free_port(int(local))
@@ -46,7 +77,10 @@ def port_plan(published: list[dict], configured: list[dict] | None, ident: str) 
                 raise PodgroveError(f"forward.local: duplicate port {local}")
         else:
             # Deterministic preference, then a free port. Never reuse a listener.
-            local = 20000 + (remote + offset) % 40000
+            # Docker may choose a new host port after recreation. Base dynamic
+            # local preferences on the stable container target instead.
+            preferred = port["target"] if _dynamic(port) else port["published"]
+            local = 20000 + (preferred + offset) % 40000
             for _ in range(40000):
                 if local not in used:
                     try:
@@ -58,8 +92,80 @@ def port_plan(published: list[dict], configured: list[dict] | None, ident: str) 
             else:
                 raise PodgroveError("No free local application port")
         used.add(local)
-        result.append({**port, "published": remote, "local": local, "url": f"http://127.0.0.1:{local}"})
+        result.append(local)
     return result
+
+
+def validate_port_plan(published: list[dict], configured: list[dict] | None, ident: str) -> None:
+    """Check selection and local availability before starting the remote stack.
+
+    Dynamic Docker ports do not exist yet. This never invents a remote port or
+    returns a forwarding plan that a caller could mistake for a ready endpoint.
+    """
+    _local_ports(_selected_ports(published, configured), ident)
+
+
+class PortMappingError(PodgroveError):
+    """An observed Compose publisher cannot safely back a local endpoint."""
+
+
+def _observed_port(port: dict, rows: list[dict], project: str | None) -> int:
+    label = f"{port['service']}:{port['target']}"
+    guidance = "Refresh with podgrove up --refresh to resolve current published ports."
+    matches = [row for row in rows if isinstance(row, dict) and row.get("Service") == port["service"]]
+    if len(matches) != 1 or matches[0].get("State") != "running":
+        raise PortMappingError(f"{label}: forwarding requires exactly one running service container. {guidance}")
+    row = matches[0]
+    if project is not None and row.get("Project") != project:
+        raise PortMappingError(f"{label}: observed container belongs to a different Compose project; refusing forwarding")
+    publishers = row.get("Publishers")
+    if not isinstance(publishers, list):
+        raise PortMappingError(f"{label}: no published TCP port was observed. {guidance}")
+    ports = set()
+    for binding in publishers:
+        if not isinstance(binding, dict):
+            raise PortMappingError(f"{label}: malformed published port observation")
+        if binding.get("TargetPort") != port["target"] or binding.get("Protocol") != "tcp":
+            continue
+        remote = binding.get("PublishedPort")
+        if (type(binding.get("TargetPort")) is not int or type(remote) is not int
+                or not 1 <= remote <= 65535 or remote == 2375
+                or binding.get("URL") not in ("0.0.0.0", "127.0.0.1", "::", "::1", "")):
+            raise PortMappingError(f"{label}: unsafe or malformed published TCP port observation")
+        lower, upper = _declared_bounds(port)
+        if not lower <= remote <= upper:
+            raise PortMappingError(f"{label}: observed port does not match its Compose declaration. {guidance}")
+        ports.add(remote)
+    if len(ports) != 1:
+        raise PortMappingError(f"{label}: expected one unambiguous published TCP port. {guidance}")
+    return ports.pop()
+
+
+def port_plan(published: list[dict], configured: list[dict] | None, ident: str, *,
+              observed: list[dict] | None = None, project: str | None = None) -> list[dict]:
+    chosen = _selected_ports(published, configured)
+    resolved = []
+    for port in chosen:
+        if observed is not None:
+            remote = _observed_port(port, observed, project)
+        elif _dynamic(port):
+            raise PortMappingError(f"{port['service']}:{port['target']}: dynamic forwarding requires observed Docker publishers")
+        else:
+            remote = port["published"]
+        metadata = {"declared_published": port.get("declared_published", port["published"])} if _dynamic(port) else {}
+        resolved.append({**port, **metadata, "published": remote})
+    return [{**port, "local": local, "url": f"http://127.0.0.1:{local}"}
+            for port, local in zip(resolved, _local_ports(resolved, ident))]
+
+
+def verify_port_mappings(ports: list[dict], rows: list[dict], project: str | None) -> None:
+    """Detect recreation or missing mappings without reallocating local ports."""
+    for port in ports:
+        if _observed_port(port, rows, project) != port["published"]:
+            raise PortMappingError(
+                f"{port['service']}:{port['target']}: Docker reassigned its published port; "
+                "forwarding stopped. Run podgrove up --refresh to reconnect."
+            )
 
 
 class ForwardOwnershipError(PodgroveError):

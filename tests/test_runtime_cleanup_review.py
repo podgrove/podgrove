@@ -72,7 +72,7 @@ def test_clean_stop_reports_cleanup_failure_in_retry_state(supervised_session, m
 
 
 def test_one_failed_tunnel_close_does_not_skip_remaining_tunnel(request, monkeypatch):
-    monkeypatch.setattr(runtime, "port_plan", lambda *_args: [{"local": 12345, "published": 80}])
+    monkeypatch.setattr(runtime, "port_plan", lambda *_args, **_kwargs: [{"local": 12345, "published": 80}])
     session = request.getfixturevalue("supervised_session")
     assert session.events.count("tunnel-start") == 2
     closed = []
