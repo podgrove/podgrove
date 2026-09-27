@@ -134,6 +134,7 @@
     "tests/test_down_json.py",
     "tests/test_dynamic_ports.py",
     "tests/test_e2e_harness.py",
+    "tests/test_engine_identity.py",
     "tests/test_exec_acceptance.py",
     "tests/test_exec_half_close.py",
     "tests/test_exec_transport.py",

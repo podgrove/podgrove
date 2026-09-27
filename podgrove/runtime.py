@@ -320,6 +320,11 @@ def serve(path: Path) -> int:
         with activity_lock:
             if api_tunnel is not None:
                 data["docker_status"] = api_tunnel.snapshot()
+                identity_snapshot = getattr(api_tunnel, "identity_snapshot", None)
+                if callable(identity_snapshot):
+                    identity = identity_snapshot()
+                    if isinstance(identity, dict):
+                        data["engine_identity"] = identity
             if app_tunnel is not None and not tearing_down:
                 data["forward_status"] = app_tunnel.snapshot()
                 for port in data.get("ports", []):
@@ -422,6 +427,7 @@ def serve(path: Path) -> int:
         api_port = free_port()
         api_tunnel = DockerTunnel(kube, data["identity"], api_port).start()
         tunnels.append(api_tunnel)
+        persist()  # Capture immutable engine UIDs before info, initial sync or a long build.
         env = docker_environment(f"tcp://127.0.0.1:{api_port}")
         # Explicitly target the engine throughout. Never select or mutate a Docker context.
         run(["docker", "info"], env=env, timeout=30)
@@ -559,7 +565,19 @@ def serve(path: Path) -> int:
     except SessionStopped:
         data["status"] = "disconnected"
     except BaseException as exc:
+        # A build can fail before the periodic ownership check notices a Pod
+        # replacement. A fresh read explains the failure without repeating any
+        # build, upload, exec or other uncertain Docker mutation.
+        identity_failure = None
+        refresh_identity = getattr(api_tunnel, "refresh_identity", None)
+        if callable(refresh_identity):
+            try:
+                refresh_identity()
+            except Exception as cause:
+                identity_failure = str(cause)
         detail = failure_detail(exc, tunnels)
+        if identity_failure and identity_failure not in detail:
+            detail += "; " + identity_failure
         data.update({"status": "error", "error": detail})
         print(detail, file=sys.stderr, flush=True)
         exit_code = 1

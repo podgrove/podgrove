@@ -134,6 +134,7 @@ include tests/test_dogfood_review.py
 include tests/test_down_json.py
 include tests/test_dynamic_ports.py
 include tests/test_e2e_harness.py
+include tests/test_engine_identity.py
 include tests/test_exec_acceptance.py
 include tests/test_exec_half_close.py
 include tests/test_exec_transport.py

@@ -400,7 +400,7 @@ def execute(args) -> int:
             public = {key: data[key] for key in ("identity", "root", "context", "namespace", "status", "created_at",
                                                  "last_activity", "ttl_seconds", "node_mode", "namespace_mode", "ports", "error",
                                                  "forward_status", "sync_status", "health_status", "docker_status",
-                                                 "heartbeat_status") if key in data}
+                                                 "heartbeat_status", "engine_identity") if key in data}
             rows.append(public)
         if args.json:
             print(json.dumps({"environments": rows}, indent=2))

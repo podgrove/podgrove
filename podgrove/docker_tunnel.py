@@ -44,6 +44,19 @@ class _VerificationUnavailable(PodgroveError):
         self.reason = reason
 
 
+class EngineReplacedError(PodgroveError):
+    """A named engine still exists, but it is not the captured engine."""
+
+    def __init__(self, expected, observed):
+        self.expected, self.observed = tuple(expected), tuple(observed)
+        super().__init__(
+            "Docker engine was replaced: "
+            f"StatefulSet UID {expected[0]} -> {observed[0]}; Pod UID {expected[1]} -> {observed[1]}. "
+            "Interrupted Docker operations were not replayed; inspect the retained engine and run "
+            "podgrove up --refresh to reconnect."
+        )
+
+
 class _StreamFailure(PodgroveError):
     """A single request became uncertain; its bytes must never be replayed."""
 
@@ -92,6 +105,9 @@ class DockerTunnel:
         self.pod_name = engine_pod_name(ident)
         self.max_connections = max_connections
         self._uids = None
+        self._identity_observed = None
+        self._identity_state = "unavailable"
+        self._identity_checked_at = None
         self._uid_guard = False
         self._verified_at = 0.0
         self._verified_wall = None
@@ -131,6 +147,27 @@ class DockerTunnel:
                                      "retry_in_seconds": (max(0.0, self._verification_retry_at - now)
                                                           if self._verification_retry_at is not None else None),
                                      "reason": self._verification_reason}}
+
+    def identity_snapshot(self):
+        """Return captured/current UID evidence without waiting on an API read."""
+        def values(uids):
+            return {"statefulset_uid": uids[0], "pod_uid": uids[1]} if uids is not None else None
+        with self._lock:
+            return {"state": self._identity_state, "checked_at": self._identity_checked_at,
+                    "namespace": self.kube.namespace, "statefulset": f"pg-{self.ident}", "pod": self.pod_name,
+                    "expected": values(self._uids), "observed": values(self._identity_observed)}
+
+    def refresh_identity(self):
+        """Make one fresh guarded read pass; never reconnect or replay a request."""
+        try:
+            self._verify_engine()
+        except _VerificationUnavailable as exc:
+            self._verification_failed(exc)
+            raise
+        except Exception as exc:
+            self._fail(exc)
+            raise
+        return self.identity_snapshot()
 
     def _verification_failed(self, failure):
         with self._lock:
@@ -194,6 +231,18 @@ class DockerTunnel:
             self._verification_pending = True
         try:
             self._read_engine_locked()
+        except Exception as exc:
+            with self._lock:
+                if isinstance(exc, EngineReplacedError):
+                    self._identity_state = "replaced"
+                    self._identity_checked_at = time.time()
+                elif self._identity_state != "replaced":
+                    # Preserve a confirmed old/new UID pair if a subsequent
+                    # diagnostic read is unavailable during teardown.
+                    self._identity_state = "unavailable"
+                    self._identity_checked_at = time.time()
+                    self._identity_observed = None
+            raise
         finally:
             with self._lock:
                 self._verification_pending = False
@@ -201,14 +250,21 @@ class DockerTunnel:
     def _read_engine_locked(self):
         controller = self._resource("statefulset", f"pg-{self.ident}")
         pod = self._resource("pod", self.pod_name)
+        uids = (controller["metadata"]["uid"], pod["metadata"]["uid"])
+        # Compare before controller-reference validation: during replacement
+        # the old Pod can still name its old controller, and the changed UID
+        # is more useful than a generic owner-reference failure.
+        if self._uids is not None and self._uids != uids:
+            with self._lock:
+                self._identity_observed = uids
+                self._identity_state = "replaced"
+                self._identity_checked_at = time.time()
+            raise EngineReplacedError(self._uids, uids)
         Kube._validate_pod_controller(pod, controller, self.ident)
         claims = [volume["persistentVolumeClaim"].get("claimName")
                   for volume in pod.get("spec", {}).get("volumes", []) if "persistentVolumeClaim" in volume]
         if claims != [f"pg-{self.ident}"]:
             raise PodgroveError("Refusing Docker API access: engine Pod does not use its owned PVC")
-        uids = (controller["metadata"]["uid"], pod["metadata"]["uid"])
-        if self._uids is not None and self._uids != uids:
-            raise PodgroveError("Docker engine Pod or StatefulSet was replaced; run podgrove up to reconnect")
         containers = [container for container in pod.get("spec", {}).get("containers", [])
                       if container.get("name") == "docker"]
         fields = [entry for container in containers for entry in container.get("env", [])
@@ -220,6 +276,10 @@ class DockerTunnel:
         self._uids = uids
         self._uid_guard = guarded
         with self._lock:
+            if self._identity_state != "replaced":
+                self._identity_observed = uids
+                self._identity_state = "verified"
+                self._identity_checked_at = time.time()
             self._verified_at = time.monotonic()
             self._verified_wall = time.time()
             self._verification_unavailable = False
