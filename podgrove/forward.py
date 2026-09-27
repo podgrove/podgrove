@@ -172,6 +172,10 @@ class ForwardOwnershipError(PodgroveError):
     """The captured engine is no longer safe to forward to."""
 
 
+class ForwardVerificationUnavailable(PodgroveError):
+    """A read failed without confirming an ownership change."""
+
+
 class Tunnel:
     """Restart application forwards without changing their ports or engine UID.
 
@@ -181,7 +185,10 @@ class Tunnel:
     """
 
     def __init__(self, kube, ident: str, ports: list[tuple[int, int]], *,
-                 poll_interval=0.5, retry_delays=(0.25, 1.0, 2.0), verification_interval=30.0):
+                 poll_interval=0.5, retry_delays=(0.25, 1.0, 2.0), verification_interval=30.0,
+                 max_verification_age=120.0):
+        if max_verification_age <= 0:
+            raise ValueError("max_verification_age must be positive")
         self.kube, self.ident, self.ports = kube, ident, ports
         self.process = None
         self.log = None
@@ -195,6 +202,10 @@ class Tunnel:
         self._poll_interval = poll_interval
         self._retry_delays = tuple(retry_delays)
         self._verification_interval = verification_interval
+        self._max_verification_age = max_verification_age
+        self._verification_error = None
+        self._verification_failures = 0
+        self._next_verification_at = 0.0
         self._ready_at = 0.0
         self._timeout = 30
         self._status = {"state": "disconnected", "error": None, "attempts": 0,
@@ -205,6 +216,8 @@ class Tunnel:
             return dict(self._status)
 
     def _report(self, state, error=None, attempts=None):
+        if state == "ready" and self._stopped.is_set():
+            return
         with self._lock:
             previous = dict(self._status)
             self._status.update(state=state, error=error, checked_at=time.time())
@@ -217,15 +230,28 @@ class Tunnel:
         if changed and self.on_change:
             self.on_change(current)
 
-    def _verify_engine(self):
+    def _verify_engine(self, *, deadline=None):
         found = []
         for kind, name in (("statefulset", "pg-" + self.ident), ("pod", engine_pod_name(self.ident))):
             if self._stopped.is_set():
                 raise PodgroveError("Application forwarding cancelled")
-            response = self.kube.call("get", kind, name, "-o", "json", "--ignore-not-found",
-                                      timeout=REQUEST_PROCESS_TIMEOUT)
+            remaining = REQUEST_PROCESS_TIMEOUT if deadline is None else deadline - time.monotonic()
+            if remaining <= 0:
+                raise PodgroveError("Application engine ownership proof expired")
+            try:
+                response = self.kube.call("get", kind, name, "-o", "json", "--ignore-not-found",
+                                          timeout=min(REQUEST_PROCESS_TIMEOUT, remaining), cancel_event=self._stopped)
+            except (PodgroveError, OSError) as exc:
+                raise ForwardVerificationUnavailable("Application engine ownership verification is unavailable") from exc
+            if self._stopped.is_set():
+                raise PodgroveError("Application forwarding cancelled")
+            if deadline is not None and time.monotonic() >= deadline:
+                raise PodgroveError("Application engine ownership proof expired")
             try:
                 resource = json.loads(response.stdout) if response.stdout.strip() else {}
+            except (ValueError, TypeError) as exc:
+                raise ForwardVerificationUnavailable("Application engine ownership response is invalid") from exc
+            try:
                 meta = resource.get("metadata", {})
                 labels = meta.get("labels", {})
                 if (meta.get("name") != name or meta.get("namespace") != self.kube.namespace
@@ -244,6 +270,9 @@ class Tunnel:
             raise ForwardOwnershipError("Application engine Pod or StatefulSet was replaced; run podgrove up to reconnect")
         self._uids = uids
         self._verified_at = time.monotonic()
+        self._verification_error = None
+        self._verification_failures = 0
+        self._next_verification_at = 0.0
 
     def _output(self):
         if self.log is None:
@@ -328,8 +357,23 @@ class Tunnel:
                         raise PodgroveError("Kubernetes application port-forward exited")
                     if not self._listeners_ready():
                         raise PodgroveError("Kubernetes application port-forward listener is unavailable")
-                    if time.monotonic() - self._verified_at >= self._verification_interval:
-                        self._verify_engine()
+                    now = time.monotonic()
+                    if now - self._verified_at > self._max_verification_age:
+                        raise PodgroveError("Application engine ownership proof expired; forwarding must reconnect")
+                    if now - self._verified_at >= self._verification_interval and now >= self._next_verification_at:
+                        try:
+                            self._verify_engine(deadline=self._verified_at + self._max_verification_age)
+                        except ForwardVerificationUnavailable as exc:
+                            self._verification_error = str(exc)
+                            self._verification_failures = min(self._verification_failures + 1, 31)
+                            delay = min(30, 2 ** min(self._verification_failures - 1, 5))
+                            self._next_verification_at = time.monotonic() + delay
+                    if self._verification_error:
+                        # Preserve the already verified, still listening child
+                        # through a short API outage; never launch an unchecked
+                        # replacement. Expired proof enters bounded recovery.
+                        self._report("reconnecting", self._verification_error, attempts)
+                        continue
                     if time.monotonic() - self._ready_at >= 30:
                         attempts = 0
                     self._report("ready", attempts=attempts)
@@ -372,6 +416,9 @@ class Tunnel:
 
     def close(self):
         self._stopped.set()
+        # Close listeners even if a slow credential/API read is in progress.
+        # That read is cancellable and cannot publish a later ready result.
+        self._dispose()
         if self._thread is not None:
             self._thread.join(timeout=8)
             if self._thread.is_alive():

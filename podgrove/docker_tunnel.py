@@ -19,18 +19,29 @@ import threading
 import time
 
 from .errors import PodgroveError
-from .kube import ENVIRONMENT, MANAGED, Kube, engine_pod_name
+from .kube import ENVIRONMENT, MANAGED, REQUEST_PROCESS_TIMEOUT, Kube, engine_pod_name
 
 MAX_CONNECTIONS = 32
 BUFFER_BYTES = 256 * 1024
 STDERR_BYTES = 4096
 POD_UID_ENV = "PODGROVE_POD_UID"
 VERIFY_INTERVAL = 30.0
+MAX_VERIFICATION_AGE = 120.0
+VERIFY_RETRY_INITIAL = 1.0
+VERIFY_RETRY_MAX = 30.0
 _UID_REJECTED = "Podgrove engine Pod UID changed; reconnect required"
 _UID_GUARD = ('if [ "${PODGROVE_POD_UID:-}" != "$1" ]; then '
               'printf "%s\\n" "Podgrove engine Pod UID changed; reconnect required" >&2; exit 126; '
               'fi; shift; exec "$@"')
 _LOG = logging.getLogger(__name__)
+
+
+class _VerificationUnavailable(PodgroveError):
+    """Read-only ownership proof failed without confirming an identity change."""
+
+    def __init__(self, reason):
+        super().__init__("Docker engine ownership verification is unavailable")
+        self.reason = reason
 
 
 class _StreamFailure(PodgroveError):
@@ -69,18 +80,28 @@ class _Stream:
 
 class DockerTunnel:
     def __init__(self, kube, ident: str, port: int, *, max_connections: int = MAX_CONNECTIONS,
-                 verification_interval: float = VERIFY_INTERVAL):
+                 verification_interval: float = VERIFY_INTERVAL,
+                 max_verification_age: float = MAX_VERIFICATION_AGE):
         if max_connections < 1:
             raise ValueError("max_connections must be positive")
         if verification_interval <= 0:
             raise ValueError("verification_interval must be positive")
+        if max_verification_age <= 0:
+            raise ValueError("max_verification_age must be positive")
         self.kube, self.ident, self.port = kube, ident, port
         self.pod_name = engine_pod_name(ident)
         self.max_connections = max_connections
         self._uids = None
         self._uid_guard = False
         self._verified_at = 0.0
+        self._verified_wall = None
         self._verification_interval = verification_interval
+        self._max_verification_age = max_verification_age
+        self._verification_unavailable = False
+        self._verification_pending = False
+        self._verification_reason = None
+        self._verification_failures = 0
+        self._verification_retry_at = None
         self._verification_lock = threading.Lock()
         self._verification_thread = None
         self._listener = None
@@ -96,9 +117,29 @@ class DockerTunnel:
     def snapshot(self):
         """Bounded diagnostics without request contents or remote stderr."""
         with self._lock:
+            now = time.monotonic()
+            age = max(0.0, now - self._verified_at) if self._verified_wall is not None else None
+            state = ("expired" if age is not None and age > self._max_verification_age else
+                     "unavailable" if self._verification_unavailable or self._verified_wall is None else
+                     "verifying" if self._verification_pending else "verified")
             return {"active_connections": len(self._streams),
                     "failed_connections": self._failed_connections,
-                    "last_failure": dict(self._last_failure) if self._last_failure else None}
+                    "last_failure": dict(self._last_failure) if self._last_failure else None,
+                    "verification": {"state": state, "last_verified_at": self._verified_wall,
+                                     "age_seconds": age, "max_age_seconds": self._max_verification_age,
+                                     "consecutive_failures": self._verification_failures,
+                                     "retry_in_seconds": (max(0.0, self._verification_retry_at - now)
+                                                          if self._verification_retry_at is not None else None),
+                                     "reason": self._verification_reason}}
+
+    def _verification_failed(self, failure):
+        with self._lock:
+            self._verification_unavailable = True
+            self._verification_reason = failure.reason
+            self._verification_failures = min(self._verification_failures + 1, 2**31 - 1)
+            delay = min(VERIFY_RETRY_MAX, VERIFY_RETRY_INITIAL * 2**min(self._verification_failures - 1, 6))
+            self._verification_retry_at = time.monotonic() + delay
+            return delay
 
     def _stream_failed(self, stream, failure):
         if self._stopped.is_set() or self._error is not None:
@@ -116,19 +157,28 @@ class DockerTunnel:
                 self._last_failure_log = now
         if report:
             _LOG.warning("Docker API connection failed (%s; exit=%s; errno=%s); "
-                         "other connections remain available; request was not replayed",
+                         "session retained; request was not replayed",
                          failure.reason, failure.exit_code, failure.error_number)
 
     def _resource(self, kind: str, name: str) -> dict:
         if self._stopped.is_set():
             raise PodgroveError("Docker API tunnel is stopping")
-        result = self.kube.call("get", kind, name, "-o", "json", "--ignore-not-found", timeout=5)
+        try:
+            result = self.kube.call("get", kind, name, "-o", "json", "--ignore-not-found",
+                                    timeout=REQUEST_PROCESS_TIMEOUT, check=False, cancel_event=self._stopped)
+        except (PodgroveError, OSError, subprocess.TimeoutExpired) as exc:
+            raise _VerificationUnavailable("api_read_failed") from exc
+        if result.returncode:
+            raise _VerificationUnavailable("api_read_failed")
         try:
             resource = json.loads(result.stdout) if result.stdout.strip() else {}
+        except (ValueError, TypeError) as exc:
+            raise _VerificationUnavailable("invalid_api_response") from exc
+        try:
             metadata = resource.get("metadata", {})
             labels = metadata.get("labels", {})
             if (metadata.get("name") != name or metadata.get("namespace") != self.kube.namespace
-                    or not metadata.get("uid") or metadata.get("deletionTimestamp")
+                    or not isinstance(metadata.get("uid"), str) or not metadata["uid"] or metadata.get("deletionTimestamp")
                     or labels.get(MANAGED) != "podgrove" or labels.get(ENVIRONMENT) != self.ident):
                 raise ValueError("missing, deleting, or foreign resource")
             return resource
@@ -140,6 +190,15 @@ class DockerTunnel:
             self._verify_engine_locked()
 
     def _verify_engine_locked(self):
+        with self._lock:
+            self._verification_pending = True
+        try:
+            self._read_engine_locked()
+        finally:
+            with self._lock:
+                self._verification_pending = False
+
+    def _read_engine_locked(self):
         controller = self._resource("statefulset", f"pg-{self.ident}")
         pod = self._resource("pod", self.pod_name)
         Kube._validate_pod_controller(pod, controller, self.ident)
@@ -160,12 +219,32 @@ class DockerTunnel:
             raise PodgroveError("Docker engine Pod lost its verified downward API UID binding")
         self._uids = uids
         self._uid_guard = guarded
-        self._verified_at = time.monotonic()
+        with self._lock:
+            self._verified_at = time.monotonic()
+            self._verified_wall = time.time()
+            self._verification_unavailable = False
+            self._verification_reason = None
+            self._verification_failures = 0
+            self._verification_retry_at = None
 
     def _revalidate(self):
-        while not self._stopped.wait(self._verification_interval):
+        while not self._stopped.is_set():
+            # A connection can discover an outage before this monitor's next
+            # regular pass. Observe its retry deadline without waiting another
+            # full verification interval, and remain promptly cancellable.
+            with self._lock:
+                due = (self._verification_retry_at if self._verification_retry_at is not None
+                       else self._verified_at + self._verification_interval)
+            if self._stopped.wait(min(.2, max(0.0, due - time.monotonic()))):
+                return
+            if time.monotonic() < due:
+                continue
             try:
                 self._verify_engine()
+            except _VerificationUnavailable as exc:
+                if self._stopped.is_set():
+                    return
+                self._verification_failed(exc)
             except Exception as exc:
                 self._fail(exc)
                 return
@@ -227,7 +306,8 @@ class DockerTunnel:
                 except socket.timeout:
                     continue
                 with self._lock:
-                    if self._stopped.is_set() or self._error or len(self._streams) >= self.max_connections:
+                    if (self._stopped.is_set() or self._error or self._verification_unavailable
+                            or len(self._streams) >= self.max_connections):
                         self._reset(client)
                         client.close()
                         continue
@@ -244,9 +324,13 @@ class DockerTunnel:
             # New Pods prove their immutable identity inside each exec. Legacy
             # Pods still require the full reads for every connection. A stalled
             # background verifier never permits indefinitely stale ownership.
-            if not self._uid_guard or time.monotonic() - self._verified_at > self._verification_interval * 2:
+            if self._verification_unavailable:
+                raise _StreamFailure("ownership_verification_unavailable")
+            if not self._uid_guard or time.monotonic() - self._verified_at > min(self._verification_interval * 2, self._max_verification_age):
                 with self._verification_lock:
-                    if not self._uid_guard or time.monotonic() - self._verified_at > self._verification_interval * 2:
+                    if self._verification_unavailable:
+                        raise _StreamFailure("ownership_verification_unavailable")
+                    if not self._uid_guard or time.monotonic() - self._verified_at > min(self._verification_interval * 2, self._max_verification_age):
                         self._verify_engine_locked()
             if self._stopped.is_set():
                 return
@@ -261,12 +345,17 @@ class DockerTunnel:
             )
             try:
                 stream.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                                  stderr=subprocess.PIPE, bufsize=0)
+                                                  stderr=subprocess.PIPE, bufsize=0,
+                                                  env={**os.environ, "KUBECTL_REMOTE_COMMAND_WEBSOCKETS": "true"})
                 if self._stopped.is_set() or self._error:
                     return  # Failure may have raced with creating this subprocess.
                 self._relay(stream)
             except OSError as exc:
                 raise _StreamFailure("local_transport_io", error_number=exc.errno) from exc
+        except _VerificationUnavailable as exc:
+            self._reset(stream.client)
+            if not self._stopped.is_set():
+                self._verification_failed(exc)
         except _StreamFailure as exc:
             # This connection may have carried a mutating operation. Signal its
             # ambiguous result with RST, keep unrelated streams alive, and never
@@ -325,6 +414,11 @@ class DockerTunnel:
                         selector.unregister(target)
 
             while not self._stopped.is_set() and self._error is None:
+                # A read outage does not revoke confirmed ownership, but stale
+                # proof cannot authorize an established connection forever.
+                # This check is independent of potentially slow API reads.
+                if time.monotonic() - self._verified_at > self._max_verification_age:
+                    raise _StreamFailure("ownership_verification_expired")
                 if input_closed and not incoming and not process.stdin.closed:
                     monitor(process.stdin, 0, "stdin")
                     process.stdin.close()  # EOF only; stdout remains attached.

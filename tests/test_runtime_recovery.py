@@ -13,6 +13,7 @@ from podgrove import runtime, state
 from podgrove.config import Config
 from podgrove.forward import Tunnel, free_port
 from podgrove.sync import SnapshotRace
+from podgrove.session_status import observed
 from test_forward_recovery import LocalKube, echo, wait_until
 from test_sync import FakeSynchronizer
 
@@ -72,6 +73,7 @@ def session(tmp_path, monkeypatch, request):
     monkeypatch.setattr(runtime, "service_status", lambda *_: rows)
     api = Mock()
     api.start.return_value = api
+    api.snapshot.return_value = {"verification": {"state": "verified"}, "failed_connections": 0}
     monkeypatch.setattr(runtime, "DockerTunnel", lambda *_: api)
     tunnels = []
     def app(*args):
@@ -138,6 +140,38 @@ def test_idle_forward_exit_publishes_reconnecting_then_recovers_same_address(ses
     after = state.read(session.path)
     assert after["status"] == "ready" and after["ports"][0] == before
     assert session.tunnel.process is not first and session.thread.is_alive()
+    echo(session.port)
+
+
+def test_verification_outage_is_visible_without_disconnecting_control_or_endpoints(session):
+    diagnostics = {"verification": {"state": "unavailable", "reason": "metadata_unavailable",
+                                    "max_age_seconds": 120, "age_seconds": 31},
+                   "active_connections": 1, "failed_connections": 0, "last_failure": None}
+    session.api.snapshot.return_value = diagnostics
+    ping = runtime.control(session.data, "ping")
+    snapshot = observed(state.read(session.path), connected=True, ping=ping)
+    assert ping["ok"] and ping["docker_status"] == diagnostics
+    assert snapshot["status"] == "degraded"
+    assert snapshot["forward_status"]["state"] == "ready"
+    echo(session.port)
+    session.api.snapshot.return_value = {**diagnostics, "verification": {"state": "verified", "age_seconds": 0}}
+    ping = runtime.control(session.data, "ping")
+    snapshot = observed(state.read(session.path), connected=True, ping=ping)
+    assert snapshot["status"] == "ready"
+    session.api.close.assert_not_called()
+
+
+def test_health_diagnostics_larger_than_one_socket_read_do_not_disconnect_session(session, monkeypatch):
+    monkeypatch.setattr(runtime, "HEALTH_INTERVAL", 0)
+    def unavailable(*_):
+        raise runtime.TransientDockerReadError("Temporary status failure: " + "x" * 5000)
+    monkeypatch.setattr(runtime, "service_status", unavailable)
+    runtime.control(session.data, "touch")
+    wait_until(lambda: state.read(session.path).get("health_status", {}).get("state") == "unavailable")
+    ping = runtime.control(session.data, "ping")
+    assert ping["ok"] and len(ping["health_status"]["error"]) > 4096
+    assert runtime.is_running(session.data)
+    assert ping["docker_status"]["verification"]["state"] == "verified"
     echo(session.port)
 
 
@@ -213,3 +247,56 @@ def test_forward_recovery_is_independent_of_slow_heartbeat(session):
         echo(session.port)
     finally:
         release.set()
+
+
+def test_heartbeat_outage_is_bounded_degraded_and_keeps_control_sync_and_forward(session, monkeypatch):
+    import time
+    from podgrove.kube import HeartbeatUnavailable
+    available = threading.Event()
+    attempts = []
+    original_forward = session.tunnel.process
+
+    def heartbeat(*_):
+        attempts.append(time.monotonic())
+        if not available.is_set():
+            raise HeartbeatUnavailable("private-error-details-must-not-persist")
+
+    monkeypatch.setattr(runtime, "HEARTBEAT_RETRY_DELAYS", (.8, .8))
+    session.kube.heartbeat.side_effect = heartbeat
+    runtime.control(session.data, "touch")
+    wait_until(lambda: state.read(session.path).get("heartbeat_status", {}).get("state") == "unavailable")
+    first = state.read(session.path)
+    assert first["status"] == "degraded" and first["heartbeat_status"]["consecutive_failures"] == 1
+    assert "private-error" not in str(first)
+    ping = runtime.control(session.data, "ping")
+    assert ping["ok"] and ping["heartbeat_status"]["state"] == "unavailable"
+    assert observed(first, connected=True, ping=ping)["status"] == "degraded"
+    echo(session.port)
+    session.source.write_text("sync continues while heartbeat is unavailable")
+    wait_until(lambda: bool(session.sync.transfers) and session.sync.transfers[-1].get("podgrove-transfer/payload/source") ==
+               b"sync continues while heartbeat is unavailable")
+    for _ in range(4):
+        runtime.control(session.data, "touch")
+        time.sleep(.02)
+    wait_until(lambda: len(attempts) >= 2)
+    assert attempts[1] - attempts[0] >= .75
+    assert session.thread.is_alive() and session.tunnel.process is original_forward
+    session.api.close.assert_not_called()
+    session.sync.close.assert_not_called()
+    available.set()
+    wait_until(lambda: state.read(session.path)["heartbeat_status"]["state"] == "ready")
+    recovered = state.read(session.path)
+    assert recovered["status"] == "ready" and "error" not in recovered["heartbeat_status"]
+    assert recovered["heartbeat_status"]["consecutive_failures"] == 0
+    echo(session.port)
+
+
+def test_confirmed_lease_ownership_failure_still_stops_session(session):
+    from podgrove.errors import PodgroveError
+    session.kube.heartbeat.side_effect = PodgroveError("Environment lease is missing or no longer owned")
+    runtime.control(session.data, "touch")
+    session.thread.join(timeout=5)
+    assert not session.thread.is_alive()
+    assert state.read(session.path)["status"] == "error"
+    assert "no longer owned" in state.read(session.path)["error"]
+    session.api.close.assert_called_once()

@@ -13,7 +13,7 @@ import pytest
 
 from podgrove.docker_tunnel import BUFFER_BYTES, POD_UID_ENV, DockerTunnel
 from podgrove.errors import PodgroveError
-from podgrove.kube import ENVIRONMENT, MANAGED, Kube
+from podgrove.kube import ENVIRONMENT, MANAGED, REQUEST_PROCESS_TIMEOUT, Kube
 
 IDENT = "012345abcdef"
 
@@ -36,7 +36,8 @@ class FakeKube:
 
     def call(self, *args, **kwargs):
         self.reads.append(args)
-        assert kwargs == {"timeout": 5}
+        assert kwargs["timeout"] == REQUEST_PROCESS_TIMEOUT
+        assert kwargs["check"] is False and isinstance(kwargs["cancel_event"], threading.Event)
         assert args[0] == "get" and args[1] in ("statefulset", "pod")
         return subprocess.CompletedProcess(args, 0, json.dumps(self.controller if args[1] == "statefulset" else self.pod), "")
 
@@ -583,5 +584,210 @@ def test_slow_reader_large_binary_stream_keeps_buffers_bounded_and_other_stream_
             assert stream.input_buffer_peak <= BUFFER_BYTES
             assert stream.sent_bytes == size
         tunnel.check()
+    finally:
+        tunnel.close()
+
+
+class OutageKube(GuardedKube):
+    def __init__(self):
+        super().__init__("import sys\nfor line in sys.stdin.buffer:\n sys.stdout.buffer.write(line);sys.stdout.buffer.flush()")
+        self.failure = None
+        self.failures_seen = 0
+
+    def call(self, *args, **kwargs):
+        if self.failure:
+            self.failures_seen += 1
+            if self.failure == "exit":
+                return subprocess.CompletedProcess(args, 1, "", "private-auth-response")
+            if self.failure == "json":
+                return subprocess.CompletedProcess(args, 0, "{incomplete", "")
+            raise PodgroveError("private-error-response")
+        return super().call(*args, **kwargs)
+
+
+@pytest.fixture
+def quick_retry(monkeypatch):
+    from podgrove import docker_tunnel
+    monkeypatch.setattr(docker_tunnel, "VERIFY_RETRY_INITIAL", .03)
+    monkeypatch.setattr(docker_tunnel, "VERIFY_RETRY_MAX", .1)
+
+
+@pytest.mark.parametrize("failure", ["exit", "json", "exception"])
+def test_transient_verification_outage_gates_new_requests_preserves_peer_and_recovers(failure, quick_retry):
+    kube = OutageKube()
+    tunnel = DockerTunnel(kube, IDENT, 0, verification_interval=.05).start()
+    try:
+        with connect(tunnel) as existing:
+            existing.sendall(b"before\n")
+            assert receive_exact(existing, 7) == b"before\n"
+            kube.failure = failure
+            wait_until(lambda: tunnel.snapshot()["verification"]["state"] == "unavailable")
+            # New operations are refused before opening a kubectl exec. An
+            # established, previously proved stream survives the short outage.
+            with connect(tunnel) as refused:
+                with pytest.raises(ConnectionResetError):
+                    refused.recv(1)
+            assert len(kube.commands) == 1
+            existing.sendall(b"during\n")
+            assert receive_exact(existing, 7) == b"during\n"
+            tunnel.check()
+            snapshot = tunnel.snapshot()
+            assert snapshot["verification"]["consecutive_failures"] >= 1
+            assert snapshot["verification"]["retry_in_seconds"] is not None
+            assert "private" not in json.dumps(snapshot)
+            kube.failure = None
+            wait_until(lambda: tunnel.snapshot()["verification"]["state"] == "verified")
+            existing.sendall(b"after\n")
+            assert receive_exact(existing, 6) == b"after\n"
+            with connect(tunnel) as fresh:
+                fresh.sendall(b"new\n")
+                assert receive_exact(fresh, 4) == b"new\n"
+            assert len(kube.commands) == 2
+            assert tunnel.snapshot()["verification"]["consecutive_failures"] == 0
+    finally:
+        tunnel.close()
+    assert not tunnel._verification_thread.is_alive()
+
+
+def test_expired_ownership_proof_resets_only_streams_and_recovers_without_replay(quick_retry):
+    kube = OutageKube()
+    tunnel = DockerTunnel(kube, IDENT, 0, verification_interval=.03, max_verification_age=.2).start()
+    try:
+        with connect(tunnel) as client:
+            client.sendall(b"started\n")
+            assert receive_exact(client, 8) == b"started\n"
+            kube.failure = "exit"
+            with pytest.raises(ConnectionResetError):
+                client.recv(1)
+            wait_until(lambda: not tunnel._streams)
+            assert tunnel.snapshot()["verification"]["state"] == "expired"
+            assert tunnel.snapshot()["last_failure"]["reason"] == "ownership_verification_expired"
+            assert len(kube.commands) == 1
+            tunnel.check()
+            kube.failure = None
+            wait_until(lambda: tunnel.snapshot()["verification"]["state"] == "verified")
+            with connect(tunnel) as fresh:
+                fresh.sendall(b"recovered\n")
+                assert receive_exact(fresh, 10) == b"recovered\n"
+            assert len(kube.commands) == 2
+    finally:
+        tunnel.close()
+
+
+def test_recovery_proof_with_changed_uid_is_fatal_even_after_transient_outage(quick_retry):
+    kube = OutageKube()
+    tunnel = DockerTunnel(kube, IDENT, 0, verification_interval=.03).start()
+    try:
+        with connect(tunnel) as client:
+            client.sendall(b"open\n")
+            assert receive_exact(client, 5) == b"open\n"
+            kube.failure = "exit"
+            wait_until(lambda: tunnel._verification_unavailable)
+            kube.pod["metadata"]["uid"] = "replacement-uid"
+            kube.failure = None
+            wait_until(lambda: tunnel._error is not None)
+            with pytest.raises(ConnectionResetError):
+                client.recv(1)
+            with pytest.raises(PodgroveError, match="replaced"):
+                tunnel.check()
+            assert len(kube.commands) == 1
+    finally:
+        tunnel.close()
+
+
+def test_legacy_connection_read_outage_recovers_without_waiting_full_normal_interval(quick_retry):
+    kube = OutageKube()
+    kube.pod["spec"].pop("containers")
+    kube.command = lambda *args: FakeKube.command(kube, *args)
+    tunnel = DockerTunnel(kube, IDENT, 0, verification_interval=30).start()
+    try:
+        kube.failure = "exit"
+        with connect(tunnel) as refused:
+            with pytest.raises(ConnectionResetError):
+                refused.recv(1)
+        wait_until(lambda: tunnel._verification_unavailable)
+        kube.failure = None
+        wait_until(lambda: not tunnel._verification_unavailable, timeout=2)
+        with connect(tunnel) as client:
+            client.sendall(b"recovered\n")
+            assert receive_exact(client, 10) == b"recovered\n"
+        tunnel.check()
+        assert len(kube.commands) == 1
+    finally:
+        tunnel.close()
+
+
+def test_slow_pending_read_cannot_extend_grace_and_close_cancels_actual_process(monkeypatch):
+    from podgrove.process import run
+    kube = OutageKube()
+    started = threading.Event()
+    original = kube.call
+    original_popen = subprocess.Popen
+    children = []
+    stalled = False
+
+    def popen(*args, **kwargs):
+        process = original_popen(*args, **kwargs)
+        children.append(process)
+        return process
+
+    def call(*args, **kwargs):
+        if stalled:
+            started.set()
+            return run([sys.executable, "-c", "import time;time.sleep(60)"], **kwargs)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    monkeypatch.setattr(kube, "call", call)
+    tunnel = DockerTunnel(kube, IDENT, 0, verification_interval=.04, max_verification_age=.15).start()
+    try:
+        with connect(tunnel) as client:
+            client.sendall(b"open\n")
+            assert receive_exact(client, 5) == b"open\n"
+            stalled = True
+            assert started.wait(2)
+            assert tunnel.snapshot()["verification"]["state"] == "verifying"
+            with pytest.raises(ConnectionResetError):
+                client.recv(1)
+            assert tunnel.snapshot()["verification"]["state"] == "expired"
+        before = time.monotonic()
+        tunnel.close()
+        assert time.monotonic() - before < 2
+    finally:
+        tunnel.close()
+    assert all(process.poll() is not None for process in children)
+    assert not tunnel._verification_thread.is_alive()
+    assert not any(thread.name == "podgrove-command-cancel" for thread in threading.enumerate())
+
+
+def test_initial_unavailable_proof_never_opens_listener():
+    kube = OutageKube()
+    kube.failure = "exit"
+    tunnel = DockerTunnel(kube, IDENT, 0)
+    with pytest.raises(PodgroveError, match="verification is unavailable"):
+        tunnel.start()
+    assert tunnel._listener is None and not kube.commands
+
+
+def test_verification_retry_delay_is_bounded_and_snapshot_does_not_expose_reason_payload():
+    from podgrove.docker_tunnel import _VerificationUnavailable
+    tunnel = DockerTunnel(OutageKube(), IDENT, 0)
+    delays = [tunnel._verification_failed(_VerificationUnavailable("api_read_failed")) for _ in range(50)]
+    assert delays[:7] == [1, 2, 4, 8, 16, 30, 30]
+    assert delays[-1] == 30
+    snapshot = tunnel.snapshot()
+    snapshot["verification"]["reason"] = "modified-copy"
+    assert tunnel.snapshot()["verification"]["reason"] == "api_read_failed"
+
+
+def test_stream_transport_forces_websocket_despite_inherited_spdy_override(monkeypatch):
+    monkeypatch.setenv("KUBECTL_REMOTE_COMMAND_WEBSOCKETS", "false")
+    kube = FakeKube("import os,sys;sys.stdout.write(os.environ['KUBECTL_REMOTE_COMMAND_WEBSOCKETS'])")
+    tunnel = DockerTunnel(kube, IDENT, 0).start()
+    try:
+        with connect(tunnel) as client:
+            assert receive(client) == b"true"
+        tunnel.check()
+        assert len(kube.commands) == 1
     finally:
         tunnel.close()

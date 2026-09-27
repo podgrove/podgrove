@@ -3,6 +3,7 @@ from copy import deepcopy
 import json
 import socket
 import sys
+import threading
 import time
 from types import SimpleNamespace
 
@@ -11,6 +12,7 @@ import pytest
 from podgrove.errors import PodgroveError
 from podgrove.forward import ForwardOwnershipError, Tunnel, free_port
 from podgrove.kube import ENVIRONMENT, MANAGED, REQUEST_PROCESS_TIMEOUT
+from podgrove.process import run
 
 IDENT = "012345abcdef"
 # A real separate process stands in for kubectl, with real TCP listeners. It
@@ -57,7 +59,7 @@ class LocalKube:
                                     "apiVersion": "apps/v1", "kind": "StatefulSet", "name": "pg-" + IDENT,
                                     "uid": "original-controller", "controller": True}]}}
 
-    def call(self, *args, timeout):
+    def call(self, *args, timeout, cancel_event=None):
         assert args[:1] == ("get",) and timeout == REQUEST_PROCESS_TIMEOUT
         self.reads.append(args)
         return SimpleNamespace(stdout=json.dumps(self.controller if args[1] == "statefulset" else self.pod))
@@ -91,11 +93,12 @@ def tunnel(tmp_path):
     made = []
     # Real child startup can exceed 300ms under aggregate-suite load; recovery
     # assertions have their own bounded waits, and timeout-specific tests override this.
-    def make(*, modes=("normal",), retry_delays=(.02, .03, .04), timeout=2, verification_interval=30):
+    def make(*, modes=("normal",), retry_delays=(.02, .03, .04), timeout=2, verification_interval=30,
+             max_verification_age=120):
         kube = LocalKube(tmp_path / (str(len(made)) + ".control"), modes)
         port = free_port()
         item = Tunnel(kube, IDENT, [(port, 8080)], poll_interval=.03, retry_delays=retry_delays,
-                      verification_interval=verification_interval)
+                      verification_interval=verification_interval, max_verification_age=max_verification_age)
         made.append(item)
         item.start(timeout=timeout)
         return item, kube, port
@@ -122,6 +125,60 @@ def test_idle_child_exit_recovers_same_port_with_ownership_checks(tunnel):
     assert any(event["state"] == "reconnecting" for event in events)
     assert events[-1]["state"] == "ready" and events[-1]["attempts"] == 1
     assert events[-1]["checked_at"] >= events[0]["checked_at"]
+
+
+@pytest.mark.parametrize("malformed", [False, True])
+def test_api_read_outage_keeps_existing_forward_then_verifies_same_uid(tunnel, malformed):
+    item, kube, port = tunnel(verification_interval=.03)
+    original = kube.call
+    child = item.process
+    available = threading.Event()
+    def read(*args, **kwargs):
+        if not available.is_set():
+            if malformed:
+                return SimpleNamespace(stdout="incomplete JSON")
+            raise PodgroveError("kubectl timed out after 35s")
+        return original(*args, **kwargs)
+    kube.call = read
+    wait_until(lambda: item.snapshot()["state"] == "reconnecting")
+    assert item.process is child and child.poll() is None
+    echo(port)
+    available.set()
+    wait_until(lambda: item.snapshot()["state"] == "ready")
+    assert item.process is child and len(kube.commands) == 1
+    echo(port)
+
+
+def test_expired_forward_ownership_proof_closes_listener_and_bounds_retries(tunnel):
+    item, kube, port = tunnel(verification_interval=.03, max_verification_age=.2)
+    child = item.process
+    def unavailable(*args, **kwargs):
+        raise PodgroveError("kubectl connection reset by peer")
+    kube.call = unavailable
+    wait_until(lambda: item.snapshot()["state"] == "disconnected")
+    assert child.poll() is not None and len(kube.commands) == 1
+    assert item.snapshot()["attempts"] == 3
+    with pytest.raises(OSError):
+        socket.create_connection(("127.0.0.1", port), timeout=.1)
+
+
+def test_slow_verification_cannot_extend_existing_forward_proof_deadline(tunnel, tmp_path):
+    item, kube, port = tunnel(verification_interval=.03, max_verification_age=.4, retry_delays=())
+    child = item.process
+    entered = tmp_path / "entered"
+    deadlines = []
+    def blocked(*args, timeout, cancel_event=None):
+        deadlines.append(timeout)
+        return run([sys.executable, "-c", "import pathlib,sys,time;pathlib.Path(sys.argv[1]).touch();time.sleep(60)",
+                    str(entered)], timeout=timeout, cancel_event=cancel_event)
+    kube.call = blocked
+    wait_until(entered.exists)
+    echo(port)
+    verified = item._verified_at
+    wait_until(lambda: item.snapshot()["state"] == "disconnected", timeout=2)
+    assert time.monotonic() - verified < 1.5
+    assert child.poll() is not None and len(kube.commands) == 1
+    assert len(deadlines) == 1 and 0 < deadlines[0] < .4
 
 
 def test_live_child_without_listener_is_restarted_without_source_edits(tunnel):
@@ -225,3 +282,97 @@ def test_process_exit_during_post_launch_ownership_check_never_reports_ready(tmp
         item.start(timeout=1)
     assert item.snapshot()["state"] == "disconnected"
     assert item.process.poll() is not None and item.log is None and item._thread is None
+
+
+def test_shutdown_cancels_slow_api_read_and_closes_listener(tunnel, tmp_path):
+    item, kube, port = tunnel(verification_interval=.03)
+    original = kube.call
+    started = tmp_path / "slow-api-pid"
+    def slow_read(*args, timeout, cancel_event=None):
+        run([sys.executable, "-c", "import os,pathlib,sys,time;pathlib.Path(sys.argv[1]).write_text(str(os.getpid()));time.sleep(60)",
+             str(started)], timeout=timeout, cancel_event=cancel_event)
+        return original(*args, timeout=timeout)
+    kube.call = slow_read
+    wait_until(started.exists)
+    echo(port)
+    start = time.monotonic()
+    item.close()
+    assert time.monotonic() - start < 2
+    assert not item._thread.is_alive()
+    assert item.process.poll() is not None
+    assert item.snapshot()["state"] == "disconnected"
+    with pytest.raises(OSError):
+        socket.create_connection(("127.0.0.1", port), timeout=.1)
+
+
+def test_cancellable_command_preserves_input_output_and_exit():
+    payload = "message\n" * 100000
+    result = run([sys.executable, "-c", "import sys,time;time.sleep(.2);sys.stdout.write(sys.stdin.read());sys.stderr.write('detail');sys.exit(7)"],
+                 input=payload, timeout=3, cancel_event=threading.Event(), check=False)
+    assert result.stdout == payload and result.stderr == "detail" and result.returncode == 7
+
+
+def test_cancellable_command_still_enforces_deadline():
+    with pytest.raises(PodgroveError, match="timed out after 0.2s"):
+        run([sys.executable, "-c", "import time;time.sleep(60)"], timeout=.2, cancel_event=threading.Event())
+
+
+def test_cancelled_command_never_launches(tmp_path):
+    cancelled = threading.Event()
+    cancelled.set()
+    marker = tmp_path / "must-not-exist"
+    with pytest.raises(PodgroveError, match="cancelled"):
+        run([sys.executable, "-c", "import pathlib,sys;pathlib.Path(sys.argv[1]).touch()", str(marker)],
+            cancel_event=cancelled)
+    assert not marker.exists()
+
+
+def test_cancellation_kills_owned_helpers_after_process_group_leader_exits(tmp_path, monkeypatch):
+    import os
+    import signal
+    import subprocess
+    marker = tmp_path / "helper-pid"
+    original = subprocess.Popen
+    leaders = []
+    cancelled = threading.Event()
+
+    def launch(*args, **kwargs):
+        child = original(*args, **kwargs)
+        leaders.append(child)
+        return child
+
+    monkeypatch.setattr(subprocess, "Popen", launch)
+
+    def cancel_after_leader_exit():
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if marker.exists() and leaders and leaders[0].poll() is not None:
+                cancelled.set()
+                return
+            time.sleep(.01)
+        cancelled.set()
+
+    watcher = threading.Thread(target=cancel_after_leader_exit)
+    watcher.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(PodgroveError, match="cancelled"):
+            run([sys.executable, "-c",
+                 "import os,pathlib,sys,time;pid=os.fork();"
+                 "os._exit(0) if pid else None;"
+                 "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()));time.sleep(60)", str(marker)],
+                timeout=5, cancel_event=cancelled)
+        assert time.monotonic() - started < 2
+        assert leaders[0].returncode == 0
+        assert not any(thread.name == "podgrove-command-cancel" for thread in threading.enumerate())
+        helper = int(marker.read_text())
+        # A terminated orphan may briefly remain a zombie until the OS reaps it.
+        status = original(["ps", "-o", "stat=", "-p", str(helper)], stdout=subprocess.PIPE, text=True)
+        assert status.communicate(timeout=2)[0].strip() in ("", "Z", "Z+")
+    finally:
+        watcher.join(timeout=3)
+        if marker.exists():
+            try:
+                os.kill(int(marker.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass

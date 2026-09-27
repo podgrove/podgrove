@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -26,6 +27,10 @@ REQUEST_TIMEOUT = 30
 # Allow kubectl to finish its request and authentication/cleanup work before
 # the local subprocess deadline expires.
 REQUEST_PROCESS_TIMEOUT = REQUEST_TIMEOUT + 5
+
+
+class HeartbeatUnavailable(PodgroveError):
+    """A lease observation/update was uncertain; re-read before any next write."""
 
 DEFAULT_TAINTED_NODES = {"selector": {DEDICATED: "true"},
                          "taint": {"key": "dedicated", "value": "podgrove", "effect": "NoSchedule"}}
@@ -658,14 +663,40 @@ class Kube:
             time.sleep(min(2, remaining))
 
     def heartbeat(self, ident: str, timestamp: float) -> None:
-        lease = self.get("configmap", f"pg-{ident}")
-        labels = lease.get("metadata", {}).get("labels", {})
-        if labels.get(MANAGED) != "podgrove" or labels.get(ENVIRONMENT) != ident:
-            raise PodgroveError("Environment lease is missing or no longer owned by this worktree")
+        def request(*args, **kwargs):
+            try:
+                result = self.call(*args, timeout=REQUEST_PROCESS_TIMEOUT, check=False, **kwargs)
+            except (PodgroveError, OSError, subprocess.TimeoutExpired) as exc:
+                raise HeartbeatUnavailable("Lease heartbeat is temporarily unavailable; activity update will retry") from exc
+            if result.returncode:
+                raise HeartbeatUnavailable("Lease heartbeat is temporarily unavailable; activity update will retry")
+            return result
+
+        result = request("get", "configmap", f"pg-{ident}", "-o", "json", "--ignore-not-found")
+        try:
+            lease = json.loads(result.stdout) if result.stdout.strip() else {}
+        except (ValueError, TypeError) as exc:
+            raise HeartbeatUnavailable("Lease heartbeat response was incomplete; activity update will retry") from exc
+        try:
+            meta = lease.get("metadata", {})
+            labels = meta.get("labels", {})
+            if (meta.get("name") != f"pg-{ident}" or meta.get("namespace") != self.namespace
+                    or meta.get("deletionTimestamp") or labels.get(MANAGED) != "podgrove"
+                    or labels.get(ENVIRONMENT) != ident):
+                raise ValueError()
+            if (not isinstance(meta.get("uid"), str) or not meta["uid"]
+                    or not isinstance(meta.get("resourceVersion"), str) or not meta["resourceVersion"]
+                    or not isinstance(lease.get("data"), dict)):
+                raise ValueError()
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise PodgroveError("Environment lease is missing or no longer owned by this worktree") from exc
         if self.lease_mode(ident, lease) != self.namespace_mode:
             raise PodgroveError("Environment lease namespace_mode changed; refusing activity update")
         lease["data"]["last_activity"] = str(timestamp)
-        self.call("replace", "-f", "-", input=json.dumps(lease))
+        # Retain the freshly observed UID/resourceVersion. An uncertain or
+        # conflicted replace is never resubmitted from this old object: the next
+        # periodic heartbeat starts with a new ownership read instead.
+        request("replace", "-f", "-", input=json.dumps(lease))
 
     def destroy(self, ident: str, *, namespace_mode: str | None = None) -> None:
         if not re.fullmatch(r"[a-f0-9]{12}", ident):

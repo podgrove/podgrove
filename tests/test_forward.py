@@ -50,7 +50,7 @@ def test_engine_verification_allows_a_read_longer_than_three_seconds(tmp_path):
     original = kube.call
     deadlines = []
 
-    def slow_call(*args, timeout):
+    def slow_call(*args, timeout, cancel_event=None):
         deadlines.append(timeout)
         response = original(*args, timeout=timeout)
         if args[1] == "statefulset":

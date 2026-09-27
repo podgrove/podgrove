@@ -1,4 +1,6 @@
 import copy
+import json
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -189,14 +191,16 @@ def test_lease_mode_recovery_refuses_foreign_or_malformed_lease(change):
 
 def test_lease_mode_change_refuses_heartbeat_reconnect_and_cleanup():
     current = lease("wt-team", "shared")
+    current["metadata"]["uid"] = "lease-uid"
     kube, _ = fake_kube("wt-team", "exclusive", current)
+    kube.call.return_value = SimpleNamespace(returncode=0, stdout=json.dumps(current))
     expected = lease("wt-team", "exclusive")
     expected["kind"] = "ConfigMap"
     for operation in (lambda: kube.heartbeat(IDENT, 200), lambda: kube.destroy(IDENT),
                       lambda: kube._validate_existing(expected, current, IDENT)):
         with pytest.raises(PodgroveError, match="namespace_mode"):
             operation()
-    kube.call.assert_not_called()
+    assert kube.call.call_count == 1 and kube.call.call_args.args[0] == "get"
 
 
 @pytest.mark.parametrize("mode", ["shared", "worktree", "exclusive"])

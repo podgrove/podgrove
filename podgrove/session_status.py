@@ -11,7 +11,7 @@ def observed(data: dict, *, connected: bool | None = None, ping: dict | None = N
     if isinstance(ping, dict):
         if ping.get("ok") is True and ping.get("status") in ("starting", "ready", "degraded", "unhealthy", "error", "disconnected"):
             result["status"] = ping["status"]
-        for key in ("forward_status", "sync_status", "health_status"):
+        for key in ("forward_status", "sync_status", "health_status", "docker_status", "heartbeat_status"):
             if isinstance(ping.get(key), dict):
                 result[key] = dict(ping[key])
     forward = result.get("forward_status")
@@ -35,6 +35,12 @@ def observed(data: dict, *, connected: bool | None = None, ping: dict | None = N
     retrying = isinstance(result.get("sync_status"), dict) and result["sync_status"].get("state") == "retrying"
     stale_health = (isinstance(result.get("health_status"), dict)
                     and result["health_status"].get("state") == "unavailable")
-    if result.get("status") == "ready" and (current not in ("ready", "disabled") or retrying or stale_health):
+    stale_heartbeat = (isinstance(result.get("heartbeat_status"), dict)
+                      and result["heartbeat_status"].get("state") == "unavailable")
+    docker = result.get("docker_status")
+    verification = docker.get("verification", {}) if isinstance(docker, dict) else {}
+    verification = verification if isinstance(verification, dict) else {}
+    stale_ownership = verification.get("state") in ("unavailable", "expired")
+    if result.get("status") == "ready" and (current not in ("ready", "disabled") or retrying or stale_health or stale_ownership or stale_heartbeat):
         result["status"] = "degraded"
     return result

@@ -44,7 +44,7 @@ rows = [{"Service": "app", "State": "running"}]
 runtime.launch_stack = lambda *args: (sync, .01, rows)
 runtime.service_status = block
 runtime.HEALTH_INTERVAL = 0
-tunnel = SimpleNamespace(check=noop, close=noop)
+tunnel = SimpleNamespace(check=noop, close=noop, snapshot=lambda: {"verification": {"state": "verified"}})
 runtime.DockerTunnel = lambda *args: SimpleNamespace(start=lambda: tunnel)
 runtime.run = lambda *args, **kwargs: None
 raise SystemExit(runtime.serve(Path(sys.argv[1])))

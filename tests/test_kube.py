@@ -566,11 +566,11 @@ def test_existing_incompatible_engine_refused_before_any_supporting_object_updat
 
 def test_heartbeat_refuses_lease_replaced_by_another_owner():
     kube = Kube("test-context", "podgrove-testing")
-    kube.get = Mock(return_value={"metadata": {"labels": {MANAGED: "someone-else", ENVIRONMENT: IDENT}}})
-    kube.call = Mock()
+    kube.call = Mock(return_value=SimpleNamespace(returncode=0, stdout=json.dumps(
+        {"metadata": {"labels": {MANAGED: "someone-else", ENVIRONMENT: IDENT}}})))
     with pytest.raises(PodgroveError, match="no longer owned"):
         kube.heartbeat(IDENT, 1234)
-    kube.call.assert_not_called()
+    assert kube.call.call_count == 1 and kube.call.call_args.args[0] == "get"
 
 
 def test_manifest_has_dedicated_schedule_no_host_mounts_and_api_loopback():
@@ -722,3 +722,73 @@ def test_taint_empty_value_is_valid_and_defaults_not_mutated():
 def test_manifest_refuses_mirror_that_overlays_engine_system_paths(root):
     with pytest.raises(PodgroveError, match="Unsafe worktree mirror"):
         manifests("podgrove-testing", IDENT, Path(root), "small", 600)
+
+
+@pytest.fixture
+def heartbeat_kube():
+    kube = Kube("explicit-context", "team-dev", namespace_mode="shared")
+    lease = {"metadata": {"name": "pg-" + IDENT, "namespace": "team-dev", "uid": "lease-uid",
+                          "resourceVersion": "42", "labels": {MANAGED: "podgrove", ENVIRONMENT: IDENT}},
+             "data": {"namespace_mode": "shared", "last_activity": "100"}}
+    kube.call = Mock(return_value=SimpleNamespace(returncode=0, stdout=json.dumps(lease)))
+    return kube, lease
+
+
+@pytest.mark.parametrize("stage", ["get", "replace"])
+@pytest.mark.parametrize("failure", ["exit", "timeout", "oserror"])
+def test_heartbeat_transport_failure_is_typed_and_never_retries_stale_write(heartbeat_kube, stage, failure):
+    kube, lease = heartbeat_kube
+    def call(*args, **kwargs):
+        assert kwargs["timeout"] == kube_module.REQUEST_PROCESS_TIMEOUT and kwargs["check"] is False
+        if args[0] == stage:
+            if failure == "exit":
+                return SimpleNamespace(returncode=1, stdout="", stderr="private-credential-error")
+            if failure == "timeout":
+                raise PodgroveError("private-timeout-response")
+            raise OSError("private-auth-error")
+        return SimpleNamespace(returncode=0, stdout=json.dumps(lease))
+    kube.call.side_effect = call
+    with pytest.raises(kube_module.HeartbeatUnavailable) as error:
+        kube.heartbeat(IDENT, 200)
+    assert "private" not in str(error.value)
+    assert [item.args[0] for item in kube.call.call_args_list] == (["get"] if stage == "get" else ["get", "replace"])
+    if stage == "replace":
+        submitted = json.loads(kube.call.call_args.kwargs["input"])
+        assert submitted["metadata"]["uid"] == "lease-uid" and submitted["metadata"]["resourceVersion"] == "42"
+        assert submitted["data"]["last_activity"] == "200"
+
+
+def test_heartbeat_recovers_only_after_new_owned_lease_read(heartbeat_kube):
+    kube, lease = heartbeat_kube
+    newer = copy.deepcopy(lease)
+    newer["metadata"]["resourceVersion"] = "43"
+    kube.call.side_effect = [SimpleNamespace(returncode=0, stdout=json.dumps(lease)),
+                             SimpleNamespace(returncode=1, stdout="", stderr="uncertain response"),
+                             SimpleNamespace(returncode=0, stdout=json.dumps(newer)),
+                             SimpleNamespace(returncode=0, stdout="{}")]
+    with pytest.raises(kube_module.HeartbeatUnavailable):
+        kube.heartbeat(IDENT, 200)
+    kube.heartbeat(IDENT, 300)
+    assert [item.args[0] for item in kube.call.call_args_list] == ["get", "replace", "get", "replace"]
+    submitted = json.loads(kube.call.call_args.kwargs["input"])
+    assert submitted["metadata"]["resourceVersion"] == "43" and submitted["data"]["last_activity"] == "300"
+
+
+@pytest.mark.parametrize("change", ["missing", "foreign", "mode", "deleting", "version"])
+def test_confirmed_lease_changes_are_fatal_and_never_written(heartbeat_kube, change):
+    kube, lease = heartbeat_kube
+    if change == "missing":
+        lease = {}
+    elif change == "foreign":
+        lease["metadata"]["labels"][ENVIRONMENT] = "foreign"
+    elif change == "mode":
+        lease["data"]["namespace_mode"] = "exclusive"
+    elif change == "deleting":
+        lease["metadata"]["deletionTimestamp"] = "deleting"
+    else:
+        lease["metadata"].pop("resourceVersion")
+    kube.call.return_value = SimpleNamespace(returncode=0, stdout=json.dumps(lease))
+    with pytest.raises(PodgroveError) as error:
+        kube.heartbeat(IDENT, 200)
+    assert not isinstance(error.value, kube_module.HeartbeatUnavailable)
+    assert kube.call.call_count == 1

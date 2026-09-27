@@ -20,12 +20,13 @@ from .config import load_config
 from .docker_tunnel import DockerTunnel
 from .errors import PodgroveError
 from .forward import PortMappingError, Tunnel, free_port, port_plan, verify_port_mappings
-from .kube import Kube
+from .kube import HeartbeatUnavailable, Kube
 from .process import docker_environment, run
 from .reaper import reason
 from .sync import SnapshotRace, Synchronizer
 
 HEALTH_INTERVAL = 30.0
+HEARTBEAT_RETRY_DELAYS = (1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
 STATUS_RETRY_DELAYS = (0.2, 0.5)
 STATUS_READ_TIMEOUT = 10
 _TRANSIENT_READ = re.compile(
@@ -232,7 +233,12 @@ def control(data: dict, action: str, timeout: float = 3) -> dict:
             client.settimeout(timeout)
             client.connect(data["socket"])
             client.sendall(json.dumps({"action": action, "token": data["token"]}).encode() + b"\n")
-            response = json.loads(client.recv(4096))
+            payload = bytearray()
+            while chunk := client.recv(min(4096, 65537 - len(payload))):
+                payload.extend(chunk)
+                if len(payload) > 65536:
+                    raise PodgroveError("Session control response exceeded its size limit")
+            response = json.loads(payload)
             if not isinstance(response, dict):
                 raise PodgroveError("Invalid session control response; refusing the operation")
             return response
@@ -307,10 +313,13 @@ def serve(path: Path) -> int:
     controller = None
     sync_worker = None
     app_tunnel = None
+    api_tunnel = None
     services_ready = True
 
     def persist():
         with activity_lock:
+            if api_tunnel is not None:
+                data["docker_status"] = api_tunnel.snapshot()
             if app_tunnel is not None and not tearing_down:
                 data["forward_status"] = app_tunnel.snapshot()
                 for port in data.get("ports", []):
@@ -325,7 +334,9 @@ def serve(path: Path) -> int:
             return
         degraded = (data.get("forward_status", {}).get("state") in ("reconnecting", "disconnected")
                     or data.get("sync_status", {}).get("state") == "retrying"
-                    or data.get("health_status", {}).get("state") == "unavailable")
+                    or data.get("health_status", {}).get("state") == "unavailable"
+                    or data.get("heartbeat_status", {}).get("state") == "unavailable"
+                    or data.get("docker_status", {}).get("verification", {}).get("state") in ("unavailable", "expired"))
         data["status"] = "degraded" if degraded else "ready" if services_ready else "unhealthy"
 
     def forward_changed(current):
@@ -380,6 +391,10 @@ def serve(path: Path) -> int:
                                 response["sync_status"] = sync_worker.status()
                             if "health_status" in data:
                                 response["health_status"] = dict(data["health_status"])
+                            if "heartbeat_status" in data:
+                                response["heartbeat_status"] = dict(data["heartbeat_status"])
+                            if api_tunnel is not None:
+                                response["docker_status"] = api_tunnel.snapshot()
                     client.sendall(json.dumps(response).encode())
                 except (OSError, ValueError):
                     pass
@@ -405,7 +420,8 @@ def serve(path: Path) -> int:
         compose.validate(model)
         kube.wait(data["identity"], data["timeout"])
         api_port = free_port()
-        tunnels.append(DockerTunnel(kube, data["identity"], api_port).start())
+        api_tunnel = DockerTunnel(kube, data["identity"], api_port).start()
+        tunnels.append(api_tunnel)
         env = docker_environment(f"tcp://127.0.0.1:{api_port}")
         # Explicitly target the engine throughout. Never select or mutate a Docker context.
         run(["docker", "info"], env=env, timeout=30)
@@ -438,6 +454,8 @@ def serve(path: Path) -> int:
         sync_worker.start()
         last_heartbeat = 0.0
         heartbeat_activity = 0.0
+        heartbeat_retry_at = 0.0
+        heartbeat_failures = 0
         last_health = time.monotonic()
         while not stopping:
             for tunnel in tunnels:
@@ -446,7 +464,8 @@ def serve(path: Path) -> int:
                 raise PodgroveError("docker compose watch exited; see the session log and run podgrove up")
             data["last_activity"] = max(data["last_activity"], last_touch, sync_worker.snapshot())
             activity_changed = data["last_activity"] > heartbeat_activity
-            if activity_changed or time.monotonic() - last_heartbeat >= min(30, config.ttl_seconds / 3):
+            if (activity_changed or time.monotonic() - last_heartbeat >= min(30, config.ttl_seconds / 3)
+                    or heartbeat_failures and time.monotonic() >= heartbeat_retry_at):
                 why = reason(data, check_mr=False)
                 if not why and data.get("mr_url"):
                     try:
@@ -470,7 +489,22 @@ def serve(path: Path) -> int:
                     continue
                 if stopping:
                     break
-                kube.heartbeat(data["identity"], data["last_activity"])
+                if time.monotonic() >= heartbeat_retry_at:
+                    try:
+                        kube.heartbeat(data["identity"], data["last_activity"])
+                    except HeartbeatUnavailable:
+                        heartbeat_failures = min(heartbeat_failures + 1, 2**31 - 1)
+                        delay = HEARTBEAT_RETRY_DELAYS[min(heartbeat_failures - 1, len(HEARTBEAT_RETRY_DELAYS) - 1)]
+                        heartbeat_retry_at = time.monotonic() + delay
+                        data["heartbeat_status"] = {
+                            **data.get("heartbeat_status", {}), "state": "unavailable", "checked_at": time.time(),
+                            "consecutive_failures": heartbeat_failures, "next_retry_at": time.time() + delay,
+                            "error": "Lease heartbeat unavailable; cluster activity timestamp may be stale"}
+                    else:
+                        heartbeat_failures = 0
+                        heartbeat_retry_at = 0.0
+                        data["heartbeat_status"] = {"state": "ready", "checked_at": time.time(),
+                                                    "last_success_at": time.time(), "consecutive_failures": 0}
                 heartbeat_activity = data["last_activity"]
                 if stopping:
                     break
