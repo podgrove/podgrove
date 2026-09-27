@@ -89,7 +89,7 @@ def fixture(tmp_path):
              "source_commit": "a" * 40, "package_sha256": "b" * 64, "editable": False}
     table = {
         12000: {"pid": 12000, "parent": 1, "uid": os.getuid(), "started": "Sun Sep 27 12:00:00 2026",
-                "argv": [proof["python"], "-m", "podgrove", "_serve", str(path)]},
+                "argv": [proof["python"], "-I", "-B", "-m", "podgrove", "_serve", str(path)]},
         12001: {"pid": 12001, "parent": 12000, "uid": os.getuid(), "started": "Sun Sep 27 12:00:01 2026",
                 "argv": ["kubectl", "--context", args.context, "--namespace", args.namespace, "--request-timeout=30s",
                          "port-forward", f"pod/pg-{identity}-0", "--address=127.0.0.1", "--request-timeout=0", "23456:8080"]},
@@ -195,7 +195,8 @@ def test_state_scope_and_url_are_exact(fixture, change):
         soak.read_state(args)
 
 
-@pytest.mark.parametrize("change", ["namespace", "context", "pod", "port", "parent", "uid", "supervisor-runtime", "duplicate"])
+@pytest.mark.parametrize("change", ["namespace", "context", "pod", "port", "parent", "uid",
+                                    "supervisor-runtime", "supervisor-imports", "supervisor-bytecode", "duplicate"])
 def test_fault_selection_refuses_any_unproven_process(fixture, change):
     args, data, path, proof, original = fixture
     table = deepcopy(original)
@@ -213,6 +214,10 @@ def test_fault_selection_refuses_any_unproven_process(fixture, change):
         child["uid"] += 1
     elif change == "supervisor-runtime":
         table[12000]["argv"][0] = "/checkout/.venv/bin/python"
+    elif change == "supervisor-imports":
+        table[12000]["argv"].remove("-I")
+    elif change == "supervisor-bytecode":
+        table[12000]["argv"].remove("-B")
     else:
         table[12002] = {**deepcopy(child), "pid": 12002}
     with pytest.raises(soak.Refused):

@@ -284,7 +284,11 @@ def spawn(path: Path) -> None:
     log_path = path.with_suffix(".log")
     fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     with os.fdopen(fd, "a") as log:
-        subprocess.Popen([sys.executable, "-m", "podgrove", "_serve", str(path)],
+        # Resolve the supervisor from this interpreter's installed packages, not
+        # a checkout in cwd or PYTHONPATH. Keep the environment for Compose and
+        # credential helpers; -I ignores Python's import settings, and -B avoids
+        # bytecode writes even though -I ignores PYTHONDONTWRITEBYTECODE.
+        subprocess.Popen([sys.executable, "-I", "-B", "-m", "podgrove", "_serve", str(path)],
                          stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
 
 

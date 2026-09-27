@@ -307,7 +307,7 @@ def process_table(env, stop):
 
 def forward_process(table, args, data, path, proof):
     supervisor = table.get(data["pid"])
-    expected = [proof["python"], "-m", "podgrove", "_serve", str(path)]
+    expected = [proof["python"], "-I", "-B", "-m", "podgrove", "_serve", str(path)]
     if not supervisor or supervisor["uid"] != os.getuid() or supervisor["argv"] != expected:
         raise Refused("Cannot prove the saved supervisor uses the selected installed runtime")
     arguments = ["--context", args.context, "--namespace", args.namespace, "--request-timeout=30s", "port-forward",

@@ -7,6 +7,8 @@ import threading
 import time
 import uuid
 import socket
+import subprocess
+import sys
 
 import pytest
 
@@ -15,6 +17,62 @@ from podgrove import state as state_module
 from podgrove.errors import PodgroveError
 from podgrove.config import Config
 from podgrove.process import docker_environment
+
+
+@pytest.mark.parametrize("shadow", ["cwd", "pythonpath", "all"])
+def test_real_spawn_uses_installed_runtime_despite_shadow_imports(monkeypatch, tmp_path, shadow):
+    """The actual supervisor must reach its own state error before any external work.
+
+    The test environment installs Podgrove (editable development installs work
+    too); an ambient checkout or Python startup setting must not replace it.
+    """
+    marker = tmp_path / "shadow-executed"
+    code = f"from pathlib import Path\nPath({str(marker)!r}).write_text('shadow')\nraise SystemExit(91)\n"
+    roots = {name: tmp_path / name for name in ("cwd", "pythonpath", "userbase")}
+    for root in roots.values():
+        package = root / "podgrove"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text(code)
+        (package / "__main__.py").write_text(code)
+        (root / "sitecustomize.py").write_text(code)
+    clean = tmp_path / "empty-cwd"
+    clean.mkdir()
+    for key in ("PYTHONPATH", "PYTHONHOME", "PYTHONUSERBASE", "PYTHONSTARTUP"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.chdir(roots["cwd"] if shadow in ("cwd", "all") else clean)
+    if shadow in ("pythonpath", "all"):
+        monkeypatch.setenv("PYTHONPATH", str(roots["pythonpath"]))
+    if shadow == "all":
+        monkeypatch.setenv("PYTHONHOME", str(tmp_path / "nonexistent-python-home"))
+        monkeypatch.setenv("PYTHONUSERBASE", str(roots["userbase"]))
+        monkeypatch.setenv("PYTHONSTARTUP", str(roots["userbase"] / "sitecustomize.py"))
+    monkeypatch.setenv("PODGROVE_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("KUBECONFIG", os.devnull)
+    monkeypatch.setenv("DOCKER_HOST", "tcp://127.0.0.1:1")
+    path = tmp_path / "missing-state.json"
+    original_popen = subprocess.Popen
+    children = []
+
+    def launch(*args, **kwargs):
+        child = original_popen(*args, **kwargs)
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(runtime.subprocess, "Popen", launch)
+    try:
+        runtime.spawn(path)
+        child, = children
+        assert child.wait(timeout=15) == 1
+        assert path.with_suffix(".log").read_text().strip() == (
+            "podgrove: No usable environment state; run podgrove up first")
+        assert not marker.exists()
+        assert child.args == [sys.executable, "-I", "-B", "-m", "podgrove", "_serve", str(path)]
+        assert not any(tmp_path.rglob("__pycache__"))
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=5)
 
 
 @pytest.mark.parametrize("failure", ["connection reset by peer", "unexpected EOF", "EOF",

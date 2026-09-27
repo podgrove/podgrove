@@ -97,7 +97,7 @@ brew install podgrove/tap/podgrove
 
 **The Homebrew tap is still being prepared. This command is not available yet.** The [release runbook](docs/releasing.md) explains how a verified release becomes a reviewed formula update. Use the verified release installer or source installation above.
 
-`PODGROVE_BIN` should point to the absolute installed executable. Keep its environment available while worktrees run: background sessions use the interpreter that launched `up`. Coordinate upgrades and `up --refresh` with active users. Development-only editable installation is described under [Run the tests](#run-the-tests).
+`PODGROVE_BIN` should point to the absolute installed executable. Keep its environment available while worktrees run: background sessions use the interpreter that launched `up`, with Python import isolation so the caller’s directory and ambient import paths cannot select another checkout. Coordinate upgrades and `up --refresh` with active users. Development requires the documented [editable installation](#run-the-tests); setting `PYTHONPATH` to uninstalled source does not select the supervisor runtime.
 
 ## Configure the target and prepare access
 
