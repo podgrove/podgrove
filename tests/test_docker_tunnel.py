@@ -11,7 +11,7 @@ import time
 
 import pytest
 
-from podgrove.docker_tunnel import BUFFER_BYTES, POD_UID_ENV, STDERR_BYTES, DockerTunnel
+from podgrove.docker_tunnel import BUFFER_BYTES, POD_UID_ENV, DockerTunnel
 from podgrove.errors import PodgroveError
 from podgrove.kube import ENVIRONMENT, MANAGED, Kube
 
@@ -195,17 +195,22 @@ def test_new_connection_refuses_replacement_even_with_valid_labels(replaced):
         tunnel.close()
 
 
-def test_nonzero_transport_exit_resets_client_and_retains_bounded_error():
-    kube = FakeKube("import sys;sys.stderr.write('x'*100000+'failure-marker');sys.stderr.flush();sys.exit(7)")
+def test_nonzero_transport_exit_resets_only_client_and_retains_safe_diagnostics(caplog):
+    kube = FakeKube("import sys;sys.stderr.write('x'*100000+'broken pipe: private-value');sys.stderr.flush();sys.exit(7)")
     tunnel = DockerTunnel(kube, IDENT, 0).start()
     try:
         with connect(tunnel) as client:
             with pytest.raises(ConnectionResetError):
                 receive(client)
-        with pytest.raises(PodgroveError, match="exited 7") as error:
-            tunnel.check()
-        assert "failure-marker" in str(error.value)
-        assert len(str(error.value)) < STDERR_BYTES + 100
+        wait_until(lambda: tunnel.snapshot()["failed_connections"] == 1)
+        tunnel.check()
+        snapshot = tunnel.snapshot()
+        assert snapshot["failed_connections"] == 1
+        assert snapshot["last_failure"]["reason"] == "broken_pipe"
+        assert snapshot["last_failure"]["exit_code"] == 7
+        assert "private-value" not in json.dumps(snapshot) + caplog.text
+        assert len(json.dumps(snapshot)) < 1024
+        assert "request was not replayed" in caplog.text
     finally:
         tunnel.close()
 
@@ -400,7 +405,7 @@ def test_ownership_failure_resets_existing_keepalive_streams_without_supervisor_
         tunnel.close()
 
 
-def test_transport_failure_aborts_other_streams_without_masking_original_error():
+def test_transport_failure_preserves_existing_and_future_connections_without_replay():
     kube = FakeKube("import sys\nfor line in sys.stdin.buffer:\n sys.stdout.buffer.write(line);sys.stdout.buffer.flush()")
     tunnel = DockerTunnel(kube, IDENT, 0).start()
     try:
@@ -411,10 +416,21 @@ def test_transport_failure_aborts_other_streams_without_masking_original_error()
             with connect(tunnel) as failing:
                 with pytest.raises(ConnectionResetError):
                     failing.recv(1024)
-            with pytest.raises(ConnectionResetError):
-                existing.recv(1024)
+            existing.sendall(b"still-working\n")
+            assert receive_exact(existing, len(b"still-working\n")) == b"still-working\n"
+            wait_until(lambda: tunnel.snapshot()["failed_connections"] == 1)
+            tunnel.check()
+            assert tunnel.snapshot()["failed_connections"] == 1
+            assert tunnel.snapshot()["last_failure"]["exit_code"] == 7
+            kube.script = "import sys;sys.stdout.buffer.write(sys.stdin.buffer.read())"
+            with connect(tunnel) as later:
+                later.sendall(b"new-request")
+                later.shutdown(socket.SHUT_WR)
+                assert receive(later) == b"new-request"
+            existing.shutdown(socket.SHUT_WR)
+            assert receive(existing) == b""
         wait_until(lambda: not tunnel._streams)
-        assert "exited 7" in tunnel._error and "primary-failure" in tunnel._error
+        assert tunnel._error is None and len(kube.commands) == 3
     finally:
         tunnel.close()
 
@@ -432,5 +448,140 @@ def test_expired_guarded_cache_revalidates_before_opening_another_stream():
         with pytest.raises(PodgroveError, match="replaced"):
             tunnel.check()
         assert not kube.commands
+    finally:
+        tunnel.close()
+
+
+def test_partial_failed_request_is_never_replayed_and_cannot_succeed_cleanly():
+    kube = FakeKube("import sys;sys.stdin.buffer.read(7);print('partial',flush=True);"
+                    "sys.stdin.buffer.read(1);sys.exit(1)")
+    tunnel = DockerTunnel(kube, IDENT, 0).start()
+    try:
+        with connect(tunnel) as client:
+            client.sendall(b"request")
+            assert receive_exact(client, 8) == b"partial\n"
+            client.sendall(b"!")
+            with pytest.raises(ConnectionResetError):
+                receive(client)
+        wait_until(lambda: not tunnel._streams)
+        tunnel.check()
+        assert len(kube.commands) == 1
+        failure = tunnel.snapshot()["last_failure"]
+        assert failure["received_bytes"] == 8 and failure["sent_bytes"] == 8
+        assert failure["input_buffer_peak"] <= BUFFER_BYTES
+        assert failure["output_buffer_peak"] <= BUFFER_BYTES
+    finally:
+        tunnel.close()
+
+
+def test_child_launch_failure_is_local_and_does_not_expose_exception_text(monkeypatch, caplog):
+    kube = FakeKube("import sys;sys.stdout.buffer.write(sys.stdin.buffer.read())")
+    tunnel = DockerTunnel(kube, IDENT, 0).start()
+    original = subprocess.Popen
+    try:
+        def unavailable(*_args, **_kwargs):
+            raise OSError(24, "sensitive-command-value")
+        monkeypatch.setattr(subprocess, "Popen", unavailable)
+        with connect(tunnel) as failed:
+            with pytest.raises(ConnectionResetError):
+                receive(failed)
+        wait_until(lambda: tunnel.snapshot()["failed_connections"] == 1)
+        tunnel.check()
+        assert tunnel.snapshot()["last_failure"]["errno"] == 24
+        assert "sensitive-command-value" not in json.dumps(tunnel.snapshot()) + caplog.text
+        monkeypatch.setattr(subprocess, "Popen", original)
+        with connect(tunnel) as next_client:
+            next_client.sendall(b"new request")
+            next_client.shutdown(socket.SHUT_WR)
+            assert receive(next_client) == b"new request"
+    finally:
+        tunnel.close()
+
+
+def test_stream_diagnostics_are_bounded_copies_and_logging_is_rate_limited(caplog):
+    kube = FakeKube("import sys;sys.stderr.write('secret-from-child');sys.exit(1)")
+    tunnel = DockerTunnel(kube, IDENT, 0).start()
+    try:
+        for _ in range(4):
+            with connect(tunnel) as client:
+                with pytest.raises(ConnectionResetError):
+                    receive(client)
+        wait_until(lambda: tunnel.snapshot()["failed_connections"] == 4)
+        snapshot = tunnel.snapshot()
+        assert snapshot["failed_connections"] == 4
+        assert len(json.dumps(snapshot)) < 1024
+        snapshot["last_failure"]["reason"] = "corrupted"
+        assert tunnel.snapshot()["last_failure"]["reason"] == "transport_exit"
+        assert len([record for record in caplog.records if "connection failed" in record.message]) == 1
+        assert "secret-from-child" not in caplog.text
+        tunnel.check()
+    finally:
+        tunnel.close()
+
+
+def test_uid_guard_rejection_still_revokes_other_connections_immediately():
+    kube = GuardedKube("import sys\nfor line in sys.stdin.buffer:\n print(line.decode().strip(),flush=True)")
+    tunnel = DockerTunnel(kube, IDENT, 0).start()
+    try:
+        with connect(tunnel) as existing:
+            existing.sendall(b"before\n")
+            assert receive_exact(existing, 7) == b"before\n"
+            kube.remote_uid = "replacement-uid"
+            with connect(tunnel) as changed:
+                with pytest.raises(ConnectionResetError):
+                    receive(changed)
+            with pytest.raises(ConnectionResetError):
+                existing.recv(1024)
+        with pytest.raises(PodgroveError, match="UID changed"):
+            tunnel.check()
+        assert tunnel.snapshot()["failed_connections"] == 0
+    finally:
+        tunnel.close()
+
+
+def test_guard_rejection_survives_fragmentation_and_bounded_stderr_suffix():
+    from podgrove.docker_tunnel import _UID_REJECTED
+    kube = GuardedKube(f"import sys,time;sys.stderr.write({_UID_REJECTED[:20]!r});sys.stderr.flush();"
+                       f"time.sleep(.03);sys.stderr.write({_UID_REJECTED[20:]!r}+'x'*100000);sys.exit(126)")
+    tunnel = DockerTunnel(kube, IDENT, 0).start()
+    try:
+        with connect(tunnel) as client:
+            with pytest.raises(ConnectionResetError):
+                receive(client)
+        with pytest.raises(PodgroveError, match="UID changed"):
+            tunnel.check()
+        assert tunnel.snapshot()["failed_connections"] == 0
+    finally:
+        tunnel.close()
+
+
+def test_slow_reader_large_binary_stream_keeps_buffers_bounded_and_other_stream_responsive():
+    size = 8 * 1024 * 1024 + 17
+    kube = FakeKube(f"import sys;sys.stdin.buffer.read(1);sys.stdout.buffer.write(b'x'*{size});"
+                    "sys.stdout.buffer.flush();sys.stdin.buffer.read()")
+    tunnel = DockerTunnel(kube, IDENT, 0).start()
+    try:
+        with connect(tunnel) as slow:
+            slow.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            slow.sendall(b"x")
+            wait_until(lambda: bool(tunnel._streams) and
+                       next(iter(tunnel._streams.values())).output_buffer_peak == BUFFER_BYTES)
+            stream = next(iter(tunnel._streams.values()))
+            kube.script = "import sys;sys.stdout.buffer.write(sys.stdin.buffer.read())"
+            with connect(tunnel) as other:
+                other.sendall(b"independent")
+                other.shutdown(socket.SHUT_WR)
+                assert receive(other) == b"independent"
+            slow.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, BUFFER_BYTES)
+            slow.shutdown(socket.SHUT_WR)
+            received = 0
+            while chunk := slow.recv(65536):
+                assert chunk == b"x" * len(chunk)
+                received += len(chunk)
+            assert received == size
+            assert stream.output_buffer_peak == BUFFER_BYTES
+            assert stream.input_buffer_peak <= BUFFER_BYTES
+            assert stream.sent_bytes == size
+        tunnel.check()
     finally:
         tunnel.close()

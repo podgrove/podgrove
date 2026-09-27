@@ -54,6 +54,7 @@ include podgrove/compose.py
 include podgrove/config.py
 include podgrove/docker_tunnel.py
 include podgrove/errors.py
+include podgrove/exec_transport.py
 include podgrove/fingerprint.py
 include podgrove/forward.py
 include podgrove/kube.py
@@ -129,6 +130,7 @@ include tests/test_down_json.py
 include tests/test_dynamic_ports.py
 include tests/test_e2e_harness.py
 include tests/test_exec_half_close.py
+include tests/test_exec_transport.py
 include tests/test_fingerprint.py
 include tests/test_forward.py
 include tests/test_forward_recovery.py

@@ -93,8 +93,8 @@ class FakeEngine(BaseHTTPRequestHandler):
 
 
 @contextmanager
-def fake_engine(*, truncate):
-    server = ThreadingHTTPServer(("127.0.0.1", 0), FakeEngine)
+def fake_engine(*, truncate, handler=FakeEngine):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     server.daemon_threads = True
     server.truncate = truncate
     server.finished = 0
@@ -169,3 +169,78 @@ def test_client_eof_reproduction(docker_client, tmp_path, client, truncate, hold
         else:
             assert observed == (7, "delayed stdout\n", "delayed stderr\n")
             assert server.inspect_running is False
+
+
+class LargeOutputEngine(FakeEngine):
+    """The real clients and dial-stdio bridge must drain output after input EOF."""
+
+    def do_POST(self):
+        if not self.path.endswith("/exec/probe/start"):
+            return super().do_POST()
+        self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        self.send_response(101, "UPGRADED")
+        self.send_header("Content-Type", "application/vnd.docker.raw-stream")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Upgrade", "tcp")
+        self.end_headers()
+        self.wfile.flush()
+        self.server.finished = float("inf")
+        self.connection.settimeout(5)
+        assert self.connection.recv(1) == b""  # Noninteractive client closed only its input.
+        self.server.stdin_closed = True
+        for start in range(0, len(self.server.payload), 32768):
+            chunk = self.server.payload[start:start + 32768]
+            self.wfile.write(bytes((1, 0, 0, 0)) + struct.pack(">I", len(chunk)) + chunk)
+            self.wfile.flush()
+        error = b"expected stderr\n"
+        self.wfile.write(bytes((2, 0, 0, 0)) + struct.pack(">I", len(error)) + error)
+        self.wfile.flush()
+        self.server.finished = time.monotonic()
+        self.close_connection = True
+
+
+@pytest.mark.parametrize("client", ["docker", "compose"])
+@pytest.mark.parametrize("size", [29284, 8 * 1024 * 1024 + 17], ids=["export-sized", "multi-megabyte"])
+def test_real_clients_and_dial_stdio_stream_binary_output_through_relay(docker_client, tmp_path, client, size):
+    from podgrove.docker_tunnel import DockerTunnel
+    from test_docker_tunnel import FakeKube, IDENT
+
+    # No real Engine or Kubernetes is involved. Unlike raw-pipe relay tests,
+    # this retains Docker's HTTP upgrade, multiplexed frames, exec inspection,
+    # stdin EOF and real dial-stdio child shutdown semantics end to end.
+    with fake_engine(truncate=False, handler=LargeOutputEngine) as server:
+        server.payload = bytes(range(256)) * (size // 256) + bytes(range(size % 256))
+        server.stdin_closed = False
+        kube = FakeKube("")
+        def command(*args):
+            kube.commands.append(args)
+            return [docker_client, "--host", f"tcp://127.0.0.1:{server.server_port}", "system", "dial-stdio"]
+        kube.command = command
+        tunnel = DockerTunnel(kube, IDENT, 0).start()
+        try:
+            env = {key: value for key, value in os.environ.items()
+                   if (not key.startswith("DOCKER_") or key == "DOCKER_CONFIG") and key != "BUILDX_BUILDER"}
+            env.update(DOCKER_HOST=f"tcp://127.0.0.1:{tunnel.port}", DOCKER_API_VERSION="1.53")
+            if client == "compose":
+                version = subprocess.run([docker_client, "compose", "version"], env=env,
+                                         capture_output=True, timeout=10)
+                if version.returncode:
+                    pytest.skip("Compose client plugin is not installed")
+                compose = tmp_path / "compose.yaml"
+                compose.write_text("name: transportprobe\nservices:\n  probe:\n    image: alpine:3.21\n")
+                args = [docker_client, "compose", "-f", str(compose), "exec", "-T", "probe"]
+            else:
+                args = [docker_client, "exec", "-i", "fixture"]
+            result = subprocess.run([*args, "sh", "-c", "fixture-only"], env=env, stdin=subprocess.DEVNULL,
+                                    capture_output=True, timeout=30)
+            assert result.returncode == 7
+            assert result.stdout == server.payload
+            assert result.stderr == b"expected stderr\n"
+            assert server.stdin_closed and server.inspect_running is False
+            tunnel.check()
+            assert tunnel.snapshot()["failed_connections"] == 0
+        finally:
+            tunnel.close()
+        assert not tunnel._streams
+        assert not tunnel._accept_thread.is_alive()
+        assert not tunnel._verification_thread.is_alive()

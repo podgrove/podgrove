@@ -555,7 +555,9 @@ def execute(args) -> int:
         cmd_args = args.args[1:] if args.args and args.args[0] == "--" else args.args
         if not cmd_args:
             raise PodgroveError("exec requires a command after --")
-        command = compose.command("exec", *([] if sys.stdin.isatty() else ["-T"]), args.service, *cmd_args)
+        from .exec_transport import run_exec
+        project = data.get("compose_project") or model.get("name")
+        return run_exec(kube, ident, project, args.service, cmd_args, tty=sys.stdin.isatty())
     with ExitStack() as cleanup:
         host = data.get("docker_host")
         if not connected:
