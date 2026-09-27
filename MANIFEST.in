@@ -31,10 +31,13 @@ include docs/assets/logo-dark.svg
 include docs/assets/logo-light.svg
 include docs/assets/logo.svg
 include docs/branding.md
+include docs/compose-migration.md
 include docs/configuration.md
 include docs/dogfood-workflows.md
+include docs/getting-started.md
 include docs/how-it-works.md
 include docs/known-limits.md
+include docs/operations.md
 include docs/releasing.md
 include docs/verification.md
 include docs/web.md

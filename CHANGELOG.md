@@ -2,6 +2,13 @@
 
 User-visible changes are recorded here. Release Please manages versioned entries after the first public release.
 
+## 0.2.3 (2026-09-27)
+
+- Shorten the README around the problem Podgrove solves, its operating model, and the first successful deployment.
+- Keep detailed setup, Compose migration, operation, recovery and verification guidance in linked documentation.
+- Verify complete non-TTY exec output with separate stdout/stderr checksums and a drain acknowledgement, preventing a successful transport exit from hiding truncated exports. Interrupted commands are never replayed.
+- Preserve independent output backpressure and cancellation without changing the caller's file-descriptor flags; keep native interactive terminal behavior.
+
 ## 0.2.2 (2026-09-27)
 
 - Start supervisors with Python import isolation so an older checkout in the caller's working directory cannot replace the installed runtime.

@@ -20,7 +20,7 @@ See [verification](verification.md) and [test lanes](../tests/README.md). A pass
 | `external_links`, `volumes_from`, `use_api_socket`, `provider`, `models` | These rely on external containers, provider integration, or host-coupled resources. |
 | Host or `container:` values for `network_mode`, `pid`, `ipc`, `uts`, `cgroup`; `cgroup_parent` | Host/external-container namespaces and cgroup paths differ on the remote engine. |
 | Non-`rprivate` bind propagation | Shared/slave propagation cannot reproduce the laptop's mounts. |
-| Bind paths outside the worktree, `.git` paths, missing required sources | The mirror is deliberately restricted to existing worktree sources. |
+| Bind paths outside the configuration root, `.git` paths, missing required sources | The mirror is deliberately restricted to existing sources beneath the configuration root. |
 | Symlinks and special files inside synchronized sources | Version 1 supports regular files and directories only, including when a symlink points inside the worktree. |
 | Remote `build.context`, unsupported remote `additional_contexts` | Use local contexts; Compose `service:` and `docker-image://` additional contexts are allowed. |
 | `build.ssh`, `build.network: host` | SSH-agent forwarding and laptop host networking are unavailable. |
@@ -66,7 +66,7 @@ A selected worktree cannot be `/`, a protected system directory, or an unsafe da
 
 ## Security prerequisites
 
-A privileged inner Docker engine shares its node's kernel and is not a hardened boundary against untrusted workloads. Shared Linux EC2 nodes are supported by default; `node_mode: tainted` optionally limits placement using `tainted_nodes.selector` and its configured taint key/value/effect. Both modes keep separate engines/PVCs, provisioning-marker/resource ownership, NetworkPolicy, and resource limits. Neither mode supports Fargate or EKS Auto Mode. Podgrove does not create node pools, grant itself cluster-admin, or alter node labels and taints.
+A privileged inner Docker engine shares its node's kernel and is not a hardened boundary against untrusted workloads. Eligible shared Linux nodes are supported by default; `node_mode: tainted` optionally limits placement using `tainted_nodes.selector` and its configured taint key/value/effect. Both modes keep separate engines/PVCs, provisioning-marker/resource ownership, NetworkPolicy, and resource limits. Neither mode supports Fargate or EKS Auto Mode. Podgrove does not create node pools, grant itself cluster-admin, or alter node labels and taints.
 
 The platform must prepare the target namespace and approve admission, scheduling, storage and the trust relationship with any existing CI workloads. Podgrove uses only namespaced workload APIs, exec/port-forward, and exact dashboard SA/RBAC reads. It does not inspect or modify Namespace, node, StorageClass, PV, cluster-RBAC or admission objects. Both shared and tainted scheduling modes use that boundary. The provisioning marker verifies the intended namespace mode without reading Namespace metadata.
 
