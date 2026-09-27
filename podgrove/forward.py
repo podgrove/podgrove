@@ -10,7 +10,7 @@ import threading
 import time
 
 from .errors import PodgroveError
-from .kube import ENVIRONMENT, MANAGED, Kube, engine_pod_name
+from .kube import ENVIRONMENT, MANAGED, REQUEST_PROCESS_TIMEOUT, Kube, engine_pod_name
 
 
 def free_port(preferred: int = 0) -> int:
@@ -116,7 +116,8 @@ class Tunnel:
         for kind, name in (("statefulset", "pg-" + self.ident), ("pod", engine_pod_name(self.ident))):
             if self._stopped.is_set():
                 raise PodgroveError("Application forwarding cancelled")
-            response = self.kube.call("get", kind, name, "-o", "json", "--ignore-not-found", timeout=3)
+            response = self.kube.call("get", kind, name, "-o", "json", "--ignore-not-found",
+                                      timeout=REQUEST_PROCESS_TIMEOUT)
             try:
                 resource = json.loads(response.stdout) if response.stdout.strip() else {}
                 meta = resource.get("metadata", {})

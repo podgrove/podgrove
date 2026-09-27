@@ -10,7 +10,7 @@ import pytest
 
 from podgrove.errors import PodgroveError
 from podgrove.forward import ForwardOwnershipError, Tunnel, free_port
-from podgrove.kube import ENVIRONMENT, MANAGED
+from podgrove.kube import ENVIRONMENT, MANAGED, REQUEST_PROCESS_TIMEOUT
 
 IDENT = "012345abcdef"
 # A real separate process stands in for kubectl, with real TCP listeners. It
@@ -58,7 +58,7 @@ class LocalKube:
                                     "uid": "original-controller", "controller": True}]}}
 
     def call(self, *args, timeout):
-        assert args[:1] == ("get",) and timeout <= 3
+        assert args[:1] == ("get",) and timeout == REQUEST_PROCESS_TIMEOUT
         self.reads.append(args)
         return SimpleNamespace(stdout=json.dumps(self.controller if args[1] == "statefulset" else self.pod))
 

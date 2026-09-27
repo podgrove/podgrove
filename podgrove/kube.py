@@ -22,6 +22,10 @@ ENVIRONMENT = "podgrove.dev/environment"
 DEDICATED = "podgrove.dev/dedicated"
 NODE_MODE = "podgrove.dev/node-mode"
 IMAGE = "docker:29.5.2-dind"
+REQUEST_TIMEOUT = 30
+# Allow kubectl to finish its request and authentication/cleanup work before
+# the local subprocess deadline expires.
+REQUEST_PROCESS_TIMEOUT = REQUEST_TIMEOUT + 5
 
 DEFAULT_TAINTED_NODES = {"selector": {DEDICATED: "true"},
                          "taint": {"key": "dedicated", "value": "podgrove", "effect": "NoSchedule"}}
@@ -233,7 +237,8 @@ class Kube:
         self.namespace_mode = resolve_namespace_mode(namespace, namespace_mode)
 
     def command(self, *args: str) -> list[str]:
-        return ["kubectl", "--context", self.context, "--namespace", self.namespace, "--request-timeout=30s", *args]
+        return ["kubectl", "--context", self.context, "--namespace", self.namespace,
+                f"--request-timeout={REQUEST_TIMEOUT}s", *args]
 
     def call(self, *args: str, **kwargs):
         return run(self.command(*args), **kwargs)
