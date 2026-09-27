@@ -4,7 +4,7 @@ The CLI authenticates using the credentials of the explicitly selected kubeconfi
 
 ## Run the same stack on an approved target
 
-Keep the original Compose files and their ordering. Set the actual approved context, existing namespace and dynamic StorageClass in `podgrove.yml`; there is no built-in target. The administrator must verify storage reclaim behavior because the runtime never reads StorageClass or PersistentVolume objects. Generate/review/apply the bootstrap folder once per shared namespace or once per derived worktree namespace as described in the [README](../README.md).
+Keep the original Compose files and their ordering. Set the actual approved context, existing namespace and dynamic StorageClass in `podgrove.yml`; there is no built-in target. The administrator must verify storage reclaim behavior because the runtime never reads StorageClass or PersistentVolume objects. Generate/review/apply the bootstrap folder once per shared namespace or once per derived worktree namespace as described in [getting started](getting-started.md#configure-the-target-and-prepare-access).
 
 From the configured application workspace:
 

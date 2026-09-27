@@ -104,7 +104,7 @@ network:
 
 Built-in private/special IPv4 exclusions always remain. Adjacent/overlapping IPv4 ranges are consolidated in the generated policy. Setting `0.0.0.0/0` removes public-web egress entirely, retaining only the explicit DNS allowance. IPv6 CIDRs can be recorded, but do not create an IPv6 public-egress rule. Bootstrap itself is deny-only and grants no competing broad allowance; these additional values are used by the worktree policy rendered by `up --dry-run` and installed by `up`.
 
-Run `up` after changing exclusions. It also reconciles a missing or modified owned policy before returning an already-running environment. Provisioning-marker validation, policy ownership and optimistic concurrency prevent adopting or overwriting a replacement object. Policies added by other actors remain an administrator concern: standard NetworkPolicy allows combine, and Service/NAT/node exceptions vary by platform. See [network isolation and its limits](../README.md#worktree-network-isolation) and the [administrator guide](../deploy/README.md).
+Run `up` after changing exclusions. It also reconciles a missing or modified owned policy before returning an already-running environment. Provisioning-marker validation, policy ownership and optimistic concurrency prevent adopting or overwriting a replacement object. Policies added by other actors remain an administrator concern: standard NetworkPolicy allows combine, and Service/NAT/node exceptions vary by platform. See [network isolation and its limits](operations.md#worktree-network-isolation) and the [administrator guide](../deploy/README.md).
 
 ## Two directory settings
 
@@ -128,7 +128,7 @@ compose:
 
 A test bind such as `../services:/app/services` can then refer to the backend's `services/` directory while staying within the worktree.
 
-Paths may be absolute if they remain inside the resolved worktree. Missing required sources, paths escaping the worktree, `.git` sources, symlinks in synchronized sources, and special files such as sockets or FIFOs are refused. Podgrove does not create a missing bind source as an empty directory.
+Paths may be absolute if they remain inside the configuration and allowed-source boundary. Missing required sources, paths escaping that boundary, `.git` sources, symlinks in synchronized sources, and special files such as sockets or FIFOs are refused. Podgrove does not create a missing bind source as an empty directory.
 
 ## Node placement
 
@@ -165,7 +165,7 @@ A pod's `podgrove.dev/node-mode` label records its placement mode. The privilege
 
 ## Sync exclusions and endpoint exports
 
-See the [README](../README.md#lifecycle-and-target-selection) for `podgrove env`, retained-container logs and endpoint status. Optional `sync.exclude: [__pycache__, "*.pyc", .pytest_cache]` excludes local generated content before mirror scanning. Slashless globs match any component; slash globs are workspace-relative and `**` spans directories. Excluded directories prune descendants. Explicit mounted/config/secret sources may not themselves be excluded. Existing mirrored exclusions are left untouched. Compose build `.dockerignore` and native watch rules remain independent. Invalid patterns, including absolute paths, negation or `..`, are refused.
+See [lifecycle and target selection](operations.md#lifecycle-and-target-selection) for `podgrove env`, retained-container logs and endpoint status. Optional `sync.exclude: [__pycache__, "*.pyc", .pytest_cache]` excludes local generated content before mirror scanning. Slashless globs match any component; slash globs are workspace-relative and `**` spans directories. Excluded directories prune descendants. Explicit mounted/config/secret sources may not themselves be excluded. Existing mirrored exclusions are left untouched. Compose build `.dockerignore` and native watch rules remain independent. Invalid patterns, including absolute paths, negation or `..`, are refused.
 
 ## Resource sizes
 
