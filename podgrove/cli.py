@@ -26,6 +26,18 @@ from .session_status import observed
 from .resources import engine_resources, initializer_resources, quantity_text
 
 
+def _log_tail(value: str) -> int | str:
+    if value == "all":
+        return value
+    try:
+        tail = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("tail must be a non-negative integer or all") from exc
+    if tail < 0:
+        raise argparse.ArgumentTypeError("tail must be a non-negative integer or all")
+    return tail
+
+
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="podgrove", description="Run unchanged Docker Compose worktrees on Kubernetes")
     p.add_argument("--version", action="version", version=__version__)
@@ -56,7 +68,8 @@ def parser() -> argparse.ArgumentParser:
             cmd.add_argument("service")
         if name == "logs":
             cmd.add_argument("--follow", action="store_true")
-            cmd.add_argument("--tail", type=int, default=100)
+            cmd.add_argument("--tail", type=_log_tail, default=100,
+                             help="Recent lines per container, or all retained history (default: 100)")
         if name == "status":
             cmd.add_argument("--all", action="store_true", help="List local environments for the explicit context")
         if name == "exec":
@@ -495,7 +508,7 @@ def execute(args) -> int:
     if args.service not in model["services"]:
         raise PodgroveError(f"Unknown Compose service: {args.service}")
     if args.command == "logs":
-        if args.tail < 0:
+        if args.tail != "all" and args.tail < 0:
             raise PodgroveError("--tail must be zero or greater")
         command = compose.command("logs", "--tail", str(args.tail), *( ["--follow"] if args.follow else []), args.service)
     else:
@@ -543,7 +556,7 @@ def retained_logs(data: dict, kube: Kube, args) -> int:
         raise PodgroveError("Recorded Compose project metadata is invalid")
     if args.service not in services:
         raise PodgroveError(f"Unknown Compose service: {args.service}")
-    if args.tail < 0:
+    if args.tail != "all" and args.tail < 0:
         raise PodgroveError("--tail must be zero or greater")
     with ExitStack() as cleanup:
         tunnel = DockerTunnel(kube, data["identity"], 0)

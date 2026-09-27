@@ -805,3 +805,58 @@ def test_global_settings_http_route_keeps_auth_and_only_allows_namespace_selecti
     backend.settings.side_effect = web.WebError("Namespace is outside the verified local inventory", 400)
     code, _, body = request(instance, "/api/settings?namespace=kube-system", headers={"X-Podgrove-Token": instance.token})
     assert code == 400 and b"outside the verified" in body
+
+
+@pytest.mark.parametrize("source", ["engine", "service"])
+def test_all_retained_log_snapshot_keeps_byte_limit_and_redaction(engine, monkeypatch, source):
+    data, backend, _, _, _ = engine
+    secret_line = b"password=do-not-display\n"
+    payload = secret_line + b"x" * (web.MAX_LOG - len(secret_line))
+    command = Mock(return_value=payload)
+    docker = Mock(return_value=(payload, True))
+    monkeypatch.setattr(web, "bounded_read_command", command)
+    monkeypatch.setattr(backend, "_docker", docker)
+    result = backend.logs(data["identity"], source=source, service="api" if source == "service" else None, tail="all")
+    assert result["tail"] == "all" and result["truncated"] is True
+    assert "do-not-display" not in result["text"] and "[REDACTED]" in result["text"]
+    if source == "engine":
+        args = command.call_args.args[0]
+        assert args[args.index("--tail") + 1] == "-1"
+        assert args[args.index("--limit-bytes") + 1] == str(web.MAX_LOG)
+        assert command.call_args.kwargs["limit"] == web.MAX_LOG
+        docker.assert_not_called()
+    else:
+        assert "tail=all" in docker.call_args.args[1]
+        assert docker.call_args.kwargs["limit"] == web.MAX_LOG
+        assert docker.call_args.kwargs["allow_truncated"] is True
+        command.assert_not_called()
+
+
+@pytest.mark.parametrize("tail", [True, False, 1.0, "100", "ALL", "all ", "-1", -1, None, []])
+def test_snapshot_tail_rejects_non_integer_and_non_all_values_before_reads(engine, monkeypatch, tail):
+    data, backend, *_ = engine
+    monkeypatch.setattr(backend, "_record", Mock(side_effect=AssertionError("No invalid source read")))
+    with pytest.raises(web.WebError) as caught:
+        backend.logs(data["identity"], source="engine", service=None, tail=tail)
+    assert caught.value.status == 400
+
+
+@pytest.mark.parametrize("source", ["engine", "service"])
+def test_http_snapshot_accepts_all_retained_history(server, source):
+    instance, backend = server
+    path = f"/api/environments/123456abcdef/logs?source={source}&tail=all"
+    service = "api" if source == "service" else None
+    if service:
+        path += "&service=" + service
+    code, _, _ = request(instance, path, headers={"X-Podgrove-Token": instance.token})
+    assert code == 200
+    backend.logs.assert_called_once_with("123456abcdef", source=source, service=service, tail="all")
+
+
+@pytest.mark.parametrize("tail", ["ALL", "all%20", "-1", "0", "201", "1000", "1.0", "true", "all&tail=100", ""])
+def test_http_snapshot_invalid_all_tail_is_rejected_before_dispatch(server, tail):
+    instance, backend = server
+    code, _, _ = request(instance, f"/api/environments/123456abcdef/logs?tail={tail}",
+                         headers={"X-Podgrove-Token": instance.token})
+    assert code == 400
+    backend.logs.assert_not_called()

@@ -154,9 +154,10 @@ header is distinguished before emitting bytes; later malformed framing fails.
 
 class LogStream:
     def __init__(self, backend, ident, *, source, service, tail, container=None):
-        from .web import NAME, WebError
-        if source not in ("engine", "service") or type(tail) is not int or not 1 <= tail <= 200:
-            raise WebError("Select engine/service logs and a tail between 1 and 200", 400)
+        from .web import NAME, WebError, _validate_log_tail
+        _validate_log_tail(tail)
+        if source not in ("engine", "service"):
+            raise WebError("Select engine or service logs", 400)
         if source == "service" and (not isinstance(service, str) or not NAME.fullmatch(service)):
             raise WebError("Select an existing Compose service", 400)
         if source == "engine" and (service is not None or container is not None):
@@ -300,7 +301,7 @@ class LogStream:
             return
         kube, _, pod, _ = self.engine
         command = kube.command("logs", "pod/" + pod["metadata"]["name"], "--container", "docker",
-                               "--follow", "--tail", str(self.tail), "--timestamps=true")
+                               "--follow", "--tail", "-1" if self.tail == "all" else str(self.tail), "--timestamps=true")
         process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, start_new_session=True, bufsize=0)
 

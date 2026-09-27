@@ -1116,3 +1116,44 @@ def test_cancelled_fullscreen_request_cannot_enter_late(page, dashboard):
     page.evaluate("window.fixtureFinishFullscreen()")
     page.wait_for_function("window.fixtureExited === true && document.fullscreenElement === null")
     assert not page.locator(".topbar").evaluate("el=>el.inert")
+
+
+@pytest.mark.parametrize("source", ["engine", "service:api"])
+def test_all_logs_requests_selected_history_for_snapshot_and_live_with_visible_limits(page, dashboard, monkeypatch, source):
+    server, backend = dashboard
+    original = backend.logs
+    def all_snapshot(ident, *, source, service, tail, container=None):
+        if tail != "all":
+            return original(ident, source=source, service=service, tail=tail, container=container)
+        backend.calls.append(("logs", ident, source, service, tail))
+        return {"source": source, "service": service, "tail": tail,
+                "text": "retained snapshot history\n", "truncated": True}
+    monkeypatch.setattr(backend, "logs", all_snapshot)
+    backend.live_records = [{"type": "line", "text": f"retained row {index}\n", "stream": "stdout"}
+                            for index in range(2105)]
+    open_dashboard(page, server)
+    choose_tab(page, "Logs")
+    page.get_by_label("Source", exact=True).select_option(source)
+    expect(page.locator("#refresh-logs")).to_have_attribute("aria-busy", "false")
+    page.get_by_label("Lines", exact=True).select_option(label="All logs")
+    expect(page.locator("#log-output")).to_have_text("retained snapshot history\n")
+    expect(page.locator("#log-status")).to_contain_text("This snapshot is incomplete")
+    expect(page.locator(".log-guidance")).to_contain_text("all available retained history for the selected source")
+    expect(page.locator(".log-guidance")).to_contain_text("64 KiB")
+    expect(page.locator(".log-guidance")).to_contain_text("2,000 lines or 256 KiB")
+    service = "api" if source == "service:api" else None
+    kind = "service" if service else "engine"
+    assert ("logs", IDENT, kind, service, "all") in backend.calls
+    page.get_by_role("button", name="Go live", exact=True).click()
+    expect(page.locator("#log-status")).to_contain_text("Live · receiving retained history and new lines")
+    expect(page.locator("#log-output")).to_contain_text("retained row 2104")
+    expect(page.locator("#log-buffer")).to_have_text("2,000 lines · buffer trimmed")
+    assert ("logs_stream", IDENT, kind, service, "all", None) in backend.calls
+    assert len(page.locator("#log-output").inner_text().splitlines()) == 2000
+    assert "retained row 0\n" not in page.locator("#log-output").inner_text()
+    stream = backend.live_streams[-1]
+    page.get_by_role("button", name="Pause live", exact=True).click()
+    assert stream.stopped.wait(2)
+    page.get_by_label("Lines", exact=True).select_option("100")
+    expect(page.locator("#log-output")).to_contain_text("api ready")
+    assert ("logs", IDENT, kind, service, 100) in backend.calls

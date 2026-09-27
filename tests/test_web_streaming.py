@@ -564,3 +564,56 @@ def test_bounded_ownership_read_cancels_its_process_without_disclosing_stderr():
     finally:
         timer.cancel()
         timer.join()
+
+
+@pytest.mark.parametrize("source", ["engine", "service"])
+def test_http_all_retained_history_stream_maps_source_tail_and_redacts(follower, monkeypatch, source):
+    data, backend, *_ = follower
+    commands = engine_command(monkeypatch, "print('password=hidden-history'); print('last retained line')")
+    with docker_source(backend, monkeypatch, [frame(b"password=hidden-history\nlast retained line\n")]) as (calls, _):
+        with serve(backend) as server:
+            query = f"?source={source}&tail=all" + ("&service=api" if source == "service" else "")
+            connection, response = request(server, data["identity"], query)
+            try:
+                assert response.status == 200
+                start = event(response)
+                assert start["type"] == "start" and start["tail"] == "all"
+                records = [json.loads(line) for line in response]
+            finally:
+                response.close()
+                connection.close()
+            wait_until(lambda: not server.active_streams)
+    assert [row["text"] for row in records if row["type"] == "line"] == [
+        "password=[REDACTED]\n", "last retained line\n"]
+    assert records[-1]["reason"] == "completed"
+    if source == "engine":
+        assert not calls and len(commands) == 1
+        assert commands[0][commands[0].index("--tail") + 1] == "-1"
+        assert "--follow" in commands[0]
+    else:
+        assert not commands and len(calls) == 1
+        assert "tail=all" in calls[0] and "follow=1" in calls[0]
+
+
+@pytest.mark.parametrize("tail", ["ALL", "all%20", "-1", "0", "201", "1000", "1.0", "true", "all&tail=100", ""])
+def test_http_stream_invalid_all_tail_is_rejected_before_reads(follower, monkeypatch, tail):
+    data, backend, *_ = follower
+    read = Mock(side_effect=AssertionError("No invalid source read"))
+    monkeypatch.setattr(backend, "_record", read)
+    with serve(backend) as server:
+        connection, response = request(server, data["identity"], "?tail=" + tail)
+        try:
+            assert response.status == 400
+            response.read()
+        finally:
+            connection.close()
+        assert not server.active_streams and server.stream_slots._value == 2
+    read.assert_not_called()
+
+
+@pytest.mark.parametrize("tail", [False, 1.0, "100", "ALL", "all ", "-1", -1, None, []])
+def test_stream_tail_rejects_non_integer_and_non_all_values(follower, monkeypatch, tail):
+    monkeypatch.setattr(follower[1], "_record", Mock(side_effect=AssertionError("No invalid source read")))
+    with pytest.raises(web.WebError) as caught:
+        stream_for(follower, tail=tail)
+    assert caught.value.status == 400

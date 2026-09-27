@@ -54,6 +54,20 @@ class WebError(Exception):
         self.status = status
 
 
+def _validate_log_tail(tail: int | str) -> int | str:
+    if tail == "all" or (type(tail) is int and 1 <= tail <= 200):
+        return tail
+    raise WebError("Select a tail between 1 and 200, or all retained logs", 400)
+
+
+def _parse_log_tail(value: str) -> int | str:
+    if value == "all":
+        return value
+    if not re.fullmatch(r"[0-9]{1,3}", value):
+        raise WebError("Invalid log tail", 400)
+    return _validate_log_tail(int(value))
+
+
 def _stop(process: subprocess.Popen) -> None:
     try:
         os.killpg(process.pid, signal.SIGKILL)
@@ -570,10 +584,11 @@ class Dashboard:
             result["warnings"].append(str(exc))
         return result
 
-    def logs(self, ident: str, *, source: str, service: str | None, tail: int,
+    def logs(self, ident: str, *, source: str, service: str | None, tail: int | str,
              container: str | None = None) -> dict:
-        if source not in ("engine", "service") or not 1 <= tail <= 200:
-            raise WebError("Select engine/service logs and a tail between 1 and 200", 400)
+        _validate_log_tail(tail)
+        if source not in ("engine", "service"):
+            raise WebError("Select engine or service logs", 400)
         if source == "service" and (not isinstance(service, str) or not NAME.fullmatch(service)):
             raise WebError("Select an existing Compose service", 400)
         if source == "engine" and (service is not None or container is not None):
@@ -585,7 +600,7 @@ class Dashboard:
         if source == "engine":
             observed_uid = pod["metadata"]["uid"]
             raw = bounded_read_command(kube.command("logs", "pod/" + pod["metadata"]["name"], "--container", "docker",
-                                                     "--tail", str(tail), "--limit-bytes", str(MAX_LOG), "--timestamps=true"),
+                                                     "--tail", "-1" if tail == "all" else str(tail), "--limit-bytes", str(MAX_LOG), "--timestamps=true"),
                                        limit=MAX_LOG)
             current = self._kube_read(kube, "pod", pod["metadata"]["name"])
             meta = current.get("metadata", {})
@@ -626,7 +641,7 @@ class Dashboard:
         return {"source": source, "service": service, "text": text, "truncated": truncated,
                 "tail": tail, "observed_at": time.time()}
 
-    def logs_stream(self, ident: str, *, source: str, service: str | None, tail: int,
+    def logs_stream(self, ident: str, *, source: str, service: str | None, tail: int | str,
                     container: str | None = None):
         from .web_logs import LogStream
         return LogStream(self, ident, source=source, service=service, tail=tail, container=container)
@@ -721,9 +736,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _stream(self, ident: str, query: dict) -> None:
         if not set(query) <= {"source", "service", "tail", "container"}:
             raise WebError("Unknown log parameter", 400)
-        tail = query.get("tail", ["100"])[0]
-        if not re.fullmatch(r"[0-9]{1,3}", tail):
-            raise WebError("Invalid log tail", 400)
+        tail = _parse_log_tail(query.get("tail", ["100"])[0])
         if not self.server.stream_slots.acquire(blocking=False):
             raise WebError("Two log streams are already open; pause one before starting another", 429)
         stream = None
@@ -732,7 +745,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         try:
             stream = self.server.backend.logs_stream(
                 ident, source=query.get("source", ["engine"])[0], service=query.get("service", [None])[0],
-                tail=int(tail), container=query.get("container", [None])[0])
+                tail=tail, container=query.get("container", [None])[0])
             with self.server.stream_lock:
                 if self.server.stopping.is_set():
                     raise WebError("Dashboard is stopping")
@@ -823,11 +836,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     if match[2]:
                         if not set(query) <= {"source", "service", "tail", "container"}:
                             raise WebError("Unknown log parameter", 400)
-                        tail = query.get("tail", ["100"])[0]
-                        if not re.fullmatch(r"[0-9]{1,3}", tail):
-                            raise WebError("Invalid log tail", 400)
+                        tail = _parse_log_tail(query.get("tail", ["100"])[0])
                         result = self.server.backend.logs(match[1], source=query.get("source", ["engine"])[0],
-                                                          service=query.get("service", [None])[0], tail=int(tail),
+                                                          service=query.get("service", [None])[0], tail=tail,
                                                           **({"container": query["container"][0]} if "container" in query else {}))
                     elif query:
                         raise WebError("Details do not accept parameters", 400)

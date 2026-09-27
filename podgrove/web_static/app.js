@@ -608,12 +608,12 @@
     const controller = new AbortController(); state.logAbort = controller;
     busy("refresh-logs", true);
     $("log-output").textContent = "Reading logs…";
-    logStatus("Reading a bounded log snapshot…");
+    logStatus($("log-tail").value === "all" ? "Reading retained history within the snapshot limit…" : "Reading a bounded log snapshot…");
     try {
       const result = await api(`/api/environments/${encodeURIComponent(state.selected)}/logs?${logParameters()}`, controller.signal);
       if (generation !== state.logGeneration) return;
       appendLogText(result.text || ""); renderLogBuffer();
-      logStatus(result.truncated ? "Output was truncated to the server’s size limit." : `Read at ${new Date().toLocaleTimeString()} · refresh on request`);
+      logStatus(result.truncated ? "Output was truncated to the server’s size or source limit. This snapshot is incomplete." : `Read at ${new Date().toLocaleTimeString()} · refresh on request`);
     } catch (error) {
       if (generation !== state.logGeneration) return;
       message("log-error", errorText(error));
@@ -643,7 +643,7 @@
       if (!event || typeof event !== "object") throw new Error("The live log response was not valid.");
       if (event.type === "start" && !started) {
         started = true; clearLogBuffer(); renderLogBuffer("Connected. Waiting for log lines…");
-        logStatus("Live · receiving new lines", true); return;
+        logStatus($("log-tail").value === "all" ? "Live · receiving retained history and new lines" : "Live · receiving new lines", true); return;
       }
       if (!started) throw new Error("The live log response did not include a valid start event.");
       if (event.type === "line" && typeof event.text === "string") {

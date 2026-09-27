@@ -581,3 +581,63 @@ def test_targeted_reap_passes_explicit_identity(project, monkeypatch):
     args = lifecycle_args(project, "reap", "--environment", state.identity(project), "--dry-run")
     assert cli.execute(args) == 0
     assert reaper.call_args.kwargs == {"identity": state.identity(project)}
+
+
+@pytest.mark.parametrize("value,expected", [("all", "all"), ("0", 0), ("100", 100), ("100000", 100000)])
+def test_logs_tail_accepts_all_retained_history_or_non_negative_counts(value, expected):
+    args = cli.parser().parse_args(["logs", "api", "--tail", value])
+    assert args.tail == expected
+
+
+@pytest.mark.parametrize("value", ["ALL", "all ", "-1", "1.5", "true", "", "--all"])
+def test_logs_invalid_tail_fails_before_dispatch(value, monkeypatch):
+    kube = Mock(side_effect=AssertionError("No invalid argument cluster reads"))
+    monkeypatch.setattr(cli, "Kube", kube)
+    with pytest.raises(SystemExit) as caught:
+        cli.parser().parse_args(["logs", "api", "--tail", value])
+    assert caught.value.code == 2
+    kube.assert_not_called()
+
+
+@pytest.mark.parametrize("connected", [True, False])
+@pytest.mark.parametrize("follow", [True, False])
+def test_all_logs_streams_uncapped_to_inherited_stdout_and_preserves_exit_status(project, monkeypatch, capfd,
+                                                                              connected, follow):
+    import os
+    import sys
+    from podgrove import docker_tunnel
+    (project / "podgrove.yml").write_text("cluster: {context: log-fixture, namespace: owned}\n")
+    monkeypatch.chdir(project)
+    data = {"identity": state.identity(project), "root": str(project), "context": "log-fixture", "namespace": "owned",
+            "namespace_mode": "shared", "node_mode": "shared", "status": "ready",
+            "docker_host": "tcp://127.0.0.1:12345", "compose_project": "log-fixture", "compose_services": ["app"]}
+    path = state.state_path(project, data["context"])
+    state.write(path, data)
+    kube = Mock()
+    monkeypatch.setattr(cli, "Kube", Mock(return_value=kube))
+    monkeypatch.setattr(runtime, "is_running", lambda _: connected)
+    monkeypatch.setattr(runtime, "control", Mock(return_value={"ok": True}))
+    monkeypatch.setattr(Compose, "model", lambda _: {"name": "log-fixture", "services": {"app": {}}})
+    tunnel = Mock(port=23456)
+    monkeypatch.setattr(docker_tunnel, "DockerTunnel", Mock(return_value=tunnel))
+    fake_bin = project / "bin"
+    fake_bin.mkdir()
+    docker = fake_bin / "docker"
+    # A real child writes more than the dashboard byte/line limits. Podgrove
+    # passes stdout through directly, and does not collect the export in memory.
+    docker.write_text(f"#!{sys.executable}\nimport sys\nassert '--tail' in sys.argv\n"
+                      "assert sys.argv[sys.argv.index('--tail')+1]=='all'\n"
+                      f"assert ('--follow' in sys.argv)=={follow!r}\n"
+                      "sys.stdout.write('retained-history-line\\n' * 20000)\nsys.exit(17)\n")
+    docker.chmod(0o700)
+    monkeypatch.setenv("PATH", str(fake_bin) + os.pathsep + os.environ.get("PATH", ""))
+    args = cli.parser().parse_args(["logs", "app", "--tail", "all", *(["--follow"] if follow else [])])
+    assert cli.execute(args) == 17
+    assert capfd.readouterr().out == "retained-history-line\n" * 20000
+    assert state.read(path) == data
+    kube.create_environment.assert_not_called()
+    if connected:
+        tunnel.start.assert_not_called()
+    else:
+        tunnel.start.assert_called_once()
+        tunnel.close.assert_called_once()
