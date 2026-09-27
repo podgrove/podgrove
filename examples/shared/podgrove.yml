@@ -1,4 +1,5 @@
-# Copy to the application worktree and replace these three target values.
+# Add this file to the application repository and replace these three target values.
+# Commit it once; linked worktrees use identical bytes and derive their own identity.
 # Generate/apply bootstrap once for the shared namespace before the first up.
 version: 1
 cluster:

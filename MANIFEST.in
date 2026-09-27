@@ -41,6 +41,10 @@ include docs/web.md
 include docs/why-not.md
 include examples/dashboard/podgrove.yml
 include examples/network/podgrove.yml
+include examples/portable/README.md
+include examples/portable/backend/compose.yml
+include examples/portable/backend/public/index.html
+include examples/portable/podgrove.yml
 include examples/resources/compose.yml
 include examples/resources/podgrove.yml
 include examples/shared/podgrove.yml
@@ -143,6 +147,7 @@ include tests/test_namespace_workflow.py
 include tests/test_network_config.py
 include tests/test_network_isolation.py
 include tests/test_network_reconciliation.py
+include tests/test_portable_worktrees.py
 include tests/test_public_export.py
 include tests/test_public_manifest.py
 include tests/test_reaper.py

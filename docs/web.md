@@ -28,7 +28,7 @@ podgrove web --project-directory /path/to/worktree --config settings/dashboard.y
 podgrove web --context your-explicit-kube-context --namespace team-development --port 8765 --no-open
 ```
 
-`--project-directory` defaults to the current directory, and `--config` defaults to its `podgrove.yml`. Dashboard target loading needs no Compose file and does not open referenced Compose/env/secret files or launch Docker.
+`--project-directory` defaults to the current directory. Without `--config`, Podgrove finds the nearest `podgrove.yml` upward within that Git worktree; an explicit config path remains relative to the selected directory. Worktree identity and a derived namespace always use the Git checkout top level, even when the selected directory is nested. Outside Git, the selected directory defines identity. Saved environments retain their separate configuration directory for the read-only configuration view. Dashboard target loading needs no Compose file and does not open referenced Compose/env/secret files or launch Docker.
 
 `--port 0`, the default, selects an available port. The server binds only to `127.0.0.1`. There is no public listener, Kubernetes Service, separate frontend server, Node dependency, or frontend build step. HTML, CSS, and JavaScript ship with the Python package. The interface supports light and dark themes. It follows your system setting until you choose a theme in the toolbar, then remembers that choice in this browser.
 

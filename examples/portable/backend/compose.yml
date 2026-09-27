@@ -1,0 +1,7 @@
+services:
+  web:
+    image: busybox:1.37
+    command: [httpd, -f, -p, "8080", -h, /srv]
+    ports: ["8080"]
+    volumes:
+      - ./public:/srv:ro

@@ -1,0 +1,21 @@
+# Put this file at the application repository root and commit it once.
+# Replace the three target values with settings approved for your team.
+# Every linked worktree uses the same bytes: never put a worktree name,
+# absolute checkout path, branch name, environment hash or local port here.
+version: 1
+cluster:
+  context: your-development-context
+  namespace: your-development-namespace
+  namespace_mode: shared
+  storage_class: your-delete-storage-class
+compose:
+  project_directory: backend
+  files: [backend/compose.yml]
+node_mode: shared
+size: small
+storage:
+  size: 5Gi
+ttl: 8h
+forward:
+  - service: web
+    port: 8080

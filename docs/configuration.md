@@ -76,7 +76,7 @@ cluster:
 
 Target precedence is per field: explicit CLI flag, then YAML, then `PODGROVE_CONTEXT` for context only. Namespace has no fallback; neither `default` nor a generated worktree namespace is assumed. A missing namespace or context is an error before opening the dashboard or contacting a cluster. The current kubectl context is never read implicitly. An explicit `--namespace` is an exact target and selects shared mode unless accompanied by `--namespace-mode worktree`; this permits recovery using a resolved worktree namespace without deriving it twice.
 
-`web --project-directory /path/to/worktree --config settings/dashboard.yml` resolves the config path beneath the selected worktree. The target reader validates YAML settings but does not load referenced Compose files, interpolation env files, services or Docker configuration. A dashboard-only target does not need a Compose project. The same target fields are used by new `up`, `doctor`, `reap` and `status --all`; `reap` still requires a namespace supplied by config or a flag and never discovers arbitrary namespaces.
+`web --project-directory /path/to/worktree --config settings/dashboard.yml` resolves the explicit config path beneath the selected directory. Without `--config`, Podgrove searches for the nearest `podgrove.yml` upward within the Git worktree. The target reader validates YAML settings but does not load referenced Compose files, interpolation env files, services or Docker configuration. A dashboard-only target does not need a Compose project. The same target fields are used by new `up`, `doctor`, `reap` and `status --all`; `reap` still requires a namespace supplied by config or a flag and never discovers arbitrary namespaces.
 
 For existing `status`, `logs`, `exec` and `down`, the validated state record controls the environment namespace and recorded namespace mode in the selected context. A changed `cluster.namespace` cannot redirect existing cleanup; a mismatching explicit `--namespace` is refused. Changing context selects a different state record. With no local state, the explicit configured/flagged namespace supplies the narrowly scoped recovery target and an owned lease can recover its lifecycle mode. For target-only commands such as `web`, `status` and `down`, supplying both `--context` and `--namespace` avoids reading the default YAML and permits recovery when that file is broken. An explicitly selected `--config` remains subject to validation. `up` always loads and validates the full project configuration.
 
@@ -108,11 +108,17 @@ Run `up` after changing exclusions. It also reconciles a missing or modified own
 
 ## Two directory settings
 
-The CLI's `--project-directory` chooses the whole worktree. It defaults to the current directory and controls environment identity, local state, and the boundary for allowed local paths.
+The CLI's `--project-directory` selects a directory to locate the project configuration. It defaults to the current directory. Inside Git, the nearest checkout's top level determines environment identity even when this flag explicitly names a subdirectory. Linked worktrees have separate identities despite sharing Git metadata; branch names and environment variables do not choose identity. Outside Git, the selected directory itself determines identity. Missing paths retain their selected-path identity for recorded cleanup.
 
-`compose.project_directory` chooses the Compose path-resolution base **within** that worktree. It does not change the environment identity or enlarge the sync boundary. Config filenames, `compose.files`, and `compose.env_file` are resolved from the worktree root; paths inside Compose are resolved by Compose against its selected project directory.
+Without `--config`, the nearest `podgrove.yml` is found upward from the selected directory, stopping at the Git worktree boundary. Its directory is the configuration and allowed-source boundary. If no config exists, the selected directory remains that boundary. An explicit `--config` is resolved beneath the selected directory and retains that directory as its boundary; it cannot escape through `..` or a symlink. Podgrove records this configuration directory separately from the worktree identity so status, logs, the supervisor and the dashboard can reload the same configuration.
 
-For example, from a backend root whose independent test stack is under `tests/`:
+`compose.project_directory` chooses the Compose path-resolution base **within** the configuration boundary. It does not change identity or enlarge the sync boundary. `compose.files` and `compose.env_file` are resolved from the configuration directory; paths inside Compose are resolved by Compose against its selected project directory.
+
+Commit one `podgrove.yml` at the repository root with relative Compose paths. Every linked worktree can use identical bytes: engine/PVC names, namespace suffixes and loopback ports are derived at runtime. Do not insert a worktree identity, branch name or absolute checkout path into the committed YAML. The [complete portable example](../examples/portable/README.md) and its [real linked-worktree regression](../tests/test_portable_worktrees.py) cover both namespace modes. Cluster target fields are team configuration; replace the example values with approved settings before deployment.
+
+Older releases could create an environment for a Git subdirectory. If one of those records exists, the new resolver refuses to adopt, merge or duplicate it and identifies its recorded version and directory. Resolve that old environment with its original version before using the new identity. Existing environments already rooted at the checkout top level retain their identity.
+
+For example, with `podgrove.yml` at a backend repository root and the test Compose file under `tests/`:
 
 ```yaml
 compose:
