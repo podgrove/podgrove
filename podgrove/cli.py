@@ -105,6 +105,8 @@ def print_state(data: dict, as_json=False) -> None:
         print(f"  {row.get('Service', '?')}: {row.get('State', '?')} {row.get('Health', '')}".rstrip())
     if data.get("error"):
         print(f"  {data['error']}")
+    if data.get("health_status", {}).get("state") == "unavailable":
+        print(f"  Service observations are stale: {data['health_status'].get('error', 'temporarily unavailable')}")
     if data.get("session_log"):
         print(f"  Session log: {data['session_log']}")
 
@@ -351,7 +353,7 @@ def execute(args) -> int:
             data = observed(data, connected=connected, ping=ping)
             public = {key: data[key] for key in ("identity", "root", "context", "namespace", "status", "created_at",
                                                  "last_activity", "ttl_seconds", "node_mode", "namespace_mode", "ports", "error",
-                                                 "forward_status", "sync_status") if key in data}
+                                                 "forward_status", "sync_status", "health_status") if key in data}
             rows.append(public)
         if args.json:
             print(json.dumps({"environments": rows}, indent=2))
@@ -427,7 +429,7 @@ def execute(args) -> int:
     if args._explicit_namespace and args.namespace != data["namespace"]:
         raise PodgroveError("--namespace differs from the recorded environment")
     kube = Kube(args.context, data["namespace"], namespace_mode=state.namespace_mode(data))
-    from .runtime import control, is_running, readiness, service_status
+    from .runtime import TransientDockerReadError, control, is_running, readiness, service_status
     connected = is_running(data)
     # The control server can answer while provisioning/building, before the
     # Docker endpoint is published. A startup failure can briefly do so too.
@@ -473,7 +475,16 @@ def execute(args) -> int:
     compose = Compose(config)
     if args.command == "status":
         env = docker_environment(data["docker_host"])
-        data["services"] = service_status(compose, env)
+        try:
+            data["services"] = service_status(compose, env)
+        except TransientDockerReadError as exc:
+            data["status"] = "degraded"
+            data["health_status"] = {**data.get("health_status", {}), "state": "unavailable",
+                                     "error": str(exc), "checked_at": time.time()}
+            data["problems"] = [str(exc)]
+            print_state(observed(data, connected=True), args.json)
+            return 1
+        data["health_status"] = {"state": "ready", "checked_at": time.time(), "last_success_at": time.time()}
         ready, problems = readiness(compose.model(), data["services"])
         data["status"] = "ready" if ready else "unhealthy"
         data = observed(data, connected=True)

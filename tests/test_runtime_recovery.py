@@ -139,6 +139,40 @@ def test_idle_forward_exit_publishes_reconnecting_then_recovers_same_address(ses
     echo(session.port)
 
 
+def test_health_read_outage_keeps_control_sync_and_forward_alive_then_recovers(session, monkeypatch):
+    available = threading.Event()
+    original = session.tunnel.process
+
+    def health(*_):
+        if not available.is_set():
+            raise runtime.TransientDockerReadError("Docker status temporarily unavailable after EOF")
+        return [{"Service": "api", "State": "running", "Health": "healthy"}]
+
+    monkeypatch.setattr(runtime, "HEALTH_INTERVAL", 0)
+    monkeypatch.setattr(runtime, "service_status", health)
+    runtime.control(session.data, "touch")
+    wait_until(lambda: state.read(session.path).get("health_status", {}).get("state") == "unavailable")
+    stale = state.read(session.path)
+    assert stale["status"] == "degraded"
+    assert stale["services"][0]["State"] == "running"
+    assert stale["health_status"]["last_success_at"] <= stale["health_status"]["checked_at"]
+    assert stale["ports"][0]["status"] == "ready"
+    assert runtime.control(session.data, "ping")["health_status"]["state"] == "unavailable"
+    session.source.write_text("edit during health outage")
+    wait_until(lambda: bool(session.sync.transfers) and
+               session.sync.transfers[-1].get("podgrove-transfer/payload/source") == b"edit during health outage")
+    echo(session.port)
+    assert session.thread.is_alive() and session.tunnel.process is original
+    session.sync.close.assert_not_called()
+    session.api.close.assert_not_called()
+    available.set()
+    runtime.control(session.data, "touch")
+    wait_until(lambda: state.read(session.path)["health_status"]["state"] == "ready")
+    assert state.read(session.path)["status"] == "ready"
+    assert "error" not in state.read(session.path)["health_status"]
+    echo(session.port)
+
+
 @pytest.mark.parametrize("session", [{"modes": ("normal", "fail")}], indirect=True)
 def test_exhausted_forward_recovery_is_truthful_but_preserves_session_and_sync(session):
     first = session.tunnel.process

@@ -48,6 +48,28 @@ def test_healthy_containers_cannot_mask_dead_forward(session, monkeypatch, capsy
     assert result["identity"] == data["identity"] and result["root"] == data["root"]
 
 
+def test_status_eof_reports_stale_health_as_json_and_next_command_still_works(session, monkeypatch, capsys):
+    _, path, before, _ = session
+    monkeypatch.setattr(runtime, "is_running", lambda _: True)
+    monkeypatch.setattr(runtime, "control", lambda *_: {"ok": True, "status": "ready",
+                                                      "forward_status": {"state": "ready", "checked_at": time.time()}})
+    monkeypatch.setattr(Compose, "model", lambda _: {"services": {"api": {}}})
+    status = Mock(side_effect=[runtime.TransientDockerReadError("temporary EOF"),
+                              [{"Service": "api", "State": "running", "Health": "healthy"}]])
+    monkeypatch.setattr(runtime, "service_status", status)
+    stop = Mock(side_effect=AssertionError("A status read must not stop the session"))
+    monkeypatch.setattr(runtime, "stop_session", stop)
+    args = cli.parser().parse_args(["status", "--json"])
+    assert cli.execute(args) == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "degraded" and result["health_status"]["state"] == "unavailable"
+    assert result["ports"][0]["status"] == "ready"
+    assert state.read(path) == before
+    assert cli.execute(cli.parser().parse_args(["status", "--json"])) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "ready"
+    stop.assert_not_called()
+
+
 @pytest.mark.parametrize("command", [["status", "--json"], ["status", "--all", "--json"]])
 def test_disconnected_status_marks_planned_endpoints(session, monkeypatch, capsys, command):
     monkeypatch.setattr(runtime, "is_running", lambda _: False)

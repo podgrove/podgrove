@@ -324,7 +324,8 @@ def serve(path: Path) -> int:
         if data.get("status") not in ("ready", "unhealthy", "degraded"):
             return
         degraded = (data.get("forward_status", {}).get("state") in ("reconnecting", "disconnected")
-                    or data.get("sync_status", {}).get("state") == "retrying")
+                    or data.get("sync_status", {}).get("state") == "retrying"
+                    or data.get("health_status", {}).get("state") == "unavailable")
         data["status"] = "degraded" if degraded else "ready" if services_ready else "unhealthy"
 
     def forward_changed(current):
@@ -377,6 +378,8 @@ def serve(path: Path) -> int:
                                 response["forward_status"] = data["forward_status"]
                             if sync_worker is not None:
                                 response["sync_status"] = sync_worker.status()
+                            if "health_status" in data:
+                                response["health_status"] = dict(data["health_status"])
                     client.sendall(json.dumps(response).encode())
                 except (OSError, ValueError):
                     pass
@@ -426,6 +429,8 @@ def serve(path: Path) -> int:
                          "ports": ports, "startup_seconds": round(elapsed, 3), "last_activity": time.time(),
                          "services": rows})
             data["sync_status"] = {"state": "ready", "error": None, "checked_at": time.time()}
+            data["health_status"] = {"state": "ready", "checked_at": time.time(),
+                                     "last_success_at": time.time()}
             session_health()
             persist()
         sync_worker = SyncWorker(sync, watch_activity, on_status=sync_changed)
@@ -469,16 +474,28 @@ def serve(path: Path) -> int:
                 if stopping:
                     break
                 if time.monotonic() - last_health >= HEALTH_INTERVAL:
-                    rows = service_status(compose, env)
+                    try:
+                        rows = service_status(compose, env)
+                    except TransientDockerReadError as exc:
+                        # A failed observation does not invalidate the engine or
+                        # an acknowledged sync. Keep existing services/forwards
+                        # usable and identify the retained rows as stale.
+                        data["health_status"] = {
+                            **data.get("health_status", {}), "state": "unavailable",
+                            "checked_at": time.time(), "error": str(exc)}
+                        data["problems"] = [str(exc)]
+                    else:
+                        data["services"] = rows
+                        ready, problems = readiness(model, rows)
+                        services_ready = ready
+                        data["health_status"] = {"state": "ready", "checked_at": time.time(),
+                                                 "last_success_at": time.time()}
+                        data["problems"] = problems
                     sync_worker.snapshot()  # A slow health result must not mask sync failure.
                     if stopping:
                         break
-                    data["services"] = rows
-                    ready, problems = readiness(model, rows)
-                    services_ready = ready
                     with activity_lock:
                         session_health()
-                    data["problems"] = problems
                     last_health = time.monotonic()
                 data["last_activity"] = max(data["last_activity"], last_touch, sync_worker.snapshot())
                 persist()
