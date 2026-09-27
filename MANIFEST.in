@@ -81,6 +81,7 @@ include release-please-config.json
 include schema/podgrove-v1.schema.json
 include scripts/e2e.py
 include scripts/homebrew_formula.py
+include scripts/install_release.py
 include scripts/prepare_public.py
 include scripts/publish_release.py
 include scripts/resolve_release.py
@@ -126,6 +127,7 @@ include tests/test_e2e_harness.py
 include tests/test_exec_half_close.py
 include tests/test_forward.py
 include tests/test_forward_recovery.py
+include tests/test_install_release.py
 include tests/test_kube.py
 include tests/test_lane_workspace.py
 include tests/test_namespace_modes.py

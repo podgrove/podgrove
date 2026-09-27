@@ -12,7 +12,7 @@ For an agent adopting a project, follow the installation, cluster prerequisites,
 
 ## Agent setup checklist
 
-1. [Install Podgrove](#install) from this checkout and save its executable as `PODGROVE_BIN`.
+1. [Install a pinned Podgrove release](#install) and save its executable as `PODGROVE_BIN`.
 2. In the **application worktree**, create `podgrove.yml` with its approved cluster context, namespace, namespace mode, and StorageClass. Add the project's actual Compose invocation using [the mapping below](#1-preserve-the-projects-compose-invocation); retain the existing Compose service definitions.
 3. [Generate bootstrap manifests](#configure-the-target-and-prepare-access) from that application worktree: `"$PODGROVE_BIN" bootstrap --output /existing/parent/new-folder`. The folder is generated from YAML; there is no fixed `deploy/bootstrap` folder to apply.
 4. Have the administrator ensure the printed target namespace already exists, review the generated folder, arrange developer authentication, and run its printed `kubectl --context ... --namespace ... apply -f ...` command on the same cluster. Shared mode needs this once per namespace; worktree mode needs it for **each worktree**. [Platform guide](deploy/README.md).
@@ -33,7 +33,46 @@ Copy a starting configuration, replace its example values, and adjust Compose fi
 
 Requirements: macOS or Linux, Python 3.11 or newer, `uv` or pip, the Docker CLI with a recent Compose plugin, and `kubectl` with working authentication for the approved cluster. Compose must support `config --format json --no-env-resolution`, `watch --no-up` when watch rules are used, and the features present in your Compose files. Normal remote use needs no local Docker daemon. This repository's opt-in Docker integration tests do need one; Docker Desktop is not required.
 
-### Install from this source checkout
+### Install a verified release
+
+For shared automation, install a published release into its own versioned environment.
+The installer requires Python 3.11+, `uv`, and a complete release bundle; these download
+commands also use the GitHub CLI. Choose a version from [Releases](https://github.com/podgrove/podgrove/releases).
+From a checkout of that tag, download its five assets into a new directory:
+
+```sh
+git clone --branch v0.2.0 https://github.com/podgrove/podgrove.git
+cd podgrove
+PODGROVE_RELEASE_DIR="$(mktemp -d)"
+gh release download v0.2.0 --repo podgrove/podgrove --dir "$PODGROVE_RELEASE_DIR"
+PODGROVE_RELEASE_SHA="$(git rev-parse HEAD)"
+python3 scripts/install_release.py --dist "$PODGROVE_RELEASE_DIR" \
+  --tag v0.2.0 --source-sha "$PODGROVE_RELEASE_SHA"
+export PODGROVE_BIN="$HOME/.local/share/podgrove/current/bin/podgrove"
+"$PODGROVE_BIN" --version
+```
+
+The installer verifies asset hashes and the expected tag/commit, uses the release's
+locked dependency hashes, checks the installed CLI and dashboard assets, and renders
+bootstrap manifests offline. It creates `~/.local/share/podgrove/<version>-<commit>/venv`
+and an `installation.json` receipt, then atomically switches `current` after every
+check passes. The installation never reads kubeconfig or contacts a cluster.
+Checksums establish integrity; obtain the bundle and checkout from the trusted repository.
+
+An existing version directory is never overwritten, even if an earlier installation
+was incomplete. Failed installation checks preserve the previous `current` selection.
+Use `--install-root /absolute/path` for a separate installation, `--python /path/to/python`
+to choose its interpreter, or `--offline` when all locked dependencies are already
+cached by `uv`. Keep installed version directories intact while their sessions run.
+
+To upgrade, repeat with the new tag and a fresh download directory. Updating `current`
+affects future commands; existing supervisors retain their original interpreter.
+Coordinate any `up --refresh` with the worktree's owner because it restarts local
+connections and reruns Compose. Do not refresh another seat's stack during an upgrade.
+For an automation run that must remain on one version while `current` changes, set
+`PODGROVE_BIN` to the receipt's exact `executable` path.
+
+### Install from a source checkout
 
 Clone the source if needed, install an isolated copy of the package, then run it from the application worktree:
 
@@ -55,7 +94,7 @@ The planned install command is:
 brew install podgrove/tap/podgrove
 ```
 
-**The first public release and tap are still being prepared. This command is not available yet.** The [release runbook](docs/releasing.md) explains how a verified release becomes a reviewed formula update. The source installation above works before publication.
+**The Homebrew tap is still being prepared. This command is not available yet.** The [release runbook](docs/releasing.md) explains how a verified release becomes a reviewed formula update. Use the verified release installer or source installation above.
 
 `PODGROVE_BIN` should point to the absolute installed executable. Keep its environment available while worktrees run: background sessions use the interpreter that launched `up`. Coordinate upgrades and `up --refresh` with active users. Development-only editable installation is described under [Run the tests](#run-the-tests).
 

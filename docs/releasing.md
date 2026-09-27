@@ -61,7 +61,7 @@ Use Conventional Commits (`fix:`, `feat:`, and `feat!:` for breaking changes).
 Release-please prepares a PR updating `CHANGELOG.md`, the Python package version,
 `podgrove/__init__.py`, `.release-please-manifest.json`, and just the local
 `podgrove` package version in `uv.lock`. Dependency versions remain locked.
-The recorded `0.1.0` baseline is not evidence that a public GitHub release exists.
+The recorded manifest baseline is not evidence that a public GitHub release exists.
 Review the proposed first public version and release notes explicitly.
 
 Merging a release PR starts one workflow:
