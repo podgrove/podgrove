@@ -70,9 +70,16 @@ def _parse_log_tail(value: str) -> int | str:
 
 def _stop(process: subprocess.Popen) -> None:
     try:
+        # Still signal when the leader exited: an authentication helper may
+        # remain in its private group and keep our capture pipes open.
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+    except PermissionError:
+        # macOS can report EPERM while an exited leader awaits reaping. Only
+        # dismiss that race after confirming exit; a live denial is an error.
+        if process.poll() is None:
+            raise
     process.wait(timeout=2)
 
 
@@ -118,10 +125,17 @@ def bounded_read_command(args: list[str], *, timeout: float = 6, limit: int = MA
     except subprocess.TimeoutExpired as exc:
         raise WebError("Cluster read timed out") from exc
     finally:
-        if not completed:
-            _stop(process)
-        process.stdout.close()
-        process.stderr.close()
+        primary_error = sys.exception()
+        try:
+            if not completed:
+                _stop(process)
+        except (OSError, subprocess.TimeoutExpired) as cleanup_error:
+            if primary_error is None:
+                raise WebError("Dashboard command cleanup could not be confirmed") from cleanup_error
+            primary_error.add_note("Dashboard command cleanup could not be confirmed")
+        finally:
+            process.stdout.close()
+            process.stderr.close()
 
 
 def _text(value, limit: int = 256) -> str:

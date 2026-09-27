@@ -6,8 +6,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import selectors
+import signal
 import stat
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -389,6 +392,90 @@ def test_bounded_subprocess_timeout_size_limit_and_stderr_do_not_expose_private_
     with pytest.raises(web.WebError) as exc:
         web.bounded_read_command([sys.executable, "-c", "import sys; sys.stderr.write('private-value'); sys.exit(1)"])
     assert "private-value" not in str(exc.value)
+
+
+def test_exited_child_group_permission_race_preserves_size_limit_and_closes_pipes(monkeypatch):
+    original_popen = subprocess.Popen
+    processes = []
+    def start(*args, **kwargs):
+        process = original_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+    def exited_group(pid, sig):
+        process, = processes
+        assert pid == process.pid and sig == signal.SIGKILL
+        process.wait(timeout=2)  # Deterministically race group cleanup against exit.
+        raise PermissionError(1, "Operation not permitted")
+    monkeypatch.setattr(web.subprocess, "Popen", start)
+    monkeypatch.setattr(web.os, "killpg", exited_group)
+    with pytest.raises(web.WebError, match="size limit") as failure:
+        web.bounded_read_command([sys.executable, "-c", "print('x'*1000)"], limit=10)
+    process, = processes
+    assert process.poll() == 0
+    assert process.stdout.closed and process.stderr.closed
+    assert not getattr(failure.value, "__notes__", [])
+
+
+@pytest.mark.parametrize("leader_exits", [False, True])
+def test_cleanup_kills_private_group_helpers_even_after_leader_exit(leader_exits):
+    child = "import sys,time;print('helper-ready',flush=True);time.sleep(60)"
+    program = ("import subprocess,sys,time;subprocess.Popen([sys.executable,'-c',sys.argv[1]]);"
+               + ("raise SystemExit(0)" if leader_exits else "time.sleep(60)"))
+    process = subprocess.Popen([sys.executable, "-c", program, child], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    try:
+        with selectors.DefaultSelector() as ready:
+            ready.register(process.stdout, selectors.EVENT_READ)
+            assert ready.select(2), "Fixture helper did not start"
+            assert os.read(process.stdout.fileno(), 128) == b"helper-ready\n"
+            if leader_exits:
+                assert process.wait(timeout=2) == 0
+            else:
+                assert process.poll() is None
+            web._stop(process)
+            assert process.poll() == (0 if leader_exits else -signal.SIGKILL)
+            assert ready.select(2), "Orphan helper retained the capture pipe after cancellation"
+            assert os.read(process.stdout.fileno(), 128) == b""
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        process.wait(timeout=2)
+        process.stdout.close()
+        process.stderr.close()
+
+
+def test_live_group_permission_denial_is_not_mistaken_for_success(monkeypatch):
+    process = Mock(pid=12345)
+    process.poll.return_value = None
+    monkeypatch.setattr(web.os, "killpg", Mock(side_effect=PermissionError(1, "Operation not permitted")))
+    with pytest.raises(PermissionError):
+        web._stop(process)
+    process.wait.assert_not_called()
+
+
+def test_live_cleanup_denial_preserves_primary_web_error_and_reports_incomplete_cleanup(monkeypatch):
+    original_popen, original_killpg = subprocess.Popen, os.killpg
+    processes = []
+    def start(*args, **kwargs):
+        process = original_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+    monkeypatch.setattr(web.subprocess, "Popen", start)
+    monkeypatch.setattr(web.os, "killpg", Mock(side_effect=PermissionError(1, "private cleanup diagnostic")))
+    try:
+        with pytest.raises(web.WebError, match="size limit") as failure:
+            web.bounded_read_command([sys.executable, "-c", "import time;print('x'*1000,flush=True);time.sleep(60)"], limit=10)
+        process, = processes
+        assert process.poll() is None
+        assert process.stdout.closed and process.stderr.closed
+        assert failure.value.__notes__ == ["Dashboard command cleanup could not be confirmed"]
+        assert "private" not in str(failure.value)
+    finally:
+        for process in processes:
+            original_killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=2)
 
 
 def test_cli_web_dispatches_before_worktree_state_or_lifecycle(tmp_path, monkeypatch):
