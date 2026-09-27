@@ -435,7 +435,12 @@ def execute(args) -> int:
                 state.write(path, data)
             kube.destroy(data["identity"])
             state.cleanup(path, data)
-            print(f"Removed environment {data['identity']}; namespace and bootstrap retained")
+            if args.json:
+                print(json.dumps({"identity": data["identity"], "context": data["context"],
+                                  "namespace": data["namespace"], "status": "removed",
+                                  "namespace_retained": True, "bootstrap_retained": True}))
+            else:
+                print(f"Removed environment {data['identity']}; namespace and bootstrap retained")
             return 0
     data = state.read(path)
     state.validate_binding(data, root, args.context)
@@ -575,10 +580,15 @@ def retained_logs(data: dict, kube: Kube, args) -> int:
 
 
 def main() -> int:
+    args = None
     try:
-        return execute(parser().parse_args())
+        args = parser().parse_args()
+        return execute(args)
     except PodgroveError as exc:
-        print(f"podgrove: {exc}", file=sys.stderr)
+        if args is not None and args.command == "down" and args.json:
+            print(json.dumps({"command": "down", "status": "error", "error": str(exc)}))
+        else:
+            print(f"podgrove: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print("podgrove: interrupted; an existing environment can be inspected with status or removed with down", file=sys.stderr)
