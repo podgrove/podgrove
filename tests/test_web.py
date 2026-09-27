@@ -205,7 +205,7 @@ def test_docker_reads_ping_without_touch_and_never_export_connection_credentials
     monkeypatch.setattr(Path, "lstat", lambda _self: SimpleNamespace(st_uid=os.getuid(), st_mode=stat.S_IFSOCK | 0o600))
     control = Mock(return_value={"ok": True})
     monkeypatch.setattr(web, "control", control)
-    response = Mock(status=200)
+    response = Mock(status=200, length=None)
     response.read1.side_effect = [b"[]", b""]
     connection = Mock()
     connection.getresponse.return_value = response
@@ -219,6 +219,78 @@ def test_docker_reads_ping_without_touch_and_never_export_connection_credentials
     with pytest.raises(web.WebError):
         web.Dashboard._docker(bad, "/containers/json")
     assert http.call_count == 1
+
+
+@pytest.mark.parametrize("framing,body,declared,limit,allow_truncated,error", [
+    ("length", b"complete", 8, 16, False, None),
+    ("length", b"", 0, 16, False, None),
+    ("length", b"partial", 100, 128, True, "declared length"),
+    ("length", b"x" * 16, 16, 16, False, None),
+    ("length", b"x" * 17, 17, 16, True, None),
+    ("length", b"x" * 17, 17, 16, False, "size limit"),
+    ("length", b"x" * 20, 100, 16, True, None),
+    ("chunked", b"\x00\xffcomplete", None, 32, False, None),
+    ("chunked", b"", None, 32, False, None),
+    ("chunked", b"complete", 999, 32, False, None),
+    ("incomplete-chunked", b"partial", None, 32, True, "unavailable"),
+    ("close-delimited", b"complete", None, 32, False, None),
+])
+def test_docker_snapshot_http_completion_and_explicit_size_limit(
+        monkeypatch, framing, body, declared, limit, allow_truncated, error):
+    """Real HTTPResponse EOF/length semantics, including a socket closed by read1."""
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *_args):
+            pass
+
+        def do_GET(self):
+            requests.append(self.path)
+            self.send_response(200)
+            if "chunked" in framing:
+                self.send_header("Transfer-Encoding", "chunked")
+            if declared is not None:
+                self.send_header("Content-Length", str(declared))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            wire = body
+            if "chunked" in framing:
+                wire = (f"{len(body):x}\r\n".encode() + body + b"\r\n") if body else b""
+                if framing != "incomplete-chunked":
+                    wire += b"0\r\n\r\n"
+            try:
+                self.wfile.write(wire)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # A caller enforcing its size limit may close early.
+            self.close_connection = True
+
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=upstream.serve_forever, kwargs={"poll_interval": 0.01})
+    thread.start()
+
+    def connect(_data, *, timeout):
+        connection = http.client.HTTPConnection("127.0.0.1", upstream.server_port, timeout=timeout)
+        connection.connect()
+        return connection
+
+    monkeypatch.setattr(web.Dashboard, "_docker_connection", staticmethod(connect))
+    path = "/containers/" + "a" * 64 + "/logs?stdout=1&stderr=1&tail=100"
+    try:
+        if error:
+            with pytest.raises(web.WebError, match=error):
+                web.Dashboard._docker({}, path, limit=limit, allow_truncated=allow_truncated, timeout=1)
+        else:
+            result = web.Dashboard._docker({}, path, limit=limit, allow_truncated=allow_truncated, timeout=1)
+            assert result == (body[:limit], len(body) > limit)
+        assert requests == [path]  # This correctness repair does not replay reads.
+    finally:
+        upstream.shutdown()
+        upstream.server_close()
+        thread.join(timeout=2)
+    assert not thread.is_alive()
 
 
 @pytest.mark.parametrize("trickle", ["headers", "body"])

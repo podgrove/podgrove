@@ -508,11 +508,17 @@ class Dashboard:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise WebError("Docker read timed out")
+                # read1 closes a fully consumed Content-Length response's
+                # socket. Do not touch it again merely to discover EOF.
+                if response.length == 0:
+                    break
                 transport.settimeout(remaining)
                 chunk = response.read1(min(16384, limit + 1 - len(body)))
                 if not chunk:
                     if time.monotonic() >= deadline:
                         raise WebError("Docker read timed out")
+                    if response.length is not None and response.length > 0:
+                        raise WebError("Docker response ended before its declared length")
                     break
                 body.extend(chunk)
             truncated = len(body) > limit
