@@ -281,6 +281,93 @@ def doctor_args(root, *extra):
                                     "--project-directory", str(root), *extra])
 
 
+@pytest.mark.parametrize("node_mode", ["shared", "tainted"])
+def test_doctor_json_success_is_one_document(project, monkeypatch, capsys, node_mode):
+    monkeypatch.setattr(cli, "Kube", Mock())
+    monkeypatch.setattr(cli.sys, "argv", ["podgrove", "doctor", "--json", "--context", "test-context",
+                                        "--namespace", "podgrove-testing", "--node-mode", node_mode,
+                                        "--project-directory", str(project)])
+    assert cli.main() == 0
+    output = capsys.readouterr()
+    result = json.loads(output.out)
+    assert output.err == ""
+    assert result == {
+        "command": "doctor", "status": "ok", "context": "test-context",
+        "namespace": "podgrove-testing", "namespace_mode": "shared", "node_mode": node_mode,
+        "checks": {"namespace_permissions": "passed", "bootstrap_marker": "passed", "engine_admission": "passed"},
+        "notes": [
+            f"{node_mode.capitalize()} scheduling is expressed by the Pod spec; node inventory is not read.",
+            "StorageClass reclaim policy and backing-volume deletion require administrator verification.",
+        ],
+    }
+
+
+@pytest.mark.parametrize("stage", ["preflight", "ensure_namespace", "check_admission"])
+def test_doctor_json_check_error_is_one_document(project, monkeypatch, capsys, stage):
+    kube = Mock()
+    getattr(kube, stage).side_effect = PodgroveError('diagnostic "quoted"\nsecond line')
+    monkeypatch.setattr(cli, "Kube", Mock(return_value=kube))
+    monkeypatch.setattr(cli.sys, "argv", ["podgrove", "doctor", "--json", "--context", "test-context",
+                                        "--namespace", "podgrove-testing", "--project-directory", str(project)])
+    assert cli.main() == 1
+    output = capsys.readouterr()
+    assert output.err == ""
+    assert json.loads(output.out) == {"command": "doctor", "status": "error",
+                                      "error": 'diagnostic "quoted"\nsecond line'}
+    kube.create_environment.assert_not_called()
+
+
+def test_doctor_json_target_error_before_checks_is_json(project, monkeypatch, capsys):
+    (project / "podgrove.yml").write_text("cluster:\n  context: test-context\n")
+    monkeypatch.delenv("PODGROVE_NAMESPACE", raising=False)
+    kube = Mock()
+    monkeypatch.setattr(cli, "Kube", kube)
+    monkeypatch.setattr(cli.sys, "argv", ["podgrove", "doctor", "--json", "--project-directory", str(project)])
+    assert cli.main() == 1
+    output = capsys.readouterr()
+    assert output.err == ""
+    result = json.loads(output.out)
+    assert result["command"] == "doctor" and result["status"] == "error"
+    assert "namespace" in result["error"]
+    kube.assert_not_called()
+
+
+def test_doctor_json_interruption_is_json(project, monkeypatch, capsys):
+    kube = Mock()
+    kube.preflight.side_effect = KeyboardInterrupt
+    monkeypatch.setattr(cli, "Kube", Mock(return_value=kube))
+    monkeypatch.setattr(cli.sys, "argv", ["podgrove", "doctor", "--json", "--context", "test-context",
+                                        "--namespace", "podgrove-testing", "--project-directory", str(project)])
+    assert cli.main() == 130
+    output = capsys.readouterr()
+    assert output.err == ""
+    assert json.loads(output.out) == {"command": "doctor", "status": "error", "error": "interrupted"}
+
+
+def test_doctor_plain_output_is_preserved(project, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "Kube", Mock())
+    assert cli.execute(doctor_args(project)) == 0
+    output = capsys.readouterr()
+    assert output.err == ""
+    assert output.out.splitlines() == [
+        "Namespace permissions, bootstrap marker and engine admission checks passed",
+        "Shared scheduling is expressed by the Pod spec; node inventory is not read.",
+        "StorageClass reclaim policy and backing-volume deletion require administrator verification.",
+    ]
+
+
+def test_doctor_plain_error_is_preserved(project, monkeypatch, capsys):
+    kube = Mock()
+    kube.preflight.side_effect = PodgroveError("namespace permissions denied")
+    monkeypatch.setattr(cli, "Kube", Mock(return_value=kube))
+    monkeypatch.setattr(cli.sys, "argv", ["podgrove", "doctor", "--context", "test-context",
+                                        "--namespace", "podgrove-testing", "--project-directory", str(project)])
+    assert cli.main() == 1
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert output.err == "podgrove: namespace permissions denied\n"
+
+
 def test_doctor_defaults_shared_without_any_project_files(tmp_path, monkeypatch):
     kube = Mock()
     monkeypatch.setattr(cli, "Kube", Mock(return_value=kube))

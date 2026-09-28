@@ -434,9 +434,23 @@ def execute(args) -> int:
                                        node_mode=node_mode, tainted_nodes=tainted_nodes,
                                        namespace_mode=args.namespace_mode, resources=budget, init_resources=init_budget,
                                        storage=storage_size, storage_class=storage_class))
-        print("Namespace permissions, bootstrap marker and engine admission checks passed")
-        print(f"{node_mode.capitalize()} scheduling is expressed by the Pod spec; node inventory is not read.")
-        print("StorageClass reclaim policy and backing-volume deletion require administrator verification.")
+        summary = "Namespace permissions, bootstrap marker and engine admission checks passed"
+        notes = [
+            f"{node_mode.capitalize()} scheduling is expressed by the Pod spec; node inventory is not read.",
+            "StorageClass reclaim policy and backing-volume deletion require administrator verification.",
+        ]
+        if args.json:
+            print(json.dumps({
+                "command": "doctor", "status": "ok", "context": args.context,
+                "namespace": namespace, "namespace_mode": args.namespace_mode, "node_mode": node_mode,
+                "checks": {name: "passed" for name in
+                           ("namespace_permissions", "bootstrap_marker", "engine_admission")},
+                "notes": notes,
+            }, indent=2))
+        else:
+            print(summary)
+            for note in notes:
+                print(note)
         return 0
     if args.command == "reap":
         if not args.namespace:
@@ -626,13 +640,16 @@ def main() -> int:
         args = parser().parse_args()
         return execute(args)
     except PodgroveError as exc:
-        if args is not None and args.command == "down" and args.json:
-            print(json.dumps({"command": "down", "status": "error", "error": str(exc)}))
+        if args is not None and args.command in ("down", "doctor") and args.json:
+            print(json.dumps({"command": args.command, "status": "error", "error": str(exc)}))
         else:
             print(f"podgrove: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
-        print("podgrove: interrupted; an existing environment can be inspected with status or removed with down", file=sys.stderr)
+        if args is not None and args.command == "doctor" and args.json:
+            print(json.dumps({"command": "doctor", "status": "error", "error": "interrupted"}))
+        else:
+            print("podgrove: interrupted; an existing environment can be inspected with status or removed with down", file=sys.stderr)
         return 130
 
 
