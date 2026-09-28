@@ -3,6 +3,8 @@
 
 No setup or cleanup commands are issued. Status reads extend the fixture's TTL.
 Optional fault injection terminates one proven supervisor-owned port-forward.
+Sync-only recovery is recorded separately and must retain healthy HTTP/control,
+the same application forward and verified identities within a fixed budget.
 A run shorter than four hours is only a smoke test, never long-soak evidence.
 """
 from __future__ import annotations
@@ -31,6 +33,8 @@ import zipfile
 
 MAX_BYTES = 1024 * 1024
 HTTP_TIMEOUT = 5.0
+SYNC_RECOVERY_SECONDS = 120.0
+SYNC_STABLE_SECONDS = 30.0
 MANAGED = "app.kubernetes.io/managed-by"
 ENVIRONMENT = "podgrove.dev/environment"
 
@@ -342,8 +346,39 @@ def sample_status(args, env, stop):
     # Never persist raw status/state/errors; those can contain application output.
     safe = {"exit_code": code, "status": result.get("status"),
             "forward_state": result.get("forward_status", {}).get("state"),
-            "health_state": result.get("health_status", {}).get("state")}
-    return code == 0 and safe["status"] == "ready" and safe["forward_state"] == "ready", safe
+            "health_state": result.get("health_status", {}).get("state"),
+            "sync_state": result.get("sync_status", {}).get("state"),
+            "heartbeat_state": result.get("heartbeat_status", {}).get("state"),
+            "docker_verification": result.get("docker_status", {}).get("verification", {}).get("state")}
+    return (code == 0 and safe["status"] == "ready" and safe["forward_state"] == "ready"
+            and safe["sync_state"] in (None, "ready")), safe
+
+
+def control_probe(data, stop):
+    """Confirm the same authenticated control socket is responsive, without logging it."""
+    if stop.is_set() or not isinstance(data.get("socket"), str) or not isinstance(data.get("token"), str):
+        return False
+    try:
+        deadline = time.monotonic() + 2
+        with socket.socket(socket.AF_UNIX) as client:
+            client.settimeout(2)
+            client.connect(data["socket"])
+            client.sendall(json.dumps({"action": "ping", "token": data["token"]}).encode() + b"\n")
+            raw = bytearray()
+            while not stop.is_set() and time.monotonic() < deadline:
+                client.settimeout(max(.001, deadline - time.monotonic()))
+                part = client.recv(65537 - len(raw))
+                if not part:
+                    value = json.loads(raw)
+                    return (isinstance(value, dict) and value.get("ok") is True
+                            and value.get("status") in ("ready", "degraded")
+                            and value.get("forward_status", {}).get("state") == "ready")
+                raw.extend(part)
+                if len(raw) > 65536:
+                    return False
+    except (OSError, ValueError):
+        pass
+    return False
 
 
 def run(args, stop):
@@ -352,11 +387,15 @@ def run(args, stop):
     env.update(KUBECONFIG=str(args.kubeconfig), PODGROVE_STATE_HOME=str(args.state_home), PYTHONDONTWRITEBYTECODE="1",
                PYTHONPYCACHEPREFIX=str(args.output / ".unused-bytecode-cache"))
     started, started_utc = time.monotonic(), utc()
-    counts = {"http": 0, "status": 0, "errors": 0, "recovery_samples": 0}
+    counts = {"http": 0, "status": 0, "errors": 0, "recovery_samples": 0,
+              "sync_recovery_samples": 0, "sync_recoveries": 0}
     summary = {"started_utc": started_utc, "started_monotonic": started, "requested_seconds": args.duration,
                "context": args.context, "namespace": args.namespace, "identity": args.identity,
                "project_directory": str(args.project_directory), "passed": False,
-               "four_hour_proof": False, "fault": {"status": "not_requested"}}
+               "four_hour_proof": False, "fault": {"status": "not_requested"},
+               "sync_recovery_policy": {"budget_seconds": SYNC_RECOVERY_SECONDS,
+                                        "stable_ready_seconds": SYNC_STABLE_SECONDS,
+                                        "budget_starts": "first observed reconnecting sample"}}
     log_path = args.output / "samples.jsonl"
     fd = os.open(log_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     with os.fdopen(fd, "w") as log:
@@ -390,9 +429,14 @@ def run(args, stop):
             deadline = started + args.duration
             fault_deadline = None
             recovery_http = recovery_status = False
+            sync_started = sync_ready_since = None
+            sync_recovering = False
             while not stop.is_set() and time.monotonic() < deadline:
                 now = time.monotonic()
-                if args.inject_after is not None and summary["fault"]["status"] == "not_requested" and now - started >= args.inject_after:
+                if sync_recovering and now - sync_started > SYNC_RECOVERY_SECONDS:
+                    raise Refused("Sync-only recovery deadline exceeded")
+                if (args.inject_after is not None and summary["fault"]["status"] == "not_requested"
+                        and now - started >= args.inject_after and sync_started is None):
                     try:
                         if owned_uids(args, env, stop) != uids:
                             raise Refused("Resource UID changed before fault injection")
@@ -421,10 +465,56 @@ def run(args, stop):
                     max_status_gap = max(max_status_gap, gap)
                     counts["status"] += 1
                     recovering = fault_deadline is not None and time.monotonic() <= fault_deadline
-                    counts["recovery_samples" if recovering else "errors"] += int(not ok)
-                    record("status", ok=ok, recovering=recovering, runtime_verified=True, ownership_verified=True, **values)
+                    sync_state = values.get("sync_state")
+                    if sync_state == "disconnected":
+                        raise Refused("File sync is disconnected; automatic recovery did not complete")
+                    if sync_state == "reconnecting":
+                        if (fault_deadline is not None or values.get("exit_code") != 1
+                                or values.get("status") != "degraded" or values.get("forward_state") != "ready"
+                                or values.get("health_state") != "ready" or values.get("heartbeat_state") != "ready"
+                                or values.get("docker_verification") not in ("verified", "verifying")):
+                            raise Refused("Sync recovery overlaps another degraded component")
+                        observed_at = time.monotonic()
+                        if sync_started is None:
+                            sync_started = observed_at
+                            record("sync_recovery", state="started", budget_seconds=SYNC_RECOVERY_SECONDS)
+                        if observed_at - sync_started > SYNC_RECOVERY_SECONDS:
+                            raise Refused("Sync-only recovery deadline exceeded")
+                        # Each accepted degraded sample carries fresh ownership,
+                        # runtime, control, marked HTTP and exact forward proofs.
+                        if (not control_probe(current, stop) or not http_probe(args.endpoint, marker)
+                                or forward_process(process_table(env, stop), args, current, path, proof) != selected):
+                            raise Refused("Sync recovery lost control, HTTP or the existing application forward")
+                        if time.monotonic() - sync_started > SYNC_RECOVERY_SECONDS:
+                            raise Refused("Sync-only recovery deadline exceeded")
+                        sync_recovering, sync_ready_since = True, None
+                        counts["sync_recovery_samples"] += 1
+                        record("sync_continuity", control_verified=True, http_ok=True, forward_process_unchanged=True)
+                    elif sync_started is not None:
+                        if (not ok or sync_state != "ready" or values.get("health_state") != "ready"
+                                or values.get("heartbeat_state") != "ready"
+                                or values.get("docker_verification") not in ("verified", "verifying")):
+                            raise Refused("Sync recovery changed to an unsupported or unhealthy state")
+                        if (not control_probe(current, stop) or not http_probe(args.endpoint, marker)
+                                or forward_process(process_table(env, stop), args, current, path, proof) != selected):
+                            raise Refused("Sync recovery lost control, HTTP or the existing application forward")
+                        if sync_recovering:
+                            elapsed_sync = time.monotonic() - sync_started
+                            if elapsed_sync > SYNC_RECOVERY_SECONDS:
+                                raise Refused("Sync-only recovery deadline exceeded")
+                            counts["sync_recoveries"] += 1
+                            record("sync_recovery", state="recovered", recovery_seconds=elapsed_sync)
+                            sync_recovering = False
+                            sync_ready_since = time.monotonic()
+                        elif time.monotonic() - sync_ready_since >= SYNC_STABLE_SECONDS:
+                            # Brief ready blips do not reset an absolute budget.
+                            sync_started = sync_ready_since = None
+                    if not sync_recovering:
+                        counts["recovery_samples" if recovering else "errors"] += int(not ok)
+                    record("status", ok=ok, recovering=recovering, sync_recovering=sync_recovering,
+                           runtime_verified=True, ownership_verified=True, **values)
                     recovery_status = ok
-                    next_status = time.monotonic() + args.status_interval
+                    next_status = time.monotonic() + min(args.status_interval, 5 if sync_started is not None else args.status_interval)
                 if now >= next_http:
                     ok = http_probe(args.endpoint, marker)
                     gap = time.monotonic() - last_http
@@ -434,6 +524,8 @@ def run(args, stop):
                     max_http_gap = max(max_http_gap, gap)
                     counts["http"] += 1
                     recovering = fault_deadline is not None and time.monotonic() <= fault_deadline
+                    if sync_started is not None and not ok:
+                        raise Refused("Marked HTTP failed during sync recovery observation")
                     counts["recovery_samples" if recovering else "errors"] += int(not ok)
                     record("http", ok=ok, recovering=recovering)
                     recovery_http = ok
@@ -446,6 +538,7 @@ def run(args, stop):
                                 summary["fault"].update(status="recovered", replacement=replacement,
                                                         recovery_seconds=time.monotonic() - started - summary["fault"]["elapsed_seconds"])
                                 record("recovery", **summary["fault"])
+                                selected = replacement
                                 fault_deadline = None
                         except Refused:
                             pass
@@ -467,7 +560,11 @@ def run(args, stop):
                     counts["errors"] += 1
                     record("sampling_gap", ok=False, http_seconds=max_http_gap, http_wall_seconds=max_http_wall_gap, status_seconds=max_status_gap)
                 summary["passed"] = (counts["errors"] == 0 and counts["http"] > 0 and counts["status"] > 0
+                                     and not sync_recovering
                                      and (args.inject_after is None or summary["fault"]["status"] == "recovered"))
+                if sync_recovering:
+                    counts["errors"] += 1
+                    record("sync_recovery", state="incomplete", reason="Soak ended before sync became ready")
             else:
                 summary["cancelled"] = True
         except Exception as error:

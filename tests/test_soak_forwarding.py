@@ -102,7 +102,9 @@ def mocked_observations(monkeypatch, fixture):
     monkeypatch.setattr(soak, "binary_proof", lambda *_, **_kwargs: deepcopy(proof))
     monkeypatch.setattr(soak, "owned_uids", lambda *_: {"pod": "pod-uid", "pvc": "pvc-uid", "statefulset": "sts-uid"})
     monkeypatch.setattr(soak, "process_table", lambda *_: deepcopy(table))
-    monkeypatch.setattr(soak, "sample_status", lambda *_: (True, {"exit_code": 0, "status": "ready", "forward_state": "ready"}))
+    monkeypatch.setattr(soak, "sample_status", lambda *_: (True, {"exit_code": 0, "status": "ready", "forward_state": "ready",
+                        "sync_state": "ready", "health_state": "ready", "heartbeat_state": "ready", "docker_verification": "verified"}))
+    monkeypatch.setattr(soak, "control_probe", lambda *_: True)
     monkeypatch.setattr(soak, "http_probe", lambda *_: True)
     return args, data, path, proof, table
 
@@ -390,7 +392,8 @@ def test_status_evidence_projection_never_keeps_private_fields(fixture, monkeypa
         return 0, json.dumps(response).encode()
     monkeypatch.setattr(soak, "read_command", command)
     ok, evidence = soak.sample_status(args, {}, threading.Event())
-    assert ok and evidence == {"exit_code": 0, "status": "ready", "forward_state": "ready", "health_state": "ready"}
+    assert ok and evidence == {"exit_code": 0, "status": "ready", "forward_state": "ready", "health_state": "ready",
+                              "sync_state": None, "heartbeat_state": None, "docker_verification": None}
     assert calls[0][1] == "status" and "--context" in calls[0] and "--namespace" in calls[0]
 
 
@@ -613,3 +616,184 @@ def test_unexpected_observer_failure_is_recorded_without_secret_exception_payloa
     assert read_result(args)["counts"]["errors"] == 1
     text = (args.output / "samples.jsonl").read_text()
     assert "RuntimeError" in text and "never-persist-this" not in text
+
+
+def sync_sample(state="reconnecting", **changes):
+    ready = state == "ready"
+    values = {"exit_code": 0 if ready else 1, "status": "ready" if ready else "degraded",
+              "forward_state": "ready", "sync_state": state, "health_state": "ready",
+              "heartbeat_state": "ready", "docker_verification": "verified", **changes}
+    return ready and not changes, values
+
+
+def test_sync_only_recovery_keeps_all_other_proofs_and_is_explicit_in_evidence(fixture, monkeypatch, runner_clock):
+    args, *_ = mocked_observations(monkeypatch, fixture)
+    args.duration = .10
+    monkeypatch.setattr(soak, "sample_status", lambda *_: sync_sample("reconnecting" if runner_clock.elapsed < .04 else "ready"))
+    assert soak.run(args, runner_clock) == 0
+    result = read_result(args)
+    assert result["counts"]["errors"] == 0
+    assert result["counts"]["sync_recovery_samples"] == 2
+    assert result["counts"]["sync_recoveries"] == 1
+    assert result["four_hour_proof"] is False
+    rows = [json.loads(line) for line in (args.output / "samples.jsonl").read_text().splitlines()]
+    recovery = [r for r in rows if r["kind"] == "sync_recovery"]
+    assert [r["state"] for r in recovery] == ["started", "recovered"]
+    assert recovery[1]["recovery_seconds"] == pytest.approx(.04)
+    degraded = [r for r in rows if r["kind"] == "status" and r["sync_recovering"]]
+    assert len(degraded) == 2 and all(not r["ok"] and not r["recovering"] for r in degraded)
+    assert all(r["runtime_verified"] and r["ownership_verified"] for r in degraded)
+    proofs = [r for r in rows if r["kind"] == "sync_continuity"]
+    assert len(proofs) == 2 and all(r["control_verified"] and r["http_ok"] and r["forward_process_unchanged"] for r in proofs)
+
+
+@pytest.mark.parametrize("failure", ["health", "heartbeat", "ownership", "forward", "control", "http", "process", "global", "exit"])
+def test_sync_recovery_never_excuses_other_component_failure(fixture, monkeypatch, runner_clock, failure):
+    args, _, _, _, table = mocked_observations(monkeypatch, fixture)
+    values = {}
+    if failure in {"health", "heartbeat", "forward"}:
+        values[failure + "_state"] = "unavailable"
+    elif failure == "ownership":
+        values["docker_verification"] = "expired"
+    elif failure == "global":
+        values["status"] = "error"
+    elif failure == "exit":
+        values["exit_code"] = 2
+    elif failure == "control":
+        monkeypatch.setattr(soak, "control_probe", lambda *_: False)
+    elif failure == "http":
+        monkeypatch.setattr(soak, "http_probe", lambda *_: False)
+    def sample(*_):
+        if failure == "process":
+            table[12001]["started"] = "replacement even with the same PID"
+        return sync_sample(**values)
+    monkeypatch.setattr(soak, "sample_status", sample)
+    assert soak.run(args, runner_clock) == 1
+    result = read_result(args)
+    assert not result["passed"] and result["counts"]["errors"] >= 1
+    assert result["counts"]["sync_recoveries"] == 0
+
+
+@pytest.mark.parametrize("state", ["retrying", "disconnected", "unknown"])
+def test_non_transport_sync_states_are_not_accepted_as_recovery(fixture, monkeypatch, runner_clock, state):
+    args, *_ = mocked_observations(monkeypatch, fixture)
+    monkeypatch.setattr(soak, "sample_status", lambda *_: sync_sample(state))
+    assert soak.run(args, runner_clock) == 1
+    assert read_result(args)["counts"]["sync_recovery_samples"] == 0
+
+
+def test_sync_disconnected_is_fatal_even_inside_injected_forward_grace(fixture, monkeypatch, runner_clock):
+    args, *_ = mocked_observations(monkeypatch, fixture)
+    args.inject_after = 0
+    monkeypatch.setattr(soak.os, "kill", lambda *_: None)
+    monkeypatch.setattr(soak, "sample_status", lambda *_: sync_sample("disconnected"))
+    assert soak.run(args, runner_clock) == 1
+    rows = [json.loads(line) for line in (args.output / "samples.jsonl").read_text().splitlines()]
+    assert any(r["kind"] == "fatal" and "disconnected" in r["error"] for r in rows)
+
+
+def test_sync_recovery_deadline_is_absolute_and_ready_blips_do_not_reset_it(fixture, monkeypatch, runner_clock):
+    args, *_ = mocked_observations(monkeypatch, fixture)
+    args.duration = .12
+    monkeypatch.setattr(soak, "SYNC_RECOVERY_SECONDS", .05)
+    monkeypatch.setattr(soak, "SYNC_STABLE_SECONDS", .04)
+    def sample(*_):
+        return sync_sample("ready" if .02 <= runner_clock.elapsed < .04 else "reconnecting")
+    monkeypatch.setattr(soak, "sample_status", sample)
+    assert soak.run(args, runner_clock) == 1
+    assert read_result(args)["elapsed_seconds"] <= .08
+    rows = [json.loads(line) for line in (args.output / "samples.jsonl").read_text().splitlines()]
+    assert any(r["kind"] == "fatal" and "deadline" in r["error"] for r in rows)
+
+
+def test_soak_ending_mid_sync_recovery_never_passes(fixture, monkeypatch, runner_clock):
+    args, *_ = mocked_observations(monkeypatch, fixture)
+    monkeypatch.setattr(soak, "sample_status", lambda *_: sync_sample())
+    assert soak.run(args, runner_clock) == 1
+    result = read_result(args)
+    assert result["counts"]["sync_recovery_samples"] > 0
+    assert result["counts"]["errors"] == 1 and not result["four_hour_proof"]
+    assert '"state": "incomplete"' in (args.output / "samples.jsonl").read_text()
+
+
+def test_later_sync_loss_gets_new_budget_only_after_stable_ready_period(fixture, monkeypatch, runner_clock):
+    args, *_ = mocked_observations(monkeypatch, fixture)
+    args.duration = .18
+    monkeypatch.setattr(soak, "SYNC_RECOVERY_SECONDS", .05)
+    monkeypatch.setattr(soak, "SYNC_STABLE_SECONDS", .025)
+    def sample(*_):
+        return sync_sample("reconnecting" if runner_clock.elapsed < .02 or .10 <= runner_clock.elapsed < .12 else "ready")
+    monkeypatch.setattr(soak, "sample_status", sample)
+    assert soak.run(args, runner_clock) == 0
+    assert read_result(args)["counts"]["sync_recoveries"] == 2
+
+
+def test_sync_recovery_status_polling_is_more_frequent_than_normal(fixture, monkeypatch, runner_clock):
+    args, *_ = mocked_observations(monkeypatch, fixture)
+    args.duration, args.status_interval, args.probe_interval = 16, 60, 1
+    monkeypatch.setattr(soak, "sample_status", lambda *_: sync_sample("ready" if runner_clock.elapsed >= 6 else "reconnecting"))
+    assert soak.run(args, runner_clock) == 0
+    rows = [json.loads(line) for line in (args.output / "samples.jsonl").read_text().splitlines()]
+    assert [r["elapsed_seconds"] for r in rows if r["kind"] == "status"] == [0, 5, 10, 15]
+
+
+@pytest.mark.parametrize("response", [
+    {"ok": True, "status": "degraded", "forward_status": {"state": "ready"}},
+    {"ok": False, "status": "degraded", "forward_status": {"state": "ready"}},
+    {"ok": True, "status": "error", "forward_status": {"state": "ready"}},
+    {"ok": True, "status": "degraded", "forward_status": {"state": "disconnected"}},
+])
+def test_sync_continuity_control_probe_uses_authenticated_ping_only(response):
+    import socket
+    import tempfile
+    received = []
+    with tempfile.TemporaryDirectory(prefix="pg-sync-", dir="/tmp") as temporary, socket.socket(socket.AF_UNIX) as server:
+        path = Path(temporary) / "control.sock"
+        server.bind(str(path))
+        server.listen(1)
+        server.settimeout(2)
+        def handle():
+            connection, _ = server.accept()
+            with connection:
+                connection.settimeout(2)
+                received.append(json.loads(connection.recv(4096)))
+                connection.sendall(json.dumps(response).encode())
+        thread = threading.Thread(target=handle)
+        thread.start()
+        try:
+            expected = response["ok"] and response["status"] == "degraded" and response["forward_status"]["state"] == "ready"
+            assert soak.control_probe({"socket": str(path), "token": "fixture-token"}, threading.Event()) is expected
+        finally:
+            thread.join(timeout=3)
+        assert not thread.is_alive()
+    assert received == [{"action": "ping", "token": "fixture-token"}]
+
+
+def test_sync_and_forward_recovery_cannot_overlap_or_share_error_allowance(fixture, monkeypatch, runner_clock):
+    args, *_ = mocked_observations(monkeypatch, fixture)
+    args.inject_after = 0
+    monkeypatch.setattr(soak.os, "kill", lambda *_: None)
+    monkeypatch.setattr(soak, "sample_status", lambda *_: sync_sample())
+    assert soak.run(args, runner_clock) == 1
+    result = read_result(args)
+    assert result["counts"]["sync_recovery_samples"] == 0
+    assert result["counts"]["errors"] >= 1
+    assert 'overlaps another degraded component' in (args.output / "samples.jsonl").read_text()
+
+
+def test_sync_recovery_binds_replacement_forward_after_completed_injected_fault(fixture, monkeypatch, runner_clock):
+    args, _, _, _, table = mocked_observations(monkeypatch, fixture)
+    args.duration, args.inject_after = .12, .01
+    killed = []
+    def kill(pid, sig):
+        killed.append((pid, sig))
+        original = table.pop(pid)
+        table[13001] = {**original, "pid": 13001, "started": "replacement-forward-birth"}
+    monkeypatch.setattr(soak.os, "kill", kill)
+    monkeypatch.setattr(soak, "sample_status", lambda *_: sync_sample(
+        "reconnecting" if .04 <= runner_clock.elapsed < .06 else "ready"))
+    assert soak.run(args, runner_clock) == 0
+    result = read_result(args)
+    assert killed == [(12001, signal.SIGTERM)]
+    assert result["fault"]["replacement"]["pid"] == 13001
+    assert result["counts"]["sync_recoveries"] == 1 and result["counts"]["errors"] == 0
