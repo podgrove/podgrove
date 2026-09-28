@@ -718,38 +718,59 @@ def test_legacy_connection_read_outage_recovers_without_waiting_full_normal_inte
 
 
 def test_slow_pending_read_cannot_extend_grace_and_close_cancels_actual_process(monkeypatch):
+    from types import SimpleNamespace
+
+    from podgrove import docker_tunnel
     from podgrove.process import run
+
+    # Control the tunnel clock so ownership age cannot race the assertions.
+    # Sockets, the sleeping subprocess, and cancellation timing stay real.
+    now = [1000.0]
+    monkeypatch.setattr(docker_tunnel, "time", SimpleNamespace(monotonic=lambda: now[0], time=time.time))
     kube = OutageKube()
     started = threading.Event()
     original = kube.call
     original_popen = subprocess.Popen
     children = []
+    stalled_reads = []
     stalled = False
 
     def popen(*args, **kwargs):
         process = original_popen(*args, **kwargs)
         children.append(process)
+        if kwargs.get("start_new_session"):
+            stalled_reads.append(process)
+            started.set()
         return process
 
     def call(*args, **kwargs):
         if stalled:
-            started.set()
             return run([sys.executable, "-c", "import time;time.sleep(60)"], **kwargs)
         return original(*args, **kwargs)
 
     monkeypatch.setattr(subprocess, "Popen", popen)
     monkeypatch.setattr(kube, "call", call)
-    tunnel = DockerTunnel(kube, IDENT, 0, verification_interval=.04, max_verification_age=.15).start()
+    tunnel = DockerTunnel(kube, IDENT, 0, verification_interval=30, max_verification_age=120).start()
     try:
         with connect(tunnel) as client:
             client.sendall(b"open\n")
             assert receive_exact(client, 5) == b"open\n"
             stalled = True
+            now[0] = 1030.0
             assert started.wait(2)
+            assert len(stalled_reads) == 1 and stalled_reads[0].poll() is None
             assert tunnel.snapshot()["verification"]["state"] == "verifying"
+            now[0] = 1119.0
+            client.sendall(b"before-expiry\n")
+            assert receive_exact(client, 14) == b"before-expiry\n"
+            assert tunnel.snapshot()["verification"]["state"] == "verifying"
+            now[0] = 1121.0
             with pytest.raises(ConnectionResetError):
                 client.recv(1)
             assert tunnel.snapshot()["verification"]["state"] == "expired"
+            assert tunnel.snapshot()["last_failure"]["reason"] == "ownership_verification_expired"
+            assert stalled_reads[0].poll() is None
+            assert len(kube.commands) == 1
         before = time.monotonic()
         tunnel.close()
         assert time.monotonic() - before < 2
