@@ -52,7 +52,7 @@ The sample assumes those files, profiles, services, and published ports exist in
 | `resources.requests` / `resources.limits` | Omitted when not declared in an explicit `resources` block | Maps accepting `cpu`, `memory`, `ephemeral-storage`; nonnegative Kubernetes quantities, with request no greater than the corresponding limit. Explicit zero is preserved. |
 | `init_resources` | Requests: CPU `10m`, memory `16Mi`; limits: CPU `100m`, memory `32Mi` | Complete replacement of the storage initializer's requests/limits, with the same shape and validation as `resources`. An empty map adds none. |
 | `storage.size` | `20Gi` | Positive Kubernetes storage quantity for the engine PVC. `up --storage` overrides it for that invocation; existing PVCs are never resized. |
-| `node_mode` | `shared` | `shared` uses eligible existing Linux EC2 nodes; `tainted` supplies a configured pool selector/toleration without reading nodes. |
+| `node_mode` | `shared` | `shared` uses eligible existing Linux nodes; `tainted` supplies a configured pool selector/toleration without reading nodes. |
 | `network.blocked_cidrs` | `[]`, in addition to built-in exclusions | Up to 128 distinct IPv4/IPv6 CIDR network addresses. Adds infrastructure exclusions to the engine's public IPv4 HTTP(S) rule; DNS remains a separate scoped exception. IPv6 public egress is not enabled. |
 | `tainted_nodes.selector` | `{podgrove.dev/dedicated: "true"}` | Nonempty map of node label names to string values; a supplied map replaces the default. |
 | `tainted_nodes.taint.key` | `dedicated` | Taint key placed in the Pod toleration; the administrator verifies taints on the selected nodes. |
