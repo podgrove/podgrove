@@ -2,6 +2,12 @@
 
 User-visible changes are recorded here. Release Please manages versioned entries after the first public release.
 
+## 0.2.6 (2026-09-27)
+
+- Clarify bounded idle file-sync recovery versus paused uncertain transfers, including when `up --refresh` is required.
+- Correct shared-node eligibility and distinguish resource presets from custom budgets.
+- Documentation and release metadata only; runtime behavior, dependencies and the acceptance runner are unchanged.
+
 ## 0.2.5 (2026-09-27)
 
 - Recover idle file-sync transport loss with bounded, cancellable attempts against the original engine and verified sync helper, retaining healthy session commands and application forwards.
