@@ -82,17 +82,24 @@ def target(monkeypatch, tmp_path):
         "script": "pass",
         "wire_script": None,
         "protocol": [],
+        "protocol_results": [],
+        "scratch": [],
     }
 
     def read(command, **_kwargs):
         state["reads"].append(command)
         if transport._ACK in command or transport._CLEANUP in command:
-            state["protocol"].append("ack" if transport._ACK in command else "cleanup")
-            program = transport._ACK if transport._ACK in command else transport._CLEANUP
-            child = original(["sh", "-c", program, "fixture-protocol", *command[-2:]],
+            operation = "ack" if transport._ACK in command else "cleanup"
+            state["protocol"].append(operation)
+            # Run the real outer guard too: replacement Pods must never execute
+            # bookkeeping intended for the original Pod, even in this fixture.
+            child = original(command[command.index("--") + 1:],
+                             env={**os.environ, transport.POD_UID_ENV: resources["pod"]["metadata"]["uid"]},
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             output, error = child.communicate(timeout=3)
-            assert child.returncode == 0, error
+            state["protocol_results"].append((operation, child.returncode))
+            if child.returncode:
+                raise PodgroveError("Fixture guarded protocol read failed")
             return output
         if "get" in command:
             kind = command[command.index("get") + 1]
@@ -118,8 +125,24 @@ def target(monkeypatch, tmp_path):
             nonce = command[command.index(transport._STREAM_WRAPPER) + 2]
             owner = command[command.index(transport._STREAM_WRAPPER) + 3]
             state["nonce"] = nonce
+            directory = Path('/tmp', 'podgrove-exec-' + nonce)
+            preexisting = directory.exists()
             child = original(["sh", "-c", transport._STREAM_WRAPPER, "fixture-stream", nonce, owner,
                               sys.executable, "-u", "-c", state["script"]], **kwargs)
+            # Remember only a directory created by this wrapper, with its exact
+            # owner and inode. A local process-group stop can interrupt its trap;
+            # real remote wrappers are not in kubectl's local process group.
+            if not preexisting:
+                deadline = time.monotonic() + 3
+                while child.poll() is None and time.monotonic() < deadline:
+                    try:
+                        if (directory / 'owner').read_text().strip() == owner:
+                            info = directory.lstat()
+                            state['scratch'].append((directory, info.st_dev, info.st_ino))
+                            break
+                    except FileNotFoundError:
+                        pass
+                    time.sleep(.001)
         else:
             child = original([sys.executable, "-u", "-c", state["script"]], **kwargs)
         state["children"].append(child)
@@ -128,7 +151,16 @@ def target(monkeypatch, tmp_path):
     monkeypatch.setattr(transport, "_read", read)
     monkeypatch.setattr(transport.subprocess, "Popen", launch)
     state["kube"] = Kube("explicit-cluster", "team-dev", namespace_mode="shared")
-    return state
+    yield state
+    for directory, device, inode in state['scratch']:
+        if not directory.exists():
+            continue
+        assert all(child.poll() is not None for child in state['children'])
+        info = directory.lstat()
+        assert (info.st_dev, info.st_ino) == (device, inode) and not directory.is_symlink()
+        # Fixture teardown only; production cleanup must retain the UID/owner
+        # guards and is deliberately best effort after ownership is lost.
+        shutil.rmtree(directory)
 
 
 def execute(target, arguments=None, **kwargs):
@@ -570,7 +602,56 @@ def test_blocked_stdout_does_not_block_stderr_or_ownership_cancellation(target, 
         assert checked and checked[0] == len(b'independent-stderr')
         assert time.monotonic() - started < 5
     assert all(child.poll() is not None for child in target['helpers'])
-    assert not Path('/tmp', 'podgrove-exec-' + target['nonce']).exists()
+    assert all(child.poll() is not None for child in target['children'])
+    assert len(target['commands']) == 1 and target['protocol'] == ['cleanup']
+    assert target['protocol_results'] == [('cleanup', 126)]
+    cleanup = next(command for command in target['reads'] if transport._CLEANUP in command)
+    assert cleanup[cleanup.index(transport._UID_GUARD) + 2] == 'pod-uid'
+    assert cleanup[-2] == target['nonce']
+
+
+@pytest.mark.parametrize('program', [transport._ACK, transport._CLEANUP], ids=['ack', 'cleanup'])
+def test_replaced_pod_guard_refuses_protocol_before_touching_scratch(target, program):
+    import uuid
+    nonce, owner = uuid.uuid4().hex, uuid.uuid4().hex
+    directory = Path('/tmp', 'podgrove-exec-' + nonce)
+    directory.mkdir(mode=0o700)
+    (directory / 'owner').write_text(owner + '\n')
+    (directory / 'out-sum').write_bytes(b'original scratch data')
+    target['resources']['pod']['metadata']['uid'] = 'replacement'
+    command = transport._guarded(target['kube'], IDENT, 'pod-uid',
+                                 ['sh', '-c', program, 'fixture-protocol', nonce, owner])
+    try:
+        with pytest.raises(PodgroveError, match='guarded protocol'):
+            transport._read(command)
+        assert target['protocol_results'][0][1] == 126
+        assert (directory / 'owner').read_text() == owner + '\n'
+        assert (directory / 'out-sum').read_bytes() == b'original scratch data'
+        assert not (directory / 'ack').exists()
+    finally:
+        shutil.rmtree(directory)
+
+
+def test_remote_wrapper_termination_trap_removes_owned_scratch(target):
+    import uuid
+    nonce = uuid.uuid4().hex
+    with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as error:
+        child = subprocess.Popen(['sh', '-c', transport._STREAM_WRAPPER, 'fixture-stream', nonce, 'd' * 32,
+                                  sys.executable, '-c', 'pass'], stdin=subprocess.DEVNULL,
+                                 stdout=output, stderr=error, start_new_session=True)
+        try:
+            # Both completion records prove the wrapper is waiting only for its
+            # ACK; signal this remote stand-in once, without a local group kill.
+            deadline = time.monotonic() + 5
+            while (output.tell() < len(frame(nonce, b'O', b''))
+                   or error.tell() < len(frame(nonce, b'E', b''))):
+                assert child.poll() is None and time.monotonic() < deadline
+                time.sleep(.01)
+            child.terminate()
+            assert child.wait(timeout=5) == 125
+            assert not Path('/tmp', 'podgrove-exec-' + nonce).exists()
+        finally:
+            transport._stop(child)
 
 
 def test_exited_process_group_permission_race_does_not_mask_primary_failure(monkeypatch):
