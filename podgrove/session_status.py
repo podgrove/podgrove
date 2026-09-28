@@ -11,7 +11,8 @@ def observed(data: dict, *, connected: bool | None = None, ping: dict | None = N
     if isinstance(ping, dict):
         if ping.get("ok") is True and ping.get("status") in ("starting", "ready", "degraded", "unhealthy", "error", "disconnected"):
             result["status"] = ping["status"]
-        for key in ("forward_status", "sync_status", "health_status", "docker_status", "heartbeat_status"):
+        for key in ("forward_status", "sync_status", "health_status", "docker_status", "heartbeat_status",
+                    "startup_status", "connectivity_status"):
             if isinstance(ping.get(key), dict):
                 result[key] = dict(ping[key])
     forward = result.get("forward_status")
@@ -42,6 +43,7 @@ def observed(data: dict, *, connected: bool | None = None, ping: dict | None = N
     verification = docker.get("verification", {}) if isinstance(docker, dict) else {}
     verification = verification if isinstance(verification, dict) else {}
     stale_ownership = verification.get("state") in ("unavailable", "expired")
-    if result.get("status") == "ready" and (current not in ("ready", "disabled") or retrying or stale_health or stale_ownership or stale_heartbeat):
+    connectivity = result.get("connectivity_status", {}).get("state", "disabled")
+    if result.get("status") == "ready" and (current not in ("ready", "disabled") or retrying or stale_health or stale_ownership or stale_heartbeat or connectivity not in ("ready", "disabled")):
         result["status"] = "degraded"
     return result

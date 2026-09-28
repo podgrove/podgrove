@@ -13,6 +13,7 @@ Services, volumes, networks, healthchecks and watch rules stay in your existing 
 - Run concurrent worktrees without sharing databases or Docker networks.
 - Keep data across reconnects and refreshes; choose CPU, memory and storage per worktree.
 - Inspect services, endpoints, storage and live logs in a read-only browser dashboard.
+- Declare connections to a local API or another worktree with [reverse forwards and environment links](docs/connectivity.md).
 
 [How it works](docs/how-it-works.md) · [Design choices](docs/why-not.md) · [Known limits](docs/known-limits.md)
 
@@ -23,13 +24,13 @@ You need macOS or Linux, Python 3.11+, `uv`, the Docker CLI with a recent Compos
 Install a verified release into a versioned environment, separate from a development checkout:
 
 ```sh
-git clone --branch v0.2.7 https://github.com/podgrove/podgrove.git
+git clone --branch v0.3.0 https://github.com/podgrove/podgrove.git
 cd podgrove
 PODGROVE_RELEASE_DIR="$(mktemp -d)"
-gh release download v0.2.7 --repo podgrove/podgrove --dir "$PODGROVE_RELEASE_DIR"
+gh release download v0.3.0 --repo podgrove/podgrove --dir "$PODGROVE_RELEASE_DIR"
 PODGROVE_RELEASE_SHA="$(git rev-parse HEAD)"
 python3 scripts/install_release.py --dist "$PODGROVE_RELEASE_DIR" \
-  --tag v0.2.7 --source-sha "$PODGROVE_RELEASE_SHA"
+  --tag v0.3.0 --source-sha "$PODGROVE_RELEASE_SHA"
 export PODGROVE_BIN="$HOME/.local/share/podgrove/current/bin/podgrove"
 "$PODGROVE_BIN" --version
 ```

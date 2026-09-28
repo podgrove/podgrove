@@ -762,7 +762,7 @@ forward:
     result = web.configuration_metadata(data)
     assert result == {"source": "current_file", "status": "available", "file": "settings/development.yml",
                           "warning": None, "settings": {
-                              "version": 1, "sync": {"exclude": []}, "size": "small", "node_mode": "tainted", "ttl_seconds": 2700,
+                              "version": 1, "placement": {}, "reverse": [], "connect": [], "sync": {"exclude": []}, "size": "small", "node_mode": "tainted", "ttl_seconds": 2700,
                               "resources_mode": "preset", "storage": {"size": "20Gi"},
                               "resources": {"requests": {"cpu": "250m", "memory": "2Gi"},
                                             "limits": {"cpu": "2", "memory": "2Gi", "ephemeral-storage": "4Gi"}},
@@ -791,7 +791,7 @@ def test_default_configuration_metadata_and_missing_file_have_distinct_meaning(t
     (root / "podgrove.yml").write_text("{}\n")
     result = web.configuration_metadata(data)
     assert result["status"] == "available" and result["warning"] is None
-    assert result["settings"] == {"version": 1, "sync": {"exclude": []}, "size": "medium", "node_mode": "shared", "ttl_seconds": 28800,
+    assert result["settings"] == {"version": 1, "placement": {}, "reverse": [], "connect": [], "sync": {"exclude": []}, "size": "medium", "node_mode": "shared", "ttl_seconds": 28800,
                                   "resources_mode": "preset", "storage": {"size": "20Gi"},
                                   "resources": {"requests": {"cpu": "1", "memory": "8Gi"},
                                                 "limits": {"cpu": "4", "memory": "8Gi", "ephemeral-storage": "4Gi"}},

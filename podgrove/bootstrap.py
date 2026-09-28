@@ -118,6 +118,7 @@ def render_bootstrap(namespace: str, storage_class: str | None = None,
               names=["podgrove-client", "podgrove-reaper", "podgrove-developers"]),
         _rule(["networkpolicies"], workload_verbs, group="networking.k8s.io"),
         _rule(["statefulsets"], workload_verbs, group="apps"),
+        _rule(["poddisruptionbudgets"], workload_verbs, group="policy"),
     ]
     cleanup_verbs = ["get", "list", "watch", "delete"]
     policy = _object("NetworkPolicy", "podgrove-default-deny", namespace, spec={
@@ -139,6 +140,7 @@ def render_bootstrap(namespace: str, storage_class: str | None = None,
             _object("Role", "podgrove-reaper", namespace, rules=[
                 _rule(["pods", "persistentvolumeclaims", "configmaps", "services"], cleanup_verbs),
                 _rule(["statefulsets"], cleanup_verbs, group="apps"),
+                _rule(["poddisruptionbudgets"], cleanup_verbs, group="policy"),
                 _rule(["networkpolicies"], cleanup_verbs, group="networking.k8s.io"),
             ]),
             _binding("podgrove-reaper", "podgrove-reaper", [reaper], namespace),

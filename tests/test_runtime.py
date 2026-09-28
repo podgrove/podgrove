@@ -166,7 +166,7 @@ def test_initial_sync_must_finish_before_compose_up(monkeypatch, tmp_path):
         events.append("compose-up")
         return SimpleNamespace(stdout="", stderr="")
     monkeypatch.setattr(runtime, "run", run)
-    monkeypatch.setattr(runtime, "service_status", lambda *_: [{"Service": "api", "State": "running"}])
+    monkeypatch.setattr(runtime, "service_status", lambda *_, **_kw: [{"Service": "api", "State": "running"}])
     compose = Mock(config=SimpleNamespace(root=tmp_path))
     result, _, _ = runtime.launch_stack(compose, {"services": {"api": {}}}, {}, "123456abcdef")
     assert result is sync
@@ -207,10 +207,12 @@ def test_failed_container_surfaces_without_readiness_timeout(monkeypatch, tmp_pa
     sync = Mock()
     monkeypatch.setattr(runtime, "Synchronizer", Mock(return_value=sync))
     monkeypatch.setattr(runtime, "run", Mock(return_value=SimpleNamespace(stdout="", stderr="")))
-    monkeypatch.setattr(runtime, "service_status", lambda *_: [{"Service": "api", "State": "exited", "ExitCode": 42}])
-    with pytest.raises(PodgroveError, match="container failed"):
+    monkeypatch.setattr(runtime, "service_status", lambda *_, **_kw: [{"Service": "api", "State": "exited", "ExitCode": 42}])
+    with pytest.raises(runtime.StartupIncomplete, match="container failed") as failed:
         runtime.launch_stack(Mock(config=SimpleNamespace(root=tmp_path)), {"services": {"api": {}}}, {}, "123456abcdef")
-    sync.close.assert_called_once()
+    assert failed.value.sync is sync
+    assert failed.value.rows[0]["ExitCode"] == 42
+    sync.close.assert_not_called()
 
 
 def test_docker_environment_does_not_reuse_context_tls_or_builder(monkeypatch):
@@ -266,8 +268,8 @@ def supervised_session(tmp_path, monkeypatch, request):
     monkeypatch.setattr(runtime, "Compose", Mock(return_value=compose))
     monkeypatch.setattr(runtime, "run", Mock(return_value=SimpleNamespace(stdout="", stderr="")))
     rows = [{"Service": "app", "State": "running", "Health": "healthy"}]
-    monkeypatch.setattr(runtime, "launch_stack", lambda *_: (sync, 0.01, rows))
-    monkeypatch.setattr(runtime, "service_status", lambda *_: rows)
+    monkeypatch.setattr(runtime, "launch_stack", lambda *_, **_kw: (sync, 0.01, rows))
+    monkeypatch.setattr(runtime, "service_status", lambda *_, **_kw: rows)
     monkeypatch.setattr(runtime.signal, "signal", lambda *_: None)
 
     class FakeTunnel:

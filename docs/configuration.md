@@ -52,6 +52,9 @@ The sample assumes those files, profiles, services, and published ports exist in
 | `resources.requests` / `resources.limits` | Omitted when not declared in an explicit `resources` block | Maps accepting `cpu`, `memory`, `ephemeral-storage`; nonnegative Kubernetes quantities, with request no greater than the corresponding limit. Explicit zero is preserved. |
 | `init_resources` | Requests: CPU `10m`, memory `16Mi`; limits: CPU `100m`, memory `32Mi` | Complete replacement of the storage initializer's requests/limits, with the same shape and validation as `resources`. An empty map adds none. |
 | `storage.size` | `20Gi` | Positive Kubernetes storage quantity for the engine PVC. `up --storage` overrides it for that invocation; existing PVCs are never resized. |
+| `placement` | `{}` | Optional Kubernetes `nodeSelector`, node affinity and tolerations for an existing pool; see node placement below. |
+| `reverse` | `[]` | Local loopback TCP ports exposed inside the engine; see [connectivity examples](connectivity.md). |
+| `connect` | `[]` | Exact same-namespace environment/service/port links; see [connectivity examples](connectivity.md). |
 | `node_mode` | `shared` | `shared` uses eligible existing Linux nodes; `tainted` supplies a configured pool selector/toleration without reading nodes. |
 | `network.blocked_cidrs` | `[]`, in addition to built-in exclusions | Up to 128 distinct IPv4/IPv6 CIDR network addresses. Adds infrastructure exclusions to the engine's public IPv4 HTTP(S) rule; DNS remains a separate scoped exception. IPv6 public egress is not enabled. |
 | `tainted_nodes.selector` | `{podgrove.dev/dedicated: "true"}` | Nonempty map of node label names to string values; a supplied map replaces the default. |
@@ -114,7 +117,7 @@ Without `--config`, the nearest `podgrove.yml` is found upward from the selected
 
 `compose.project_directory` chooses the Compose path-resolution base **within** the configuration boundary. It does not change identity or enlarge the sync boundary. `compose.files` and `compose.env_file` are resolved from the configuration directory; paths inside Compose are resolved by Compose against its selected project directory.
 
-Commit one `podgrove.yml` at the repository root with relative Compose paths. Every linked worktree can use identical bytes: engine/PVC names, namespace suffixes and loopback ports are derived at runtime. Do not insert a worktree identity, branch name or absolute checkout path into the committed YAML. The [complete portable example](../examples/portable/README.md) and its [real linked-worktree regression](../tests/test_portable_worktrees.py) cover both namespace modes. Cluster target fields are team configuration; replace the example values with approved settings before deployment.
+Commit one `podgrove.yml` at the repository root with relative Compose paths. Every linked worktree can use identical bytes: engine/PVC names, namespace suffixes and loopback ports are derived at runtime. Do not insert this worktree's own identity, branch name or absolute checkout path into the committed YAML. Optional `connect` declarations explicitly identify a different target environment; keep developer-specific links in a local configuration when that target is not shared by the team. The [complete portable example](../examples/portable/README.md) and its [real linked-worktree regression](../tests/test_portable_worktrees.py) cover both namespace modes. Cluster target fields are team configuration; replace the example values with approved settings before deployment.
 
 Older releases could create an environment for a Git subdirectory. If one of those records exists, the new resolver refuses to adopt, merge or duplicate it and identifies its recorded version and directory. Resolve that old environment with its original version before using the new identity. Existing environments already rooted at the checkout top level retain their identity.
 
@@ -162,6 +165,17 @@ podgrove doctor --node-mode tainted
 Both node modes require cluster admission to allow the privileged engine. `doctor` checks a new Pod through a server-side dry-run, or verifies an existing compatible engine, without persisting a Pod. The target namespace must already exist and its reviewed bootstrap marker must match. `up` validates that namespaced marker before creating supporting resources; no Namespace object is read. A node-mode change cannot override a denying admission policy.
 
 A pod's `podgrove.dev/node-mode` label records its placement mode. The privileged engine shares the node kernel in either mode; Podgrove does not change node labels, taints, or permissions. Namespace mode is independent of node mode. Existing environments keep their recorded placement: changing `node_mode` or active `tainted_nodes` settings requires recreating the environment with `down`, which removes its PVC data.
+
+Use `placement` to select an existing on-demand pool without requiring dedicated taints:
+
+```yaml
+placement:
+  nodeSelector:
+    example.com/capacity: on-demand
+  tolerations: []
+```
+
+Replace the example label with your platform's actual on-demand-pool label. Podgrove does not infer cloud-provider labels or inspect/create nodes. `affinity.nodeAffinity` also supports required `nodeSelectorTerms` and weighted preferred terms with `matchExpressions`; Pod affinity and `matchFields` are not accepted. Kubernetes operator/key/value rules are validated. Required terms retain Linux and unsupported-compute exclusions; conflicts with mandatory or tainted-mode selectors are refused. See the [complete placement example](../examples/placement/podgrove.yml). Changing an existing engine's placement requires planned recreation; `up --refresh` does not move it.
 
 ## Sync exclusions and endpoint exports
 

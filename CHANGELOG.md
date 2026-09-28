@@ -2,6 +2,14 @@
 
 User-visible changes are recorded here. Release Please manages versioned entries after the first public release.
 
+## 0.3.0 (2026-09-28)
+
+- Protect each engine with supported autoscaler annotations and a namespaced PodDisruptionBudget; add optional node selectors, node affinity and tolerations for existing pools.
+- Retry startup after a verified engine Pod replacement within a fixed budget, preserving the original StatefulSet specification and PVC identity.
+- Remirror bind sources on rerun and recreate failed services while keeping healthy services available; retain diagnostic sessions and forwards for running containers after partial startup.
+- Add declared reverse TCP forwarding to laptop loopback services and exact same-namespace environment/service links with narrow NetworkPolicy rules.
+- Suggest `sync.exclude` when a mirrored source contains an unsupported symlink, and include new configuration fields in the read-only dashboard.
+
 ## 0.2.7 (2026-09-28)
 
 - Return one JSON document for `doctor --json` success, check/configuration errors and interruption, while preserving ordinary text output.

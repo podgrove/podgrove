@@ -42,6 +42,7 @@ def invoke(command, path, *options):
 
 @pytest.fixture
 def project(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "capture_anchor", lambda *_: {"fixture": "owned-controller-and-pvc"})
     root = checkout(tmp_path / "repo")
     (root / "backend" / "src").mkdir(parents=True)
     monkeypatch.setenv("PODGROVE_STATE_HOME", str(tmp_path / "state"))

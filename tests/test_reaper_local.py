@@ -155,8 +155,19 @@ def without_lease(kube, resources=None):
     resources = resources or {}
     def get(kind, name=None, **kwargs):
         if name is None:
-            assert kind == "configmap" and kwargs.get("selector")
-            return {"items": []}
+            selector = kwargs.get("selector")
+            assert isinstance(selector, str)
+            labels = dict(part.split("=", 1) for part in selector.split(","))
+            assert labels.get(MANAGED) == "podgrove"
+            if kind == "configmap":
+                assert set(labels) <= {MANAGED, ENVIRONMENT}
+                return {"items": []}
+            assert kind in ("service", "networkpolicy")
+            assert set(labels) == {MANAGED, ENVIRONMENT, "podgrove.dev/component"}
+            assert labels["podgrove.dev/component"] == "connection"
+            return {"items": [resource for (resource_kind, _), resource in resources.items()
+                              if resource_kind == kind and all(resource["metadata"].get("labels", {}).get(key) == value
+                                                               for key, value in labels.items())]}
         return resources.get((kind, name), {})
     kube.get.side_effect = get
 
@@ -179,8 +190,8 @@ def test_absent_cluster_environment_cleans_local_only_without_cluster_writes(tmp
     assert set(exact) == {("configmap", f"pg-{data['identity']}"), ("statefulset", f"pg-{data['identity']}"),
                           ("pod", f"pg-{data['identity']}-0"), ("pod", f"pg-{data['identity']}"),
                           ("pvc", f"pg-{data['identity']}"), ("networkpolicy", f"pg-{data['identity']}"),
-                          ("service", f"pg-{data['identity']}")}
-    assert len(exact) == 14, "absence must be rechecked under the local lock"
+                          ("service", f"pg-{data['identity']}"), ("poddisruptionbudget", f"pg-{data['identity']}")}
+    assert len(exact) == 16, "absence must be rechecked under the local lock"
 
 
 def test_absent_cluster_environment_dry_run_does_not_create_lock_or_remove_files(tmp_path, monkeypatch):
@@ -320,3 +331,92 @@ def test_reaper_refuses_local_and_cluster_mode_disagreement_before_stopping(tmp_
     kube.destroy.assert_not_called()
     stop.assert_not_called()
     assert path.exists()
+
+
+def orphan_link(data, kind):
+    name = f"pg-{data['identity']}-link-0123456789" + ("-out" if kind == "networkpolicy" else "")
+    return name, {"kind": "NetworkPolicy" if kind == "networkpolicy" else "Service", "metadata": {
+        "name": name, "namespace": data["namespace"], "uid": "original-link-uid", "resourceVersion": "2",
+        "labels": {MANAGED: "podgrove", ENVIRONMENT: data["identity"], "podgrove.dev/component": "connection"},
+        "ownerReferences": [{"apiVersion": "apps/v1", "kind": "StatefulSet", "name": f"pg-{data['identity']}",
+                             "uid": "original-source-controller"}],
+    }}
+
+
+@pytest.mark.parametrize("kind", ["service", "networkpolicy"])
+def test_missing_core_resources_do_not_hide_orphan_connection_or_discard_retry_state(tmp_path, monkeypatch, kind):
+    _, path, data, _, kube, stop = environment(tmp_path, monkeypatch)
+    name, link = orphan_link(data, kind)
+    without_lease(kube, {(kind, name): link})
+    before = path.read_bytes()
+    result = reaper.reap(kube)
+    assert result[0]["deleted"] is False and "lease is missing" in result[0]["error"]
+    assert path.read_bytes() == before
+    stop.assert_not_called()
+    kube.destroy.assert_not_called()
+    selector = f"{MANAGED}=podgrove,{ENVIRONMENT}={data['identity']},podgrove.dev/component=connection"
+    kube.get.assert_any_call(kind, selector=selector)
+
+
+@pytest.mark.parametrize("kind", ["service", "networkpolicy"])
+@pytest.mark.parametrize("why", ["expired", "missing"])
+def test_eligible_orphan_connections_use_scoped_destroy_before_local_cleanup(tmp_path, monkeypatch, kind, why):
+    root, path, data, _, kube, stop = environment(tmp_path, monkeypatch)
+    if why == "expired":
+        data["last_activity"] = 100
+        state.write(path, data)
+    else:
+        root.rmdir()
+    name, link = orphan_link(data, kind)
+    without_lease(kube, {(kind, name): link})
+    assert reaper.reap(kube)[0]["deleted"] is True
+    stop.assert_called_once()
+    kube.destroy.assert_called_once_with(data["identity"], namespace_mode="shared")
+    assert not path.exists()
+    selector = f"{MANAGED}=podgrove,{ENVIRONMENT}={data['identity']},podgrove.dev/component=connection"
+    assert sum(call.args == (kind,) and call.kwargs == {"selector": selector} for call in kube.get.call_args_list) == 2
+
+
+@pytest.mark.parametrize("mutation", ["namespace", "name", "missing-uid", "owner-name", "owner-kind", "owner-api", "owner-uid", "extra-owner"])
+def test_foreign_or_malformed_orphan_connection_preserves_state_before_any_cleanup(tmp_path, monkeypatch, mutation):
+    root, path, data, _, kube, stop = environment(tmp_path, monkeypatch)
+    root.rmdir()
+    name, link = orphan_link(data, "service")
+    metadata = link["metadata"]
+    if mutation == "namespace":
+        metadata["namespace"] = "unrelated-namespace"
+    elif mutation == "name":
+        metadata["name"] = "unrelated-service"
+    elif mutation == "missing-uid":
+        metadata.pop("uid")
+    elif mutation == "extra-owner":
+        metadata["ownerReferences"].append(dict(metadata["ownerReferences"][0]))
+    else:
+        key = {"owner-name": "name", "owner-kind": "kind", "owner-api": "apiVersion", "owner-uid": "uid"}[mutation]
+        metadata["ownerReferences"][0][key] = "" if key == "uid" else "foreign"
+    without_lease(kube, {("service", name): link})
+    result = reaper.reap(kube)
+    assert result[0]["deleted"] is False and "foreign or malformed" in result[0]["error"]
+    assert path.exists()
+    stop.assert_not_called()
+    kube.destroy.assert_not_called()
+
+
+def test_connection_appearing_during_locked_absence_recheck_prevents_local_state_loss(tmp_path, monkeypatch):
+    _, path, data, _, kube, stop = environment(tmp_path, monkeypatch)
+    _, link = orphan_link(data, "service")
+    calls = 0
+    def get(kind, name=None, **kwargs):
+        nonlocal calls
+        if name is not None:
+            return {}
+        if kind == "service":
+            calls += 1
+            return {"items": [link] if calls == 2 else []}
+        return {"items": []}
+    kube.get.side_effect = get
+    result = reaper.reap(kube)
+    assert result[0]["deleted"] is False and "lease is missing" in result[0]["error"]
+    assert calls == 2 and path.exists()
+    stop.assert_not_called()
+    kube.destroy.assert_not_called()

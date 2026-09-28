@@ -34,10 +34,11 @@ for _tag in ("!override", "!reset"):
 class Compose:
     def __init__(self, config: Config):
         self.config = config
+        self.overlay_files: list[Path] = []
 
     def command(self, *args: str) -> list[str]:
         command = ["docker", "compose", "--ansi", "never", "--project-directory", str(self.config.project_directory)]
-        for path in self.config.files:
+        for path in [*self.config.files, *self.overlay_files]:
             command.extend(["--file", str(path)])
         for profile in self.config.profiles:
             command.extend(["--profile", profile])
@@ -102,7 +103,7 @@ class Compose:
             if component == self.config.root:
                 break
             if component.is_symlink():
-                self._refuse(key, f"symlinks in sync sources are unsupported: {component}")
+                self._refuse(key, f"symlinks in sync sources are unsupported: {component}; exclude optional paths with sync.exclude")
         self._check_file_type(path, key)
         if path.is_dir():
             def onerror(error: OSError) -> None:
@@ -126,7 +127,7 @@ class Compose:
         except OSError as exc:
             raise PodgroveError(f"{key}: cannot read sync source {path}: {exc}") from exc
         if stat.S_ISLNK(mode):
-            self._refuse(key, f"symlinks in sync sources are unsupported: {path}")
+            self._refuse(key, f"symlinks in sync sources are unsupported: {path}; exclude optional paths with sync.exclude")
         if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
             self._refuse(key, f"only regular files and directories can be synced: {path}")
 

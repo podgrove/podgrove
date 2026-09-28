@@ -154,7 +154,7 @@ def test_default_reaper_removes_only_owned_environment_and_retains_namespace_and
     assert kube.call.call_args_list == [
         call("delete", "statefulset", "-l", f"{MANAGED}=podgrove,{ENVIRONMENT}=123456abcdef",
              "--ignore-not-found", "--cascade=foreground", "--wait=true", "--timeout=120s", "--request-timeout=0", timeout=130),
-        call("delete", "pod,pvc,configmap,networkpolicy,service", "-l", f"{MANAGED}=podgrove,{ENVIRONMENT}=123456abcdef",
+        call("delete", "pod,pvc,configmap,networkpolicy,service,poddisruptionbudget", "-l", f"{MANAGED}=podgrove,{ENVIRONMENT}=123456abcdef",
              "--ignore-not-found", "--wait=true", "--timeout=120s", timeout=130),
     ]
     assert namespace == before

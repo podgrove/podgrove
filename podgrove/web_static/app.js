@@ -258,6 +258,9 @@
       ["Configured extra blocked CIDRs", settings.network?.blocked_cidrs?.join(", ") || "None configured"],
       ["Saved extra blocked CIDRs", Array.isArray(savedNetwork?.blocked_cidrs) ? savedNetwork.blocked_cidrs.join(", ") || "None configured" : "Not recorded"],
       ["Node placement", settings.node_mode], ["Idle TTL", duration(settings.ttl_seconds)],
+      ["Additional placement", Object.keys(settings.placement || {}).length ? JSON.stringify(settings.placement) : "None configured"],
+      ["Reverse forwarding", settings.reverse?.length ? settings.reverse.map(rule => `host.docker.internal:${rule.remote_port} → ${rule.local_host}:${rule.local_port}`).join("; ") : "None configured"],
+      ["Environment links", settings.connect?.length ? settings.connect.map(rule => `${rule.name}.podgrove:${rule.port} → ${rule.environment}/${rule.service}`).join("; ") : "None configured"],
       ...(settings.node_mode === "tainted" && settings.tainted_nodes ? [
         ["Node selector", Object.entries(settings.tainted_nodes.selector || {}).map(([key, value]) => `${key}=${value}`).join(", ")],
         ["Taint tolerated", `${settings.tainted_nodes.taint?.key}=${settings.tainted_nodes.taint?.value || ""} · ${settings.tainted_nodes.taint?.effect}`],

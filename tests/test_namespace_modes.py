@@ -74,7 +74,7 @@ def test_shared_marker_is_verified_without_namespace_reads_or_metadata_changes(n
     kube.get.assert_called_once_with("configmap", PROVISIONING_MARKER)
     kube.destroy(IDENT)
     assert marker == before
-    assert [call.args[1] for call in kube.call.call_args_list] == ["statefulset", "pod,pvc,configmap,networkpolicy,service"]
+    assert [call.args[1] for call in kube.call.call_args_list] == ["statefulset", "pod,pvc,configmap,networkpolicy,service,poddisruptionbudget"]
     assert all(f"{MANAGED}=podgrove,{ENVIRONMENT}={IDENT}" in call.args for call in kube.call.call_args_list)
 
 
@@ -170,7 +170,7 @@ def test_malformed_persisted_mode_is_rejected(mode):
 def test_legacy_cleanup_retains_namespace_and_does_not_require_marker_or_lease(namespace):
     kube, _ = fake_kube(namespace, "exclusive")
     kube.destroy(IDENT)
-    assert [call.args[1] for call in kube.call.call_args_list] == ["statefulset", "pod,pvc,configmap,networkpolicy,service"]
+    assert [call.args[1] for call in kube.call.call_args_list] == ["statefulset", "pod,pvc,configmap,networkpolicy,service,poddisruptionbudget"]
     kube.get.assert_called_once_with("configmap", f"pg-{IDENT}")
 
 

@@ -41,7 +41,7 @@ runtime.Compose = lambda *args: SimpleNamespace(model=lambda: {"services": {"app
                                                published_ports=lambda *args: [], has_watch=lambda *args: False)
 sync = SimpleNamespace(sync_once=lambda: 0, cancel=noop, close=noop)
 rows = [{"Service": "app", "State": "running"}]
-runtime.launch_stack = lambda *args: (sync, .01, rows)
+runtime.launch_stack = lambda *args, **kwargs: (sync, .01, rows)
 runtime.service_status = block
 runtime.HEALTH_INTERVAL = 0
 tunnel = SimpleNamespace(check=noop, close=noop, snapshot=lambda: {"verification": {"state": "verified"}})

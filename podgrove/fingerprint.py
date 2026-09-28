@@ -40,6 +40,10 @@ def launch_fingerprint(model: dict, config: Config) -> LaunchFingerprint:
     current = {**original, "network": config.network}
     if config.sync_exclude:
         current["sync_exclude"] = config.sync_exclude
+    for key in ("placement", "reverse", "connect"):
+        if value := getattr(config, key):
+            current[key] = value
     legacy = (_digest(original) if config.network == {"blocked_cidrs": []} and not config.sync_exclude
+              and not any(getattr(config, key) for key in ("placement", "reverse", "connect"))
               else None)
     return LaunchFingerprint(_digest(current), legacy)

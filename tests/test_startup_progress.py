@@ -16,6 +16,7 @@ from podgrove import runtime, state
     ("docker_api", "opening the Docker API connection"),
     ("docker_ready", "checking Docker engine readiness"),
     ("initial_sync", "copying the initial workspace snapshot"),
+    ("existing_services", "checking existing Compose services"),
     ("compose_up", "building and starting Compose services"),
     ("service_readiness", "waiting for Compose service readiness"),
     ("port_forwards", "opening application port forwards"),
@@ -58,14 +59,18 @@ def api_start():
     block("docker_api")
     return api
 runtime.DockerTunnel = lambda *args: SimpleNamespace(start=api_start)
+compose_started = False
 def run(command, **kwargs):
+    global compose_started
     block("docker_ready" if command == ["docker", "info"] else "compose_up")
+    if command != ["docker", "info"]:
+        compose_started = True
     return SimpleNamespace(stdout="", stderr="")
 runtime.run = run
 sync = SimpleNamespace(start=lambda: block("initial_sync"), close=noop, cancel=noop, sync_once=lambda: 0)
 runtime.Synchronizer = lambda *args, **kwargs: sync
-def services(*args):
-    block("service_readiness")
+def services(*args, **kwargs):
+    block("service_readiness" if compose_started else "existing_services")
     return [{"Service": "app", "State": "running"}]
 runtime.service_status = services
 runtime.port_plan = lambda *args, **kwargs: [{"service": "app", "target": 8000,

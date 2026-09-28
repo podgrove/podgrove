@@ -137,7 +137,7 @@ def test_supervisor_persists_original_and_failure_time_identity_before_any_build
         return tunnel
     monkeypatch.setattr(runtime, "DockerTunnel", make_tunnel)
     starting = []
-    def fail_build(*_):
+    def fail_build(*_, **_kwargs):
         observed = state.read(path)
         assert observed["status"] == "starting"
         assert observed["engine_identity"]["expected"] == {"statefulset_uid": "controller-uid", "pod_uid": "pod-uid"}

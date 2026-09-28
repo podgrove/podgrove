@@ -57,6 +57,7 @@ def test_a_tagged_record_never_uses_pre_network_compatibility(tmp_path, recorded
 
 @pytest.fixture
 def project(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "capture_anchor", lambda *_: {"fixture": "owned-controller-and-pvc"})
     root = tmp_path / "worktree"
     root.mkdir()
     monkeypatch.chdir(root)

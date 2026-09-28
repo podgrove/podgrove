@@ -84,6 +84,6 @@ def test_runtime_passes_only_explicit_configuration_patterns(tmp_path, monkeypat
     factory = Mock(return_value=sync)
     monkeypatch.setattr(runtime, "Synchronizer", factory)
     monkeypatch.setattr(runtime, "run", Mock(return_value=Mock(stdout="", stderr="")))
-    monkeypatch.setattr(runtime, "service_status", lambda *_: [{"Service": "api", "State": "running", "Health": ""}])
+    monkeypatch.setattr(runtime, "service_status", lambda *_, **_kwargs: [{"Service": "api", "State": "running", "Health": ""}])
     runtime.launch_stack(compose, {"services": {"api": {}}}, {}, "012345abcdef")
     factory.assert_called_once_with(tmp_path, [tmp_path], {}, "012345abcdef", exclude=config.sync_exclude)

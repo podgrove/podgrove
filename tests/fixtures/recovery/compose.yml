@@ -1,0 +1,22 @@
+x-service: &service
+  image: python:3.12-alpine
+  volumes:
+    - ./server.py:/server.py:ro
+    - ./content:/fixture:ro
+  ports:
+    - "8080"
+  healthcheck:
+    test: ["CMD", "test", "-f", "/tmp/startup-ready"]
+    interval: 1s
+    timeout: 1s
+    retries: 1
+services:
+  healthy:
+    <<: *service
+    command: ["python", "/server.py", "healthy"]
+  exited:
+    <<: *service
+    command: ["python", "/server.py", "exited"]
+  unhealthy:
+    <<: *service
+    command: ["python", "/server.py", "unhealthy"]

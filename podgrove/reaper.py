@@ -101,13 +101,13 @@ def _stop_local(record: dict) -> None:
 
 
 def _remaining_without_lease(kube: Kube, ident: str) -> list[str]:
-    """Inspect exact names only; foreign collisions are never treated as absence."""
+    """Inspect core names and source-owned links before discarding local evidence."""
     name = f"pg-{ident}"
     if kube.get("configmap", name):
         raise PodgroveError("An environment lease exists or appeared; retry reap before local cleanup")
     remaining = []
     for kind, resource_name in (("statefulset", name), ("pod", engine_pod_name(ident)), ("pod", name),
-                                ("pvc", name), ("networkpolicy", name), ("service", name)):
+                                ("pvc", name), ("networkpolicy", name), ("service", name), ("poddisruptionbudget", name)):
         resource = kube.get(kind, resource_name)
         if not resource:
             continue
@@ -117,6 +117,24 @@ def _remaining_without_lease(kube: Kube, ident: str) -> list[str]:
                 or labels.get(MANAGED) != "podgrove" or labels.get(ENVIRONMENT) != ident):
             raise PodgroveError(f"Refusing local cleanup: {kind}/{resource_name} is foreign")
         remaining.append(f"{kind}/{resource_name}")
+    selector = f"{MANAGED}=podgrove,{ENVIRONMENT}={ident},podgrove.dev/component=connection"
+    for kind in ("service", "networkpolicy"):
+        items = kube.get(kind, selector=selector).get("items", [])
+        if not isinstance(items, list):
+            raise PodgroveError("Cannot verify connection cleanup inventory")
+        for resource in items:
+            metadata = resource.get("metadata", {})
+            labels = metadata.get("labels", {})
+            owners = metadata.get("ownerReferences", [])
+            if (metadata.get("namespace") != kube.namespace or not metadata.get("uid")
+                    or not re.fullmatch(rf"pg-{ident}-link-[0-9a-f]{{10}}(?:-in|-out)?", metadata.get("name", ""))
+                    or labels.get(MANAGED) != "podgrove" or labels.get(ENVIRONMENT) != ident
+                    or labels.get("podgrove.dev/component") != "connection"
+                    or len(owners) != 1 or owners[0].get("apiVersion") != "apps/v1"
+                    or owners[0].get("kind") != "StatefulSet" or owners[0].get("name") != name
+                    or not owners[0].get("uid")):
+                raise PodgroveError("Refusing local cleanup: connection resource is foreign or malformed")
+            remaining.append(f"{kind}/{metadata['name']}")
     return remaining
 
 

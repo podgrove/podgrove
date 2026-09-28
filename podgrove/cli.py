@@ -15,6 +15,7 @@ from pathlib import Path
 
 from . import __version__, state
 from .compose import Compose
+from .connect import validate_connectivity
 from .config import default_tainted_nodes, load_cluster, load_config, storage_class_name
 from .errors import PodgroveError
 from .fingerprint import FORMAT as FINGERPRINT_FORMAT, launch_fingerprint
@@ -25,6 +26,7 @@ from .reaper import mr_endpoint, reap
 from .repository import configuration_root, worktree_root
 from .session_status import observed
 from .resources import engine_resources, initializer_resources, quantity_text
+from .startup_recovery import capture_anchor
 
 
 def _log_tail(value: str) -> int | str:
@@ -105,7 +107,7 @@ def parser() -> argparse.ArgumentParser:
 
 
 def print_state(data: dict, as_json=False) -> None:
-    public = {k: v for k, v in data.items() if k not in ("token", "socket", "docker_host")}
+    public = {k: v for k, v in data.items() if k not in ("token", "socket", "docker_host", "startup_anchor")}
     if as_json:
         print(json.dumps(public, indent=2))
         return
@@ -215,6 +217,7 @@ def up(args, root: Path) -> int:
     compose.validate(model)
     fingerprint = launch_fingerprint(model, config)
     ident = state.identity(root)
+    validate_connectivity(config, model, ident)
     # Validate all constraints including forwarding before any Kubernetes mutation.
     if args.mr_url:
         mr_endpoint(args.mr_url)
@@ -230,17 +233,22 @@ def up(args, root: Path) -> int:
                           storage_class=storage_class,
                           storage=storage_size, mr_url=args.mr_url, namespace_mode=args.namespace_mode,
                           node_mode=node_mode, tainted_nodes=config.tainted_nodes, network=config.network,
-                          resources=budget, init_resources=init_budget)
+                          resources=budget, init_resources=init_budget, placement=config.placement)
+    for resource in resources:
+        if resource["kind"] == "ConfigMap" and model.get("name"):
+            resource["data"]["compose_project"] = model["name"]
     if args.dry_run:
         print(json.dumps({"identity": ident, "namespace": namespace, "namespace_mode": args.namespace_mode,
                           "resources": resources}, indent=2))
         return 0
     kube = Kube(args.context, namespace, namespace_mode=args.namespace_mode)
     path = state.state_path(root, args.context)
+    reconcile_connections = bool(config.connect)
     with state.lock(path):
         if path.exists():
             old = state.read(path)
             state.validate_binding(old, root, args.context)
+            reconcile_connections = reconcile_connections or bool(old.get("connect")) or old.get("reconcile_connections", False)
             args.mr_url = args.mr_url or old.get("mr_url", "")
             if args.mr_url:
                 mr_endpoint(args.mr_url)
@@ -256,7 +264,7 @@ def up(args, root: Path) -> int:
                 previous_node_mode = "tainted"
             previous_tainted_nodes = old.get("tainted_nodes", default_tainted_nodes())
             placement_changed = node_mode == "tainted" and previous_tainted_nodes != config.tainted_nodes
-            if previous_node_mode != node_mode or placement_changed:
+            if previous_node_mode != node_mode or placement_changed or old.get("placement", {}) != config.placement:
                 raise PodgroveError(
                     f"Existing environment uses node_mode={previous_node_mode} with its recorded node placement; "
                     f"requested node_mode={node_mode} has different placement. "
@@ -274,13 +282,16 @@ def up(args, root: Path) -> int:
                 # Even an unchanged running stack must not retain a missing or
                 # weakened policy. Reconcile only this owned engine's policy.
                 kube.reconcile_network_policy(resources, ident)
+                kube.reconcile_engine_protection(resources, ident)
                 ping = control(old, "ping") if "forward_status" in old else None
                 if ping is not None and (not isinstance(ping, dict) or ping.get("ok") is not True):
                     raise PodgroveError("Session is stopping or rejected the control request; retry up after it stops")
                 health = observed(old, connected=True, ping=ping)
                 changed = (bool(old.get("compose_fingerprint")) and not fingerprint.matches(
                     old["compose_fingerprint"], old.get("compose_fingerprint_format"))) or args.mr_url != old.get("mr_url", "")
-                if not args.refresh and not changed and health["forward_status"]["state"] != "disconnected":
+                retry_application = (health["status"] == "unhealthy" or bool(compose.sync_paths(model))
+                                     or health.get("startup_status", {}).get("state") == "failed")
+                if not args.refresh and not changed and not retry_application and health["forward_status"]["state"] != "disconnected":
                     print_state(health, args.json)
                     return 0 if health["status"] == "ready" else 1
                 kube.preflight(node_mode=node_mode, tainted_nodes=config.tainted_nodes)
@@ -311,6 +322,8 @@ def up(args, root: Path) -> int:
                 "ttl_seconds": config.ttl_seconds, "mr_url": args.mr_url,
                 "node_mode": node_mode,
                 "tainted_nodes": config.tainted_nodes,
+                "placement": config.placement, "reverse": config.reverse, "connect": config.connect,
+                "reconcile_connections": reconcile_connections,
                 "network": config.network,
                 "resources": budget, "init_resources": init_budget,
                 "storage": {"size": storage_size, "storage_class": effective_storage_class},
@@ -320,6 +333,8 @@ def up(args, root: Path) -> int:
         state.write(path, data)
         try:
             kube.create_environment(resources, ident)
+            data["startup_anchor"] = capture_anchor(kube, ident)
+            state.write(path, data)
             spawn(path)
         except Exception as exc:
             data.update({"status": "error", "error": str(exc)})
@@ -332,6 +347,9 @@ def up(args, root: Path) -> int:
             if data["status"] == "ready":
                 print_state(data, args.json)
                 return 0
+            if data.get("startup_status", {}).get("state") == "failed" and data["status"] in ("unhealthy", "degraded"):
+                print_state(data, args.json)
+                return 1
             if data["status"] == "error":
                 raise PodgroveError(f"{data['error']}\nSession log: {path.with_suffix('.log')}\n"
                                     "Resources retained for diagnosis; podgrove down cleans them up.")
@@ -373,6 +391,7 @@ def execute(args) -> int:
         compose = Compose(config)
         model = compose.model()
         compose.validate(model)
+        validate_connectivity(config, model, state.identity(root))
         validate_port_plan(compose.published_ports(model), config.forward, state.identity(root))
         print(json.dumps({"valid": True, "services": sorted(model["services"]), "sync_paths": [str(p) for p in compose.sync_paths(model)]}, indent=2))
         return 0
@@ -400,7 +419,7 @@ def execute(args) -> int:
             public = {key: data[key] for key in ("identity", "root", "context", "namespace", "status", "created_at",
                                                  "last_activity", "ttl_seconds", "node_mode", "namespace_mode", "ports", "error",
                                                  "forward_status", "sync_status", "health_status", "docker_status",
-                                                 "heartbeat_status", "engine_identity") if key in data}
+                                                 "heartbeat_status", "engine_identity", "startup_status", "connectivity_status") if key in data}
             rows.append(public)
         if args.json:
             print(json.dumps({"environments": rows}, indent=2))
@@ -420,20 +439,24 @@ def execute(args) -> int:
         tainted_nodes = default_tainted_nodes()
         size, ttl = "medium", 8 * 3600
         budget, init_budget, storage_size, storage_class = None, None, "20Gi", None
+        placement = {}
         if args.config is not None or args.files is not None or (args._config_root / "podgrove.yml").exists():
             config = load_config(args._config_root, args.config, args.files, require_compose=False)
             node_mode, tainted_nodes = config.node_mode, config.tainted_nodes
             size, ttl = config.size, config.ttl_seconds
             budget, init_budget = config.resources, config.init_resources
             storage_size, storage_class = config.storage_size, config.storage_class
+            placement = config.placement
         node_mode = args.node_mode or node_mode
         kube.preflight(node_mode=node_mode, tainted_nodes=tainted_nodes)
         namespace = args.namespace
         kube.ensure_namespace(ident)
-        kube.check_admission(manifests(namespace, ident, root, size, ttl,
+        admission = manifests(namespace, ident, root, size, ttl,
                                        node_mode=node_mode, tainted_nodes=tainted_nodes,
                                        namespace_mode=args.namespace_mode, resources=budget, init_resources=init_budget,
-                                       storage=storage_size, storage_class=storage_class))
+                                       storage=storage_size, storage_class=storage_class, placement=placement)
+        kube.check_admission(admission)
+        kube.check_engine_protection(admission, ident)
         summary = "Namespace permissions, bootstrap marker and engine admission checks passed"
         notes = [
             f"{node_mode.capitalize()} scheduling is expressed by the Pod spec; node inventory is not read.",

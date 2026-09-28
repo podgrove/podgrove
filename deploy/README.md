@@ -102,9 +102,13 @@ kubectl --context platform-admin --namespace team-development delete --ignore-no
 
 This removes only the generated namespaced setup objects. It does not delete the Namespace or unrelated workloads. It removes Podgrove access and its baseline policy for everyone using that installation, so it is separate from routine worktree cleanup.
 
+## Upgrading engine protection permissions
+
+Regenerate the bootstrap bundle after upgrading to the release that adds engine disruption protection. Have the namespace administrator review and apply the client and reaper RBAC files: the client needs namespaced `policy/poddisruptionbudgets` lifecycle verbs, and the reaper needs get/list/watch/delete. Existing engines receive annotations and a per-engine PDB on their next `up`, without a Pod restart. A denied PDB preflight stops deployment before allocating an engine or PVC.
+
 ## Permission and isolation limits
 
-The client Role grants namespace-wide rights on Pods, StatefulSets, Services, PVCs, ConfigMaps and NetworkPolicies. Docker API streams need `pods/exec`; application tunnels need `pods/portforward`. Both permit GET and CREATE for supported streaming protocols. GET-only `pods/log` lets the dashboard read the owned engine's logs. The client also receives exact named GETs for the two ServiceAccounts, two Roles and three RoleBindings shown by Configuration. There are no node, Namespace, StorageClass, PV, cluster-RBAC, Secrets, token, bind or escalate grants.
+The client Role grants namespace-wide rights on Pods, StatefulSets, Services, PVCs, ConfigMaps, NetworkPolicies and PodDisruptionBudgets. Docker API streams need `pods/exec`; application tunnels need `pods/portforward`. Both permit GET and CREATE for supported streaming protocols. GET-only `pods/log` lets the dashboard read the owned engine's logs. The client also receives exact named GETs for the two ServiceAccounts, two Roles and three RoleBindings shown by Configuration. There are no node, Namespace, StorageClass, PV, cluster-RBAC, Secrets, token, bind or escalate grants.
 
 The Configuration page makes eight exact namespaced metadata reads: the provisioning ConfigMap and those seven SA/RBAC objects. It reports the selected namespace string and observed marker; it does not read Namespace metadata. Missing and inaccessible declarations are distinguished. Declarations are not effective-permission checks. The reaper receives none of the dashboard-specific SA/RBAC reads or streaming/log permissions.
 

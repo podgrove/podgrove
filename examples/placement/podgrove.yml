@@ -1,0 +1,27 @@
+version: 1
+cluster:
+  context: your-development-context
+  namespace: your-development-namespace
+  namespace_mode: shared
+  storage_class: your-delete-storage-class
+node_mode: shared
+placement:
+  # Replace this selector with your administrator's existing on-demand pool label.
+  nodeSelector:
+    example.com/capacity-type: on-demand
+  affinity:
+    nodeAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 80
+          preference:
+            matchExpressions:
+              - key: example.com/pool
+                operator: In
+                values: [development]
+  # Include only tolerations required by your approved pool; this does not create taints.
+  tolerations:
+    - key: example.com/pool
+      operator: Equal
+      value: development
+      effect: NoSchedule
+ttl: 8h

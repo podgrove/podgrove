@@ -15,6 +15,7 @@ from podgrove.session_status import observed
 
 @pytest.fixture
 def recorded(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "capture_anchor", lambda *_: {"fixture": "owned-controller-and-pvc"})
     root = tmp_path / "project"
     root.mkdir()
     config_file = root / "podgrove.yml"
@@ -132,7 +133,7 @@ def test_up_after_exhausted_forward_recovery_reuses_owned_environment_names(reco
     resources, identity = kube.create_environment.call_args.args
     assert identity == data["identity"]
     assert {(item["kind"], item["metadata"]["name"]) for item in resources} == {
-        (kind, "pg-" + identity) for kind in ("NetworkPolicy", "PersistentVolumeClaim", "ConfigMap", "Service", "StatefulSet")}
+        (kind, "pg-" + identity) for kind in ("NetworkPolicy", "PersistentVolumeClaim", "ConfigMap", "Service", "PodDisruptionBudget", "StatefulSet")}
     assert all(item["metadata"]["namespace"] == data["namespace"] for item in resources)
 
 

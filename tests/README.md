@@ -27,10 +27,43 @@ Read `results.json` for each observed assertion and timing; `commands.log` retai
 | Stack and Docker daemon restart | Named-volume and mirrored-file persistence |
 | `fixtures/watch` | No `podgrove.yml`; `-f` alone, build-context upload, cached build, real remote `docker compose watch`, unchanged image after sync |
 | `fixtures/invalid` | Unknown Podgrove key and unsupported Compose host-network key rejected before a test engine is created |
+| `fixtures/recovery` | Missing-file startup failure, retained running service, then source mirroring before failed-service recovery |
 
 The Python edit fixture executes its tiny `live.py` module per request so the test measures transport latency without depending on an external framework. The watch fixture uses Compose's watcher over the remote Docker API. Neither measurement claims Vite or uvicorn itself was tested. The WebSocket fixture performs and validates an actual RFC 6455 handshake and masked echo frame, but the transport here is local Docker port publishing rather than Kubernetes port-forward.
 
 All fixture secret values are public, inert test strings. Never substitute production credentials into these fixtures.
+
+## Missing-file Docker recovery
+
+This opt-in integration test uses one disposable local Docker-in-Docker engine and the recovery fixture:
+
+```sh
+PODGROVE_RUN_DOCKER_E2E=1 python3 -m pytest tests/integration/test_startup_recovery_docker.py -q
+```
+
+It observes an exited service and an unhealthy service, creates the missing file, and checks that startup mirrors it before recovery while preserving the healthy container. The same local Unix-socket/privileged-container prerequisites apply. It cleans up its own Docker resources and never invokes Kubernetes.
+
+## Live connectivity and startup recovery
+
+Use a matching source checkout for the scripts and an absolute `PODGROVE_BIN` installed from a verified wheel in a separate versioned environment. Supply an approved existing namespace, namespace-scoped credentials through `KUBECONFIG`, an explicit storage class, and the current reviewed bootstrap/RBAC bundle with engine-protection permissions. Each output path must be new beneath an existing parent. See [live prerequisites and proof limits](../docs/verification.md#connectivity-and-startup-recovery).
+
+```sh
+python3 scripts/check_connectivity.py \
+  --podgrove-bin "$PODGROVE_BIN" \
+  --context your-development-context --namespace your-development-namespace \
+  --storage-class your-approved-storage-class \
+  --output /path/to/new-private-connectivity-evidence --execute
+
+python3 scripts/check_startup_recovery.py \
+  --podgrove-bin "$PODGROVE_BIN" \
+  --context your-development-context --namespace your-development-namespace \
+  --storage-class your-approved-storage-class \
+  --output /path/to/new-private-startup-evidence --execute
+```
+
+Connectivity uses **three simultaneous fresh engines** to test reverse-loopback HTTP, a declared link, and denied undeclared/third-engine traffic on the real CNI. Startup uses **three serial fresh engines** to test ordinary and forced refresh after a missing file arrives, diagnostic access to running services, individual annotation/PDB detection and repair, and one observed mid-build Pod replacement under the original controller/PVC identities. Each engine claims 2 GiB; the startup script cleans up one before starting the next. Protection mutation tests do not prove that an autoscaler will honor those safeguards.
+
+Both require explicit `--execute`, use private temporary worktrees/state, and attempt only their scoped `down`. Passing cleanup includes exact-name and labelled-resource absence, local state removal and captured-supervisor absence. Namespace/bootstrap resources remain; backing-volume deletion is not checked. A cleanup error preserves diagnostic evidence and fails the run. Read `result.json` and command logs before accepting a pass; neither script mutates Nodes or uses a broad reaper.
 
 
 ## Live exec export acceptance

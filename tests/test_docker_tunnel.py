@@ -36,8 +36,8 @@ class FakeKube:
 
     def call(self, *args, **kwargs):
         self.reads.append(args)
-        assert kwargs["timeout"] == REQUEST_PROCESS_TIMEOUT
-        assert kwargs["check"] is False and isinstance(kwargs["cancel_event"], threading.Event)
+        assert 0 < kwargs["timeout"] <= REQUEST_PROCESS_TIMEOUT
+        assert kwargs["check"] is False and callable(getattr(kwargs["cancel_event"], "is_set", None))
         assert args[0] == "get" and args[1] in ("statefulset", "pod")
         return subprocess.CompletedProcess(args, 0, json.dumps(self.controller if args[1] == "statefulset" else self.pod), "")
 

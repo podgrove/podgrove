@@ -15,6 +15,7 @@ from podgrove.session_status import observed
 
 @pytest.fixture
 def session(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "capture_anchor", lambda *_: {"fixture": "owned-controller-and-pvc"})
     root = tmp_path / "worktree"
     root.mkdir()
     (root / "podgrove.yml").write_text("cluster: {context: test, namespace: approved}\n")

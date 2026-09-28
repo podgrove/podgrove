@@ -14,6 +14,7 @@ from podgrove.kube import engine_pod_manifest
 
 @pytest.fixture
 def project(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "capture_anchor", lambda *_: {"fixture": "owned-controller-and-pvc"})
     root = tmp_path / "project"
     root.mkdir()
     (root / "compose.yaml").write_text("services:\n  app:\n    image: busybox:1.37\n")

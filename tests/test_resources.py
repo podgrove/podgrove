@@ -227,6 +227,7 @@ def test_doctor_passes_custom_budgets_and_pvc_settings_to_admission(project, mon
 
 
 def test_up_records_effective_budget_and_reuses_yaml_capacity(project, monkeypatch):
+    monkeypatch.setattr(cli, "capture_anchor", lambda kube, ident: {"identity": ident})
     configure(project, resources=CUSTOM, init_resources=INIT, storage={"size": "40Gi"})
     kube = Mock()
     monkeypatch.setattr(cli, "Kube", Mock(return_value=kube))
@@ -252,6 +253,7 @@ def test_up_records_effective_budget_and_reuses_yaml_capacity(project, monkeypat
 
 
 def test_reconnecting_retained_pvc_records_its_reused_storage_class(project, monkeypatch):
+    monkeypatch.setattr(cli, "capture_anchor", lambda kube, ident: {"identity": ident})
     configure(project, storage={"size": "40Gi"})
     config_path = project / "podgrove.yml"
     config = yaml.safe_load(config_path.read_text())

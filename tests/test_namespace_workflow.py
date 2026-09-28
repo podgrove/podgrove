@@ -27,6 +27,7 @@ RESOURCES = {
     "StatefulSet": ("statefulsets", "apps"), "Pod": ("pods", ""),
     "PersistentVolumeClaim": ("persistentvolumeclaims", ""), "ConfigMap": ("configmaps", ""),
     "NetworkPolicy": ("networkpolicies", "networking.k8s.io"), "Service": ("services", ""),
+    "PodDisruptionBudget": ("poddisruptionbudgets", "policy"),
 }
 CLUSTER_KINDS = {"Namespace", "StorageClass", "ClusterRole", "ClusterRoleBinding",
                  "ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"}
@@ -93,7 +94,7 @@ class MemoryCluster:
         if verb == "auth":
             assert args[1] == "can-i"
             resource, _, group = args[3].partition(".")
-            assert resource in {"pods", "pods/exec", "pods/portforward", "statefulsets", "services", "persistentvolumeclaims", "networkpolicies", "configmaps"}
+            assert resource in {"pods", "pods/exec", "pods/portforward", "statefulsets", "services", "persistentvolumeclaims", "networkpolicies", "configmaps", "poddisruptionbudgets"}
             permitted = self.allowed(kube.namespace, args[2], resource, group)
             return result("yes\n" if permitted else "no\n", 0 if permitted else 1)
         if verb == "get":
@@ -113,7 +114,7 @@ class MemoryCluster:
             resource, group = RESOURCES[body["kind"]]
             assert self.allowed(kube.namespace, "create", resource, group)
             if "--dry-run=server" in args:
-                assert body["kind"] == "Pod"
+                assert body["kind"] in ("Pod", "PodDisruptionBudget")
                 return result(json.dumps(body))
             assert self.key(body) not in self.objects
             self.mutations.append((kube.namespace, "create", body["kind"], body["metadata"]["name"]))
@@ -237,7 +238,7 @@ def test_two_worktrees_bootstrap_up_down_retain_platform_and_other_worktree(tmp_
     assert workflow.objects == {**platform, MemoryCluster.key(foreign): before[MemoryCluster.key(foreign)]}
     assert not list(state.state_home(create=False).glob("*"))
     deleted_kinds = {kind for _, verb, kind, _ in workflow.mutations if verb == "delete"}
-    assert deleted_kinds == {"StatefulSet", "PersistentVolumeClaim", "ConfigMap", "NetworkPolicy", "Service"}
+    assert deleted_kinds == {"StatefulSet", "PersistentVolumeClaim", "ConfigMap", "NetworkPolicy", "Service", "PodDisruptionBudget"}
     assert any("--dry-run=server" in args for _, args in workflow.calls)
 
 

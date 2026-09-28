@@ -15,6 +15,7 @@ from .errors import PodgroveError
 from .network import policy_spec
 from .bootstrap import PROVISIONING_MARKER
 from .process import run
+from .placement import placement_spec
 from .repository import repository_labels
 from .resources import engine_resources, initializer_resources, quantity_text, same_resources
 
@@ -23,6 +24,8 @@ ENVIRONMENT = "podgrove.dev/environment"
 DEDICATED = "podgrove.dev/dedicated"
 NODE_MODE = "podgrove.dev/node-mode"
 IMAGE = "docker:29.5.2-dind"
+ENGINE_ANNOTATIONS = {"cluster-autoscaler.kubernetes.io/safe-to-evict": "false",
+                      "autoscaling.cast.ai/removal-disabled": "true"}
 REQUEST_TIMEOUT = 30
 # Allow kubectl to finish its request and authentication/cleanup work before
 # the local subprocess deadline expires.
@@ -158,12 +161,14 @@ def manifests(namespace: str, ident: str, root: Path, size: str, ttl: int,
               *, storage_class: str | None = None, storage: str = "20Gi", mr_url: str = "",
               node_mode: str = "shared", tainted_nodes: dict | None = None,
               namespace_mode: str | None = None, network: dict | None = None,
-              resources: dict | None = None, init_resources: dict | None = None) -> list[dict]:
+              resources: dict | None = None, init_resources: dict | None = None,
+              placement: dict | None = None) -> list[dict]:
     namespace_name(namespace)
     namespace_mode = resolve_namespace_mode(namespace, namespace_mode)
     if node_mode not in ("shared", "tainted"):
         raise PodgroveError("node_mode must be shared or tainted")
-    placement = tainted_placement(tainted_nodes)
+    tainted = tainted_placement(tainted_nodes)
+    scheduling = placement_spec(placement, node_mode=node_mode, tainted_nodes=tainted)
     if not re.fullmatch(r"[a-f0-9]{12}", ident):
         raise PodgroveError("Invalid environment identity")
     if len(root.parts) < 3 or ":" in str(root) or "\n" in str(root) or any(root == Path(p) or Path(p) in root.parents
@@ -190,12 +195,7 @@ def manifests(namespace: str, ident: str, root: Path, size: str, ttl: int,
         "apiVersion": "v1", "kind": "Pod", "metadata": meta(),
         "spec": {
             "automountServiceAccountToken": False, "enableServiceLinks": False,
-            "nodeSelector": {"kubernetes.io/os": "linux", **(placement["selector"] if node_mode == "tainted" else {})},
-            "affinity": {"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": [{
-                "matchExpressions": [{"key": "eks.amazonaws.com/compute-type", "operator": "NotIn", "values": ["fargate", "auto"]}]
-            }]}}},
-            "tolerations": ([{"operator": "Equal", **placement["taint"]}]
-                            if node_mode == "tainted" else []),
+            **scheduling,
             "terminationGracePeriodSeconds": 90,
             "initContainers": [{"name": "storage", "image": "alpine:3.21",
                 "command": ["sh", "-ec", "mkdir -p /data/docker /data/worktree"],
@@ -230,9 +230,11 @@ def manifests(namespace: str, ident: str, root: Path, size: str, ttl: int,
     controller = {"apiVersion": "apps/v1", "kind": "StatefulSet", "metadata": meta(),
                   "spec": {"replicas": 1, "serviceName": name, "selector": {"matchLabels": selector.copy()},
                            "updateStrategy": {"type": "OnDelete"},
-                           "template": {"metadata": {"labels": labels.copy()}, "spec": pod["spec"]}}}
+                           "template": {"metadata": {"labels": labels.copy(), "annotations": ENGINE_ANNOTATIONS.copy()}, "spec": pod["spec"]}}}
+    protection = {"apiVersion": "policy/v1", "kind": "PodDisruptionBudget", "metadata": meta(),
+                  "spec": {"maxUnavailable": 0, "selector": {"matchLabels": selector.copy()}}}
     return [policy, {"apiVersion": "v1", "kind": "PersistentVolumeClaim", "metadata": meta(), "spec": pvc_spec},
-            lease, service, controller]
+            lease, service, protection, controller]
 
 
 class Kube:
@@ -266,8 +268,9 @@ class Kube:
         # the namespace-scoped runtime identity; Pod status reports scheduling.
         for resource, verb in (("pods", "create"), ("pods/portforward", "create"), ("pods/portforward", "get"),
                                ("pods/exec", "create"), ("pods/exec", "get"), ("statefulsets.apps", "create"),
-                               ("statefulsets.apps", "delete"), ("services", "create"), ("persistentvolumeclaims", "create"),
-                               ("networkpolicies.networking.k8s.io", "create"), ("configmaps", "create")):
+                               ("statefulsets.apps", "delete"), ("statefulsets.apps", "patch"), ("pods", "patch"), ("services", "create"), ("persistentvolumeclaims", "create"),
+                               ("networkpolicies.networking.k8s.io", "create"), ("configmaps", "create"),
+                               *(("poddisruptionbudgets.policy", verb) for verb in ("get", "list", "create", "update", "delete"))):
             result = self.call("auth", "can-i", verb, resource, check=False)
             if result.returncode or result.stdout.strip() != "yes":
                 raise PodgroveError(f"Kubernetes access missing: {verb} {resource} in {self.namespace}")
@@ -418,6 +421,9 @@ class Kube:
             if existing.get("metadata", {}).get("deletionTimestamp"):
                 raise PodgroveError("Existing StatefulSet is being deleted; wait for cleanup before recreating the environment")
             expected_spec = copy.deepcopy(resource["spec"])
+            expected_annotations = expected_spec.get("template", {}).get("metadata", {}).get("annotations", {})
+            for key in ENGINE_ANNOTATIONS:
+                expected_annotations.pop(key, None)
             # Repo/branch labels are creation-time advice, not engine settings.
             # A local checkout change must not force destructive recreation or
             # roll the existing controller merely to refresh these two labels.
@@ -425,7 +431,7 @@ class Kube:
                 expected_spec.get("template", {}).get("metadata", {}).get("labels", {}).pop(key, None)
             if not matches(expected_spec, existing.get("spec", {})):
                 raise PodgroveError(
-                    "Existing StatefulSet uses different engine settings (node_mode, tainted_nodes, resources, init_resources, image or storage); "
+                    "Existing StatefulSet uses different engine settings (node_mode, tainted_nodes, placement, resources, init_resources, image or storage); "
                     "live resizing is not supported. The existing controller was left unchanged. "
                     "Restore its settings or plan an explicit recreation after saving data; down deletes environment data."
                 )
@@ -469,6 +475,95 @@ class Kube:
             if not existing:
                 raise PodgroveError("The running session's engine controller is missing; resources were left unchanged")
             self._validate_existing(resource, existing, metadata["labels"][ENVIRONMENT])
+
+    def _protection_observations(self, resources: list[dict], ident: str) -> tuple[dict, dict, dict, dict]:
+        if not isinstance(ident, str) or not re.fullmatch(r"[a-f0-9]{12}", ident):
+            raise PodgroveError("Invalid environment identity for engine protection")
+        controllers = [item for item in resources if item.get("kind") == "StatefulSet"]
+        budgets = [item for item in resources if item.get("kind") == "PodDisruptionBudget"]
+        if len(controllers) != 1 or len(budgets) != 1:
+            raise PodgroveError("Engine protection requires exactly one StatefulSet and PodDisruptionBudget")
+        desired, budget = controllers[0], budgets[0]
+        for resource in (desired, budget):
+            self._protection_identity(resource, ident, uid_required=False)
+        selector = {"matchLabels": {MANAGED: "podgrove", ENVIRONMENT: ident}}
+        if budget.get("apiVersion") != "policy/v1" or budget.get("spec") != {"maxUnavailable": 0, "selector": selector}:
+            raise PodgroveError("Engine protection requires maxUnavailable 0 and the exact environment selector")
+        annotations = desired.get("spec", {}).get("template", {}).get("metadata", {}).get("annotations", {})
+        if any(annotations.get(key) != value for key, value in ENGINE_ANNOTATIONS.items()):
+            raise PodgroveError("Engine template is missing required eviction protection annotations")
+        existing = self.get("StatefulSet", f"pg-{ident}")
+        pod, current_budget = {}, {}
+        if existing:
+            self._protection_identity(existing, ident)
+            self._validate_existing(desired, existing, ident)
+            pod = self.get("pod", engine_pod_name(ident))
+            if pod:
+                self._protection_identity(pod, ident, pod=True)
+                self._validate_pod_controller(pod, existing, ident)
+        current_budget = self.get("PodDisruptionBudget", f"pg-{ident}")
+        if current_budget:
+            self._protection_identity(current_budget, ident)
+        return existing, pod, current_budget, budget
+
+    def _protection_identity(self, resource: dict, ident: str, *, pod: bool = False, uid_required: bool = True) -> None:
+        metadata = resource.get("metadata", {})
+        labels = metadata.get("labels", {})
+        expected = engine_pod_name(ident) if pod else f"pg-{ident}"
+        if (metadata.get("name") != expected or metadata.get("namespace") != self.namespace
+                or metadata.get("deletionTimestamp") or labels.get(MANAGED) != "podgrove"
+                or labels.get(ENVIRONMENT) != ident
+                or (uid_required and (not isinstance(metadata.get("uid"), str) or not metadata["uid"]
+                                      or not isinstance(metadata.get("resourceVersion"), str) or not metadata["resourceVersion"]))):
+            raise PodgroveError("Engine protection target is foreign, incomplete, changed, or being deleted")
+
+    def _patch_engine_annotations(self, kind: str, resource: dict) -> None:
+        metadata = resource["metadata"]
+        location = "/spec/template/metadata/annotations" if kind == "statefulset" else "/metadata/annotations"
+        target = resource["spec"]["template"]["metadata"] if kind == "statefulset" else metadata
+        existing = target.get("annotations", {})
+        if not isinstance(existing, dict):
+            raise PodgroveError("Engine protection annotations are malformed")
+        if all(existing.get(key) == value for key, value in ENGINE_ANNOTATIONS.items()):
+            return
+        patch = [{"op": "test", "path": "/metadata/uid", "value": metadata["uid"]},
+                 {"op": "test", "path": "/metadata/resourceVersion", "value": metadata["resourceVersion"]}]
+        if "annotations" not in target:
+            patch.append({"op": "add", "path": location, "value": ENGINE_ANNOTATIONS.copy()})
+        else:
+            for key, value in ENGINE_ANNOTATIONS.items():
+                if existing.get(key) != value:
+                    escaped = key.replace("~", "~0").replace("/", "~1")
+                    patch.append({"op": "add", "path": f"{location}/{escaped}", "value": value})
+        self.call("patch", kind, metadata["name"], "--type=json", "-p", json.dumps(patch))
+
+    def reconcile_engine_protection(self, resources: list[dict], ident: str) -> None:
+        """Repair owned eviction safeguards without replacing or restarting Pods."""
+        controller, pod, current, desired = self._protection_observations(resources, ident)
+        if not controller:
+            raise PodgroveError("Cannot repair engine protection before its controller exists")
+        if not current:
+            self.call("create", "-f", "-", input=json.dumps(desired))
+        elif current.get("spec") != desired["spec"]:
+            updated = copy.deepcopy(desired)
+            updated["metadata"].update(uid=current["metadata"]["uid"], resourceVersion=current["metadata"]["resourceVersion"])
+            self.call("replace", "-f", "-", input=json.dumps(updated))
+        self._patch_engine_annotations("statefulset", controller)
+        if pod:
+            self._patch_engine_annotations("pod", pod)
+
+    def check_engine_protection(self, resources: list[dict], ident: str) -> None:
+        """Detect absent safeguards on existing engines without performing writes."""
+        controller, pod, current, desired = self._protection_observations(resources, ident)
+        if not controller:
+            return
+        targets = [controller.get("spec", {}).get("template", {}).get("metadata", {})]
+        if pod:
+            targets.append(pod["metadata"])
+        if (not current or current.get("spec") != desired["spec"]
+                or any(any(target.get("annotations", {}).get(key) != value for key, value in ENGINE_ANNOTATIONS.items())
+                       for target in targets)):
+            raise PodgroveError("Existing engine eviction protection is missing or changed; run up to repair its owned annotations and PodDisruptionBudget without restarting the engine")
 
     def check_admission(self, resources: list[dict]) -> None:
         """Ask admission about new engines before provisioning supporting objects.
@@ -516,6 +611,22 @@ class Kube:
                     "admission permission for privileged pods; changing node scheduling does not bypass "
                     f"admission policy. Server detail: {exc}"
                 ) from exc
+
+        for resource in resources:
+            if resource.get("kind") != "PodDisruptionBudget":
+                continue
+            existing = self.get("PodDisruptionBudget", resource["metadata"]["name"])
+            candidate = copy.deepcopy(resource)
+            operation = "create"
+            if existing:
+                ident = resource["metadata"]["labels"][ENVIRONMENT]
+                self._protection_identity(existing, ident)
+                candidate["metadata"].update(uid=existing["metadata"]["uid"], resourceVersion=existing["metadata"]["resourceVersion"])
+                operation = "replace"
+            try:
+                self.call(operation, "--dry-run=server", "-f", "-", input=json.dumps(candidate))
+            except PodgroveError as exc:
+                raise PodgroveError(f"Kubernetes admission preflight failed for the engine PodDisruptionBudget in {self.namespace}: {exc}") from exc
 
     def reconcile_network_policy(self, resources: list[dict], ident: str) -> None:
         """Restore this engine's exact allow rules, including on idempotent up.
@@ -584,11 +695,19 @@ class Kube:
                 self._validate_existing(resource, existing, ident)
             existing_resources.append(existing)
         self.check_storage(resources)
+        if any(resource["kind"] == "StatefulSet" and existing for resource, existing in zip(resources, existing_resources)):
+            self.reconcile_engine_protection(resources, ident)
         for resource, existing in zip(resources, existing_resources):
+            if resource["kind"] == "PodDisruptionBudget" and any(
+                candidate["kind"] == "StatefulSet" and observed for candidate, observed in zip(resources, existing_resources)
+            ):
+                continue
             if existing:
                 if resource["kind"] in ("StatefulSet", "PersistentVolumeClaim", "Service"):
                     continue
                 resource["metadata"]["resourceVersion"] = existing["metadata"]["resourceVersion"]
+                if resource["kind"] == "PodDisruptionBudget":
+                    resource["metadata"]["uid"] = existing["metadata"]["uid"]
                 self.call("replace", "-f", "-", input=json.dumps(resource))
             else:
                 # Conflict if another actor won the name, never adopt it through apply.
@@ -714,4 +833,4 @@ class Kube:
         # Retain namespace and administrator bootstrap objects in EVERY mode,
         # including legacy exclusive records. Neither needs cluster-scoped access.
         # Fixed resource types and a conjunctive owner selector; never delete all.
-        self.call("delete", "pod,pvc,configmap,networkpolicy,service", "-l", selector, "--ignore-not-found", "--wait=true", "--timeout=120s", timeout=130)
+        self.call("delete", "pod,pvc,configmap,networkpolicy,service,poddisruptionbudget", "-l", selector, "--ignore-not-found", "--wait=true", "--timeout=120s", timeout=130)

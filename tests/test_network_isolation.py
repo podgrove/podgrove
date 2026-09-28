@@ -292,7 +292,7 @@ def test_actual_cleanup_retains_bootstrap_policy_and_namespace_but_removes_owned
         canonical = {"configmap": "ConfigMap"}[kind]
         return next((item for item in remaining if item["kind"] == canonical and item["metadata"]["name"] == name), {})
     aliases = {"statefulset": "StatefulSet", "pod": "Pod", "pvc": "PersistentVolumeClaim",
-               "configmap": "ConfigMap", "networkpolicy": "NetworkPolicy", "service": "Service"}
+               "configmap": "ConfigMap", "networkpolicy": "NetworkPolicy", "service": "Service", "poddisruptionbudget": "PodDisruptionBudget"}
     def delete(*args, **kwargs):
         assert args[0] == "delete" and args[1] != "namespace"
         assert "--all" not in args

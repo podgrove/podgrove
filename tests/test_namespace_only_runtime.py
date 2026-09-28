@@ -28,6 +28,7 @@ class NamespaceOnlyAPI:
         "persistentvolumeclaims": "PersistentVolumeClaim", "configmap": "ConfigMap", "configmaps": "ConfigMap",
         "service": "Service", "services": "Service", "networkpolicy": "NetworkPolicy",
         "networkpolicies.networking.k8s.io": "NetworkPolicy",
+        "poddisruptionbudget": "PodDisruptionBudget", "poddisruptionbudgets.policy": "PodDisruptionBudget",
     }
 
     def __init__(self, mode):

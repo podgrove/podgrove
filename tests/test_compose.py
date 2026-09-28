@@ -34,6 +34,29 @@ def test_command_preserves_file_order_and_project_directory(project):
     ]
 
 
+def test_managed_overlay_is_appended_without_changing_original_files(project):
+    original = list(project.config.files)
+    contents = [path.read_bytes() for path in original]
+    overlay = project.config.root / "managed.json"
+    overlay.write_text('{"services":{"app":{"extra_hosts":["fixture:host-gateway"]}}}')
+    project.overlay_files.append(overlay)
+    command = project.command("up", "--detach")
+    files = [command[index + 1] for index, part in enumerate(command) if part == "--file"]
+    assert files == [*(str(path) for path in original), str(overlay)]
+    assert project.config.files == original
+    assert [path.read_bytes() for path in original] == contents
+
+
+def test_optional_symlink_hint_names_the_working_exclusion(project):
+    source = project.config.root / "src"
+    (source / "optional-link").symlink_to("/absent/outside")
+    model = {"services": {"app": {"volumes": [{"type": "bind", "source": str(source), "target": "/app"}]}}}
+    with pytest.raises(PodgroveError, match=r"sync\.exclude"):
+        project.validate(model)
+    project.config.sync_exclude = ["src/optional-link"]
+    project.validate(model)
+
+
 def test_model_uses_compose_json_and_preserves_optional_env_metadata(project):
     model = base_model()
     model["services"]["app"]["env_file"] = [{"path": str(project.config.root / "optional.env"), "required": False}]

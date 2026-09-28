@@ -26,7 +26,8 @@ import jsonschema
 import yaml
 
 from . import state
-from .config import CONFIG_SCHEMA, _UniqueLoader, default_tainted_nodes
+from .config import CONFIG_SCHEMA, _UniqueLoader, default_tainted_nodes, normalize_connect, normalize_reverse
+from .placement import placement_spec, validate_placement
 from .errors import PodgroveError
 from .kube import ENVIRONMENT, MANAGED, Kube, context_name, engine_pod_name, namespace_name, validate_tainted_nodes
 from .network import network_settings
@@ -200,6 +201,8 @@ def _configuration_settings(raw: bytes, root: Path) -> dict:
     placement["selector"] = configured.get("selector", placement["selector"])
     placement["taint"].update(configured.get("taint", {}))
     validate_tainted_nodes(placement)
+    selected_placement = validate_placement(data.get("placement"))
+    placement_spec(selected_placement, node_mode=data.get("node_mode", "shared"), tainted_nodes=placement)
     compose = data.get("compose", {})
     files = ([_relative_config_path(root, name) for name in compose["files"]]
              if "files" in compose else None)
@@ -221,6 +224,8 @@ def _configuration_settings(raw: bytes, root: Path) -> dict:
             "storage": {"size": quantity_text(data.get("storage", {}).get("size", "20Gi"), "storage.size")},
             "sync": {"exclude": validate_patterns(data.get("sync", {}).get("exclude", []))},
             "network": network_settings(data.get("network")),
+            "placement": selected_placement,
+            "reverse": normalize_reverse(data.get("reverse", [])), "connect": normalize_connect(data.get("connect", [])),
             "tainted_nodes": placement if data.get("node_mode") == "tainted" else None,
             "ttl_seconds": ttl, "compose": {"files": files, "profiles": profiles,
                                                "project_directory": _relative_config_path(root, compose.get("project_directory", "."))},

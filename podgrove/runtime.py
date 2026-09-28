@@ -17,7 +17,7 @@ from . import state
 from .activity import WatchActivity
 from .compose import Compose
 from .config import load_config
-from .docker_tunnel import DockerTunnel
+from .docker_tunnel import DockerTunnel, EngineReplacedError
 from .errors import PodgroveError
 from .forward import PortMappingError, Tunnel, free_port, port_plan, verify_port_mappings
 from .kube import HeartbeatUnavailable, Kube
@@ -26,6 +26,7 @@ from .reaper import reason
 from .sync import SnapshotRace, Synchronizer
 from .sync_recovery import SyncRecoveryUnavailable, verify_engine as verify_sync_engine
 from .sync_transport import SyncStreamError
+from .startup_recovery import StartupRecovery
 
 HEALTH_INTERVAL = 30.0
 HEARTBEAT_RETRY_DELAYS = (1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
@@ -43,6 +44,14 @@ class TransientDockerReadError(PodgroveError):
 
 class SessionStopped(Exception):
     """Authenticated cancellation of an in-progress session operation."""
+
+
+class StartupIncomplete(PodgroveError):
+    """Retain a mirrored engine for diagnosis after an application startup failure."""
+
+    def __init__(self, error, sync, elapsed, rows):
+        super().__init__(str(error))
+        self.sync, self.elapsed, self.rows = sync, elapsed, rows
 
 
 class SyncWorker:
@@ -162,13 +171,74 @@ class SyncWorker:
             raise PodgroveError("File sync worker did not stop; refusing concurrent helper cleanup")
 
 
-def service_status(compose: Compose, env: dict) -> list[dict]:
+class _StartupKube:
+    """Bound initial Docker tunnel reads without shortening its later monitor."""
+
+    def __init__(self, kube, deadline, cancelled):
+        self.kube, self.deadline, self.cancelled = kube, deadline, cancelled
+
+    def __getattr__(self, name):
+        return getattr(self.kube, name)
+
+    def call(self, *args, **kwargs):
+        stopped = kwargs.get("cancel_event")
+        outer = self.cancelled
+
+        class Cancelled:
+            def is_set(self):
+                return outer.is_set() or (stopped is not None and stopped.is_set())
+
+        combined = Cancelled()
+        kwargs["timeout"] = min(kwargs.get("timeout", 60), _startup_remaining(self.deadline, combined))
+        kwargs["cancel_event"] = combined
+        result = self.kube.call(*args, **kwargs)
+        _startup_remaining(self.deadline, combined)
+        return result
+
+
+def _startup_remaining(deadline, cancel):
+    if cancel is not None and cancel.is_set():
+        raise PodgroveError("Stack startup cancelled")
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise PodgroveError("Stack startup deadline expired")
+    return left
+
+
+def _initial_sync(sync, deadline, cancel):
+    finished = threading.Event()
+
+    def watch():
+        while not finished.wait(.05):
+            if (cancel is not None and cancel.is_set()) or time.monotonic() >= deadline:
+                sync.cancel()
+                return
+
+    monitor = threading.Thread(target=watch, name="podgrove-initial-sync-budget", daemon=True)
+    _startup_remaining(deadline, cancel)
+    monitor.start()
+    try:
+        sync.start()
+        _startup_remaining(deadline, cancel)
+    finally:
+        finished.set()
+        monitor.join(3)
+        if monitor.is_alive():
+            raise PodgroveError("Initial sync cancellation did not finish")
+
+
+def service_status(compose: Compose, env: dict, *, deadline=None, cancel_event=None) -> list[dict]:
     # Only this read is replayable. Build/up/exec and sync transfers can mutate
     # remote state and must never inherit this retry policy.
     for attempt in range(len(STATUS_RETRY_DELAYS) + 1):
         try:
+            timeout = STATUS_READ_TIMEOUT if deadline is None else min(
+                STATUS_READ_TIMEOUT, _startup_remaining(deadline, cancel_event))
+            kwargs = {"cancel_event": cancel_event} if cancel_event is not None else {}
             output = run(compose.command("ps", "--all", "--format", "json"), env=env,
-                         cwd=compose.config.root, timeout=STATUS_READ_TIMEOUT).stdout.strip()
+                         cwd=compose.config.root, timeout=timeout, **kwargs).stdout.strip()
+            if deadline is not None:
+                _startup_remaining(deadline, cancel_event)
             break
         except PodgroveError as exc:
             if not _TRANSIENT_READ.search(str(exc)):
@@ -177,7 +247,13 @@ def service_status(compose: Compose, env: dict) -> list[dict]:
                 raise TransientDockerReadError(
                     f"Docker status temporarily unavailable after {attempt + 1} read attempts; "
                     "retry status. The read did not stop the session.") from exc
-            time.sleep(STATUS_RETRY_DELAYS[attempt])
+            delay = STATUS_RETRY_DELAYS[attempt]
+            if deadline is not None:
+                delay = min(delay, _startup_remaining(deadline, cancel_event))
+            if cancel_event is not None:
+                cancel_event.wait(delay)
+            else:
+                time.sleep(delay)
     if not output:
         return []
     try:
@@ -222,39 +298,82 @@ def _startup_phase(message: str) -> None:
     print(f"Startup: {message}", flush=True)
 
 
-def launch_stack(compose: Compose, model: dict, env: dict, ident: str, timeout: int = 600):
+def launch_stack(compose: Compose, model: dict, env: dict, ident: str, timeout: int = 600, *,
+                 deadline=None, cancel_event=None):
+    deadline = deadline if deadline is not None else time.monotonic() + timeout * 3 + 120
+    cancel = cancel_event if cancel_event is not None else threading.Event()
+    _startup_remaining(deadline, cancel)
     sync = Synchronizer(compose.config.root, compose.sync_paths(model), env, ident,
                         exclude=getattr(compose.config, "sync_exclude", []))
+    mirrored, started = False, time.monotonic()
+    completed_jobs = {name for svc in model["services"].values()
+                      for name, dependency in svc.get("depends_on", {}).items()
+                      if isinstance(dependency, dict)
+                      and dependency.get("condition") == "service_completed_successfully"}
     try:
         _startup_phase("copying the initial workspace snapshot")
-        sync.start()
-        started = time.monotonic()
+        _initial_sync(sync, min(deadline, time.monotonic() + timeout), cancel)
+        mirrored = True
+        if getattr(compose, "recover_existing", False) is True:
+            _startup_phase("checking existing Compose services")
+            previous = service_status(compose, env, deadline=deadline, cancel_event=cancel)
+            failed = sorted({row["Service"] for row in previous
+                             if row.get("Service") in model["services"]
+                             and (model.get("name") is None or row.get("Project") == model["name"])
+                             and (row.get("Health") == "unhealthy" or row.get("State") == "exited")
+                             and not (row["Service"] in completed_jobs and row.get("State") == "exited"
+                                      and int(row.get("ExitCode", 1)) == 0)})
+            if failed:
+                _startup_phase("recreating failed Compose services after source synchronization")
+                run(compose.command("up", "--detach", "--build", "--force-recreate", "--no-deps", *failed),
+                    env=env, cwd=compose.config.root, timeout=min(timeout, _startup_remaining(deadline, cancel)),
+                    cancel_event=cancel)
         _startup_phase("building and starting Compose services")
-        result = run(compose.command("up", "--detach", "--build"), env=env, cwd=compose.config.root, timeout=timeout)
+        result = run(compose.command("up", "--detach", "--build"), env=env, cwd=compose.config.root,
+                     timeout=min(timeout, _startup_remaining(deadline, cancel)), cancel_event=cancel)
         stdout, stderr = _remote_build_output(result.stdout), _remote_build_output(result.stderr)
         if stdout:
             print(stdout, flush=True)
         if stderr:
             print(stderr, file=sys.stderr, flush=True)
-        deadline = time.monotonic() + timeout
+        _startup_remaining(deadline, cancel)
         _startup_phase("waiting for Compose service readiness")
+        health_deadline = min(deadline, time.monotonic() + timeout)
         while True:
-            rows = service_status(compose, env)
+            rows = service_status(compose, env, deadline=health_deadline, cancel_event=cancel)
+            _startup_remaining(health_deadline, cancel)
             ready, problems = readiness(model, rows)
             if ready:
                 return sync, time.monotonic() - started, rows
-            if time.monotonic() >= deadline:
-                raise PodgroveError("Stack not ready: " + "; ".join(problems))
             # Surface unrecoverable failures rather than waiting for the entire timeout.
-            if any(r.get("State") == "exited" and int(r.get("ExitCode", 0)) != 0 for r in rows):
+            if any(r.get("Health") == "unhealthy" or r.get("State") == "dead"
+                   or (r.get("State") == "exited"
+                       and not (r.get("Service") in completed_jobs and int(r.get("ExitCode", 1)) == 0)) for r in rows):
                 raise PodgroveError("Stack container failed: " + "; ".join(problems))
-            time.sleep(1)
-    except BaseException:
+            cancel.wait(min(1, _startup_remaining(health_deadline, cancel)))
+    except BaseException as error:
+        if mirrored and isinstance(error, PodgroveError):
+            try:
+                _startup_remaining(deadline, cancel)
+                rows = service_status(compose, env, deadline=deadline, cancel_event=cancel)
+            except PodgroveError:
+                rows = []
+            raise StartupIncomplete(error, sync, time.monotonic() - started, rows) from error
         try:
             sync.close()
         except Exception as cleanup_error:
             print(f"Sync cleanup after stack failure: {cleanup_error}", file=sys.stderr, flush=True)
         raise
+
+
+def partial_port_plan(compose, model, rows, ident):
+    """Retain diagnostic access to running services while reporting their health separately."""
+    running = {row.get("Service") for row in rows if row.get("State") == "running"}
+    published = [port for port in compose.published_ports(model) if port["service"] in running]
+    configured = compose.config.forward
+    if configured is not None:
+        configured = [port for port in configured if port["service"] in running]
+    return port_plan(published, configured, ident, observed=rows, project=model.get("name"))
 
 
 def failure_detail(error: BaseException, tunnels: list) -> str:
@@ -340,6 +459,7 @@ def serve(path: Path) -> int:
     data = state.read(path)
     state.validate_binding(data, Path(data.get("root", "")), data.get("context", ""))
     stopping = False
+    startup_cancel = threading.Event()
     tearing_down = False
     exit_code = 0
     last_touch = 0.0
@@ -348,6 +468,7 @@ def serve(path: Path) -> int:
     def stop_signal(*_):
         nonlocal stopping
         stopping = True
+        startup_cancel.set()
         if not tearing_down:
             raise SessionStopped("Session cancelled")
     signal.signal(signal.SIGTERM, stop_signal)
@@ -362,6 +483,7 @@ def serve(path: Path) -> int:
     sync_worker = None
     app_tunnel = None
     api_tunnel = None
+    connectivity = None
     services_ready = True
 
     def persist():
@@ -379,6 +501,8 @@ def serve(path: Path) -> int:
                     port["status"] = data["forward_status"]["state"]
             if sync_worker is not None:
                 data["sync_status"] = sync_worker.status()
+            if connectivity is not None:
+                data["connectivity_status"] = connectivity.snapshot()
             session_health()
             state.write(path, data)
 
@@ -389,6 +513,7 @@ def serve(path: Path) -> int:
                     or data.get("sync_status", {}).get("state") in ("retrying", "reconnecting", "disconnected")
                     or data.get("health_status", {}).get("state") == "unavailable"
                     or data.get("heartbeat_status", {}).get("state") == "unavailable"
+                    or data.get("connectivity_status", {}).get("state") not in (None, "ready", "disabled")
                     or data.get("docker_status", {}).get("verification", {}).get("state") in ("unavailable", "expired"))
         data["status"] = "degraded" if degraded else "ready" if services_ready else "unhealthy"
 
@@ -432,6 +557,7 @@ def serve(path: Path) -> int:
                             accepted = action in ("stop", "ping", "touch") and not stopping
                             if accepted and action == "stop":
                                 stopping = True
+                                startup_cancel.set()
                                 cancel_session = True
                             elif accepted and action == "touch":
                                 last_touch = time.time()
@@ -448,6 +574,8 @@ def serve(path: Path) -> int:
                                 response["heartbeat_status"] = dict(data["heartbeat_status"])
                             if api_tunnel is not None:
                                 response["docker_status"] = api_tunnel.snapshot()
+                            if connectivity is not None:
+                                response["connectivity_status"] = connectivity.snapshot()
                     client.sendall(json.dumps(response).encode())
                 except (OSError, ValueError):
                     pass
@@ -472,26 +600,114 @@ def serve(path: Path) -> int:
         compose = Compose(config)
         model = compose.model()
         compose.validate(model)
-        _startup_phase("waiting for engine Pod readiness")
-        kube.wait(data["identity"], data["timeout"])
-        api_port = free_port()
-        _startup_phase("opening the Docker API connection")
-        api_tunnel = DockerTunnel(kube, data["identity"], api_port).start()
-        tunnels.append(api_tunnel)
-        persist()  # Capture immutable engine UIDs before info, initial sync or a long build.
-        env = docker_environment(f"tcp://127.0.0.1:{api_port}")
-        # Explicitly target the engine throughout. Never select or mutate a Docker context.
-        _startup_phase("checking Docker engine readiness")
-        run(["docker", "info"], env=env, timeout=30)
-        sync, elapsed, rows = launch_stack(compose, model, env, data["identity"], data["timeout"])
+        compose.recover_existing = True
+        recovery = (StartupRecovery(kube, data["identity"], data["startup_anchor"], data["timeout"] * 3 + 120,
+                                    cancel_event=startup_cancel)
+                    if "startup_anchor" in data else None)
+        startup_deadline = recovery.deadline if recovery else time.monotonic() + data["timeout"] * 3 + 120
+        startup_failure, startup_attempts = None, 0
+        while True:
+            _startup_remaining(startup_deadline, startup_cancel)
+            _startup_phase("waiting for engine Pod readiness")
+            if recovery is None:
+                kube.wait(data["identity"], data["timeout"])
+                selected_uid = None
+            else:
+                selected_uid = recovery.wait()
+            try:
+                _startup_remaining(startup_deadline, startup_cancel)
+                api_port = free_port()
+                _startup_phase("opening the Docker API connection")
+                opening = DockerTunnel(_StartupKube(kube, startup_deadline, startup_cancel), data["identity"], api_port)
+                try:
+                    api_tunnel = opening.start()
+                except BaseException:
+                    close = getattr(opening, "close", None)
+                    if close is not None:
+                        try:
+                            close()
+                        except Exception as cleanup_error:
+                            print(f"Docker connection cleanup after startup failure: {cleanup_error}",
+                                  file=sys.stderr, flush=True)
+                    raise
+                api_tunnel.kube = kube
+                tunnels.append(api_tunnel)
+                _startup_remaining(startup_deadline, startup_cancel)
+                if recovery is not None:
+                    captured = api_tunnel.identity_snapshot().get("expected")
+                    expected = {"statefulset_uid": recovery.anchor["statefulset_uid"], "pod_uid": selected_uid}
+                    if captured != expected:
+                        observed = captured if isinstance(captured, dict) else {}
+                        raise EngineReplacedError((expected["statefulset_uid"], selected_uid),
+                                                  (observed.get("statefulset_uid"), observed.get("pod_uid")))
+                persist()
+                env = docker_environment(f"tcp://127.0.0.1:{api_port}")
+                _startup_phase("checking Docker engine readiness")
+                run(["docker", "info"], env=env,
+                    timeout=min(30, _startup_remaining(startup_deadline, startup_cancel)),
+                    cancel_event=startup_cancel)
+                if (getattr(config, "connect", []) or getattr(config, "reverse", [])
+                        or data.get("reconcile_connections", False)):
+                    from .connectivity import Connectivity
+                    expected = api_tunnel.identity_snapshot()["expected"]
+                    connectivity = Connectivity(kube, data["identity"], compose, model, expected,
+                                                reconcile_connections=data.get("reconcile_connections", False))
+                    _startup_remaining(startup_deadline, startup_cancel)
+                    connectivity.start(deadline=startup_deadline, cancel_event=startup_cancel)
+                    _startup_remaining(startup_deadline, startup_cancel)
+                else:
+                    data["connectivity_status"] = {"state": "disabled"}
+                timeout = min(data["timeout"], recovery.remaining()) if recovery else data["timeout"]
+                sync, elapsed, rows = launch_stack(compose, model, env, data["identity"], timeout,
+                                                   deadline=startup_deadline, cancel_event=startup_cancel)
+                observed_uid = recovery.wait() if recovery else selected_uid
+                if observed_uid != selected_uid:
+                    raise EngineReplacedError((recovery.anchor["statefulset_uid"], selected_uid),
+                                              (recovery.anchor["statefulset_uid"], observed_uid))
+                break
+            except PodgroveError as error:
+                partial = error if isinstance(error, StartupIncomplete) else None
+                if partial is not None:
+                    sync, elapsed, rows = partial.sync, partial.elapsed, partial.rows
+                changed = recovery is not None and recovery.wait() != selected_uid
+                if changed and startup_attempts < 2:
+                    startup_attempts += 1
+                    if connectivity is not None:
+                        connectivity.close()
+                        connectivity = None
+                    if api_tunnel is not None:
+                        api_tunnel.close()
+                        tunnels.remove(api_tunnel)
+                        api_tunnel = None
+                    if sync is not None:
+                        sync.cancel()
+                        try:
+                            sync.close()
+                        except PodgroveError:
+                            pass
+                        sync = None
+                    data["startup_status"] = {"state": "retrying", "attempts": startup_attempts,
+                                              "error": "Owned engine Pod replaced during startup; remirroring before retry"}
+                    persist()
+                    _startup_phase("retrying startup on the verified replacement engine Pod")
+                    continue
+                if changed:
+                    raise PodgroveError("Startup engine was replaced repeatedly; bounded startup retries exhausted") from error
+                if partial is not None and api_tunnel is not None:
+                    api_tunnel.refresh_identity()
+                    startup_failure = str(error)
+                    break
+                raise
         # Capture the original engine proof, not a later same-name replacement.
         # The sync event cancels these reads before the worker is joined.
         captured_identity = getattr(api_tunnel, "identity_snapshot", lambda: {})()
         expected_sync_uids = captured_identity.get("expected") if isinstance(captured_identity, dict) else None
         sync.reconnect_guard = lambda cancelled, **kwargs: verify_sync_engine(
             kube, data["identity"], expected_sync_uids, cancelled, **kwargs)
-        ports = port_plan(compose.published_ports(model), config.forward, data["identity"],
-                          observed=rows, project=model.get("name"))
+        ports = (partial_port_plan(compose, model, rows, data["identity"]) if startup_failure else
+                 port_plan(compose.published_ports(model), config.forward, data["identity"],
+                           observed=rows, project=model.get("name")))
+        _startup_remaining(startup_deadline, startup_cancel)
         if ports:
             _startup_phase("opening application port forwards")
             app_tunnel = Tunnel(kube, data["identity"], [(p["local"], p["published"]) for p in ports])
@@ -502,21 +718,28 @@ def serve(path: Path) -> int:
         else:
             data["forward_status"] = {"state": "disabled", "error": None, "attempts": 0,
                                       "changed_at": time.time(), "checked_at": time.time()}
-        if compose.has_watch(model):
+        _startup_remaining(startup_deadline, startup_cancel)
+        if compose.has_watch(model) and startup_failure is None:
             _startup_phase("starting Compose watch")
             watch = subprocess.Popen(compose.command("watch", "--no-up"), env=env, cwd=config.root,
                                      stdin=subprocess.DEVNULL)
         watch_activity = WatchActivity(model)
         with activity_lock:
+            services_ready = startup_failure is None
             data.update({"status": "ready", "pid": os.getpid(), "docker_host": env["DOCKER_HOST"],
                          "ports": ports, "startup_seconds": round(elapsed, 3), "last_activity": time.time(),
                          "services": rows})
             data["sync_status"] = {"state": "ready", "error": None, "checked_at": time.time()}
             data["health_status"] = {"state": "ready", "checked_at": time.time(),
                                      "last_success_at": time.time()}
+            data["startup_status"] = {"state": "failed" if startup_failure else "ready", "attempts": startup_attempts,
+                                      "error": startup_failure}
+            if startup_failure:
+                data["error"] = startup_failure
+                data["problems"] = readiness(model, rows)[1]
             session_health()
             persist()
-        _startup_phase("ready")
+        _startup_phase("partially started; diagnostics and source sync remain available" if startup_failure else "ready")
         sync_worker = SyncWorker(sync, watch_activity, on_status=sync_changed)
         sync_worker.start()
         last_heartbeat = 0.0
@@ -527,6 +750,9 @@ def serve(path: Path) -> int:
         while not stopping:
             for tunnel in tunnels:
                 tunnel.check()
+            if connectivity is not None:
+                data["connectivity_status"] = connectivity.check()
+                session_health()
             if watch and watch.poll() is not None:
                 raise PodgroveError("docker compose watch exited; see the session log and run podgrove up")
             data["last_activity"] = max(data["last_activity"], last_touch, sync_worker.snapshot())
@@ -607,6 +833,9 @@ def serve(path: Path) -> int:
                                         port["status"] = "disconnected"
                         ready, problems = readiness(model, rows)
                         services_ready = ready
+                        if ready and data.get("startup_status", {}).get("state") == "failed":
+                            data["startup_status"].update(state="ready", error=None)
+                            data.pop("error", None)
                         data["health_status"] = {"state": "ready", "checked_at": time.time(),
                                                  "last_success_at": time.time()}
                         data["problems"] = problems
@@ -626,9 +855,7 @@ def serve(path: Path) -> int:
     except SessionStopped:
         data["status"] = "disconnected"
     except BaseException as exc:
-        # A build can fail before the periodic ownership check notices a Pod
-        # replacement. A fresh read explains the failure without repeating any
-        # build, upload, exec or other uncertain Docker mutation.
+        # Preserve the final ownership failure after any bounded startup-only retries.
         identity_failure = None
         refresh_identity = getattr(api_tunnel, "refresh_identity", None)
         if callable(refresh_identity):
@@ -673,6 +900,11 @@ def serve(path: Path) -> int:
                 sync.close()
             except Exception as exc:
                 cleanup_failure("Sync cleanup", exc)
+        if connectivity is not None:
+            try:
+                connectivity.close()
+            except Exception as exc:
+                cleanup_failure("Connectivity cleanup", exc)
         for tunnel in reversed(tunnels):
             try:
                 tunnel.close()

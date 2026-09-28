@@ -13,6 +13,7 @@ import yaml
 
 from .errors import PodgroveError
 from .network import network_settings
+from .placement import PLACEMENT_SCHEMA, placement_spec, validate_placement
 from .sync_filter import validate_patterns
 from .resources import QUANTITY_SCHEMA, RESOURCE_SCHEMA, quantity_text, resource_budget
 
@@ -82,6 +83,29 @@ CONFIG_SCHEMA: dict[str, Any] = {
                 },
             },
         },
+        "reverse": {
+            "type": "array", "maxItems": 32,
+            "items": {"type": "object", "additionalProperties": False, "required": ["local_port"],
+                      "properties": {
+                          "local_port": {"type": "integer", "minimum": 1, "maximum": 65535},
+                          "remote_port": {"type": "integer", "minimum": 1024, "maximum": 65535,
+                                          "description": "Engine-side listener port; defaults to local_port when at least 1024."},
+                          "local_host": {"type": "string", "enum": ["127.0.0.1", "::1"], "default": "127.0.0.1"},
+                      }},
+        },
+        "connect": {
+            "type": "array", "maxItems": 32,
+            "items": {"type": "object", "additionalProperties": False,
+                      "required": ["name", "environment", "service", "port"],
+                      "properties": {
+                          "name": {"type": "string", "minLength": 1, "maxLength": 63,
+                                   "pattern": r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"},
+                          "environment": {"type": "string", "pattern": r"^[a-f0-9]{12}$"},
+                          "service": {"type": "string", "minLength": 1, "maxLength": 128,
+                                      "pattern": r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$"},
+                          "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+                      }},
+        },
         "sync": {
             "type": "object", "additionalProperties": False,
             "properties": {"exclude": {"type": "array", "maxItems": 128, "uniqueItems": True,
@@ -94,6 +118,7 @@ CONFIG_SCHEMA: dict[str, Any] = {
         "storage": {"type": "object", "additionalProperties": False,
                     "properties": {"size": {**QUANTITY_SCHEMA, "default": "20Gi"}}},
         "node_mode": {"type": "string", "enum": ["shared", "tainted"], "default": "shared"},
+        "placement": PLACEMENT_SCHEMA,
         "network": {
             "type": "object", "additionalProperties": False,
             "properties": {
@@ -150,6 +175,44 @@ def default_tainted_nodes() -> dict:
             "taint": {"key": "dedicated", "value": "podgrove", "effect": "NoSchedule"}}
 
 
+def normalize_reverse(value: list | None) -> list[dict]:
+    entries = [] if value is None else value
+    errors = list(jsonschema.Draft202012Validator(CONFIG_SCHEMA["properties"]["reverse"]).iter_errors(entries))
+    if errors:
+        raise PodgroveError(f"reverse: {errors[0].message}")
+    result, ports = [], set()
+    for entry in entries:
+        remote = entry.get("remote_port", entry["local_port"])
+        if remote < 1024 or remote in (2375, 2376):
+            raise PodgroveError("reverse.remote_port: choose a port from 1024 to 65535 other than Docker API ports 2375 and 2376")
+        if remote in ports:
+            raise PodgroveError("reverse.remote_port: duplicate engine listener port")
+        ports.add(remote)
+        result.append({"local_host": entry.get("local_host", "127.0.0.1"),
+                       "local_port": entry["local_port"], "remote_port": remote})
+    return result
+
+
+def normalize_connect(value: list | None) -> list[dict]:
+    entries = [] if value is None else value
+    errors = list(jsonschema.Draft202012Validator(CONFIG_SCHEMA["properties"]["connect"]).iter_errors(entries))
+    if errors:
+        raise PodgroveError(f"connect: {errors[0].message}")
+    result, names = [], set()
+    reserved = {"localhost", "host", "docker", "podgrove", "host-docker-internal", "gateway-docker-internal"}
+    for entry in entries:
+        name = entry["name"]
+        if name in reserved:
+            raise PodgroveError("connect.name: reserved host or Docker alias")
+        if name in names:
+            raise PodgroveError("connect.name: duplicate connection alias")
+        if entry["port"] in (2375, 2376):
+            raise PodgroveError("connect.port: Docker API ports 2375 and 2376 are reserved")
+        names.add(name)
+        result.append(dict(entry))
+    return result
+
+
 def storage_class_name(value: str) -> str:
     """Validate CLI overrides using the same DNS-subdomain rules as YAML."""
     rule = CONFIG_SCHEMA["properties"]["cluster"]["properties"]["storage_class"]
@@ -179,6 +242,9 @@ class Config:
     storage_size: str = "20Gi"
     network: dict = field(default_factory=network_settings)
     sync_exclude: list[str] = field(default_factory=list)
+    placement: dict = field(default_factory=dict)
+    reverse: list[dict] = field(default_factory=list)
+    connect: list[dict] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.project_directory is None:
@@ -246,6 +312,9 @@ def _validate_settings(data: dict) -> tuple[int, dict]:
         tainted_nodes["selector"] = configured_taints["selector"]
     tainted_nodes["taint"].update(configured_taints.get("taint", {}))
     validate_tainted_nodes(tainted_nodes)
+    placement_spec(data.get("placement"), node_mode=data.get("node_mode", "shared"), tainted_nodes=tainted_nodes)
+    normalize_reverse(data.get("reverse"))
+    normalize_connect(data.get("connect"))
     network_settings(data.get("network"))
     validate_patterns(data.get("sync", {}).get("exclude", []))
     for section in ("resources", "init_resources"):
@@ -351,4 +420,7 @@ def load_config(
         storage_size=quantity_text(data.get("storage", {}).get("size", "20Gi"), "storage.size"),
         network=network_settings(data.get("network")),
         sync_exclude=data.get("sync", {}).get("exclude", []),
+        placement=validate_placement(data.get("placement")),
+        reverse=normalize_reverse(data.get("reverse")),
+        connect=normalize_connect(data.get("connect")),
     )

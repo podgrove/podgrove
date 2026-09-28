@@ -218,12 +218,12 @@ def test_default_cleanup_never_deletes_namespace_and_requires_both_resource_owne
     assert kube.call.call_args_list == [
         call("delete", "statefulset", "-l", f"{MANAGED}=podgrove,{ENVIRONMENT}={IDENT}",
              "--ignore-not-found", "--cascade=foreground", "--wait=true", "--timeout=120s", "--request-timeout=0", timeout=130),
-        call("delete", "pod,pvc,configmap,networkpolicy,service", "-l", f"{MANAGED}=podgrove,{ENVIRONMENT}={IDENT}",
+        call("delete", "pod,pvc,configmap,networkpolicy,service,poddisruptionbudget", "-l", f"{MANAGED}=podgrove,{ENVIRONMENT}={IDENT}",
              "--ignore-not-found", "--wait=true", "--timeout=120s", timeout=130),
     ]
 
 
-@pytest.mark.parametrize("kind", ["NetworkPolicy", "PersistentVolumeClaim", "ConfigMap", "Service", "StatefulSet"])
+@pytest.mark.parametrize("kind", ["NetworkPolicy", "PersistentVolumeClaim", "ConfigMap", "Service", "PodDisruptionBudget", "StatefulSet"])
 @pytest.mark.parametrize("labels", [{}, {MANAGED: "cluster-admin", ENVIRONMENT: IDENT},
                                     {MANAGED: "podgrove", ENVIRONMENT: "another-worktree"}])
 def test_default_refuses_foreign_resource_even_though_namespace_is_shared(kind, labels):
@@ -232,7 +232,8 @@ def test_default_refuses_foreign_resource_even_though_namespace_is_shared(kind, 
     kube = Kube("test-context", "default")
     kube.get = Mock(return_value={"metadata": {"labels": labels}})
     kube.call = Mock()
-    with pytest.raises(PodgroveError, match="Refusing to modify unowned"):
+    expected = "protection target" if kind == "PodDisruptionBudget" else "Refusing to modify unowned"
+    with pytest.raises(PodgroveError, match=expected):
         kube.create_environment([resource], IDENT)
     kube.call.assert_not_called()
 
@@ -258,7 +259,7 @@ def test_legacy_exclusive_cleanup_always_retains_namespace():
     kube.call = Mock()
     kube.destroy(IDENT)
     assert [item.args[1] for item in kube.call.call_args_list] == [
-        "statefulset", "pod,pvc,configmap,networkpolicy,service"]
+        "statefulset", "pod,pvc,configmap,networkpolicy,service,poddisruptionbudget"]
     kube.get.assert_called_once_with("configmap", f"pg-{IDENT}")
 
 
@@ -305,7 +306,7 @@ def test_testing_namespace_cleanup_selects_only_owned_environment():
     kube.destroy(IDENT)
     args = kube.call.call_args.args
     assert args[0] == "delete"
-    assert args[1] == "pod,pvc,configmap,networkpolicy,service"
+    assert args[1] == "pod,pvc,configmap,networkpolicy,service,poddisruptionbudget"
     assert args[args.index("-l") + 1] == f"{MANAGED}=podgrove,{ENVIRONMENT}={IDENT}"
     assert "namespace" not in args
     assert "--all" not in args
@@ -374,11 +375,13 @@ def test_successful_admission_precedes_all_environment_creation():
     calls = kube.call.call_args_list
     assert calls[0].args == ("create", "--dry-run=server", "-f", "-")
     assert json.loads(calls[0].kwargs["input"])["kind"] == "Pod"
-    assert len(calls) == len(resources) + 1
-    assert [json.loads(call.kwargs["input"])["kind"] for call in calls[1:]] == [
-        "NetworkPolicy", "PersistentVolumeClaim", "ConfigMap", "Service", "StatefulSet",
+    assert len(calls) == len(resources) + 2
+    assert calls[1].args == ("create", "--dry-run=server", "-f", "-")
+    assert json.loads(calls[1].kwargs["input"])["kind"] == "PodDisruptionBudget"
+    assert [json.loads(call.kwargs["input"])["kind"] for call in calls[2:]] == [
+        "NetworkPolicy", "PersistentVolumeClaim", "ConfigMap", "Service", "PodDisruptionBudget", "StatefulSet",
     ]
-    assert all("--dry-run=server" not in call.args for call in calls[1:])
+    assert all("--dry-run=server" not in call.args for call in calls[2:])
 
 
 def test_controller_has_single_replica_independent_pvc_and_no_fake_owner_reference():
@@ -449,6 +452,7 @@ def test_defaulted_controller_template_is_reused_without_replacement():
     spec["containers"][0].update(imagePullPolicy="IfNotPresent", terminationMessagePolicy="File")
     controller["spec"].update(revisionHistoryLimit=10, podManagementPolicy="OrderedReady")
     pod = engine_pod_manifest(controller)
+    pod["metadata"].update(uid="pod-uid", resourceVersion="12")
     kube = Kube("test-context", "default")
     kube.get = Mock(side_effect=lambda kind, name: controller if kind == "StatefulSet" else
                     pod if kind == "pod" and name == engine_pod_name(IDENT) else {})
@@ -466,10 +470,10 @@ def test_controller_creation_race_during_admission_accepts_only_its_owned_pod():
     kube = Kube("test-context", "default")
     kube.get = Mock(side_effect=lambda kind, name: controller if kind == "StatefulSet" else
                     next(reads) if kind == "pod" and name == engine_pod_name(IDENT) else {})
-    kube.call = Mock(side_effect=PodgroveError("AlreadyExists"))
+    kube.call = Mock(side_effect=[PodgroveError("AlreadyExists"), SimpleNamespace(returncode=0, stdout="")])
     kube.check_admission(resources)
-    kube.call.assert_called_once()
-    submitted = json.loads(kube.call.call_args.kwargs["input"])
+    assert kube.call.call_count == 2
+    submitted = json.loads(kube.call.call_args_list[0].kwargs["input"])
     assert submitted["metadata"]["ownerReferences"][0]["uid"] == controller["metadata"]["uid"]
 
 
@@ -528,15 +532,17 @@ def test_existing_owned_engine_reconnect_skips_new_pod_admission(mode):
     resources = manifests("podgrove-testing", IDENT, Path("/worktree/test"), "small", 600, node_mode=mode)
     controller = existing_controller(resources)
     pod = engine_pod_manifest(controller)
+    pod["metadata"].update(uid="pod-uid", resourceVersion="12")
     kube = Kube("test-context", "podgrove-testing")
     kube.get = Mock(side_effect=lambda kind, name: controller if kind == "StatefulSet" else
                     pod if kind == "pod" and name == engine_pod_name(IDENT) else {})
     kube.call = Mock()
     with_delete_storage(kube)
     kube.create_environment(resources, IDENT)
-    assert all("--dry-run=server" not in call.args for call in kube.call.call_args_list)
     assert not any(json.loads(call.kwargs["input"])["kind"] == "Pod" for call in kube.call.call_args_list)
-    assert len(kube.call.call_args_list) == 4
+    assert len(kube.call.call_args_list) == 6
+    assert json.loads(kube.call.call_args_list[0].kwargs["input"])["kind"] == "PodDisruptionBudget"
+    assert "--dry-run=server" in kube.call.call_args_list[0].args
     assert not any(json.loads(call.kwargs["input"])["kind"] == "StatefulSet" for call in kube.call.call_args_list)
 
 
