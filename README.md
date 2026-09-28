@@ -23,13 +23,13 @@ You need macOS or Linux, Python 3.11+, `uv`, the Docker CLI with a recent Compos
 Install a verified release into a versioned environment, separate from a development checkout:
 
 ```sh
-git clone --branch v0.2.4 https://github.com/podgrove/podgrove.git
+git clone --branch v0.2.5 https://github.com/podgrove/podgrove.git
 cd podgrove
 PODGROVE_RELEASE_DIR="$(mktemp -d)"
-gh release download v0.2.4 --repo podgrove/podgrove --dir "$PODGROVE_RELEASE_DIR"
+gh release download v0.2.5 --repo podgrove/podgrove --dir "$PODGROVE_RELEASE_DIR"
 PODGROVE_RELEASE_SHA="$(git rev-parse HEAD)"
 python3 scripts/install_release.py --dist "$PODGROVE_RELEASE_DIR" \
-  --tag v0.2.4 --source-sha "$PODGROVE_RELEASE_SHA"
+  --tag v0.2.5 --source-sha "$PODGROVE_RELEASE_SHA"
 export PODGROVE_BIN="$HOME/.local/share/podgrove/current/bin/podgrove"
 "$PODGROVE_BIN" --version
 ```

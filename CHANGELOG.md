@@ -2,6 +2,13 @@
 
 User-visible changes are recorded here. Release Please manages versioned entries after the first public release.
 
+## 0.2.5 (2026-09-27)
+
+- Recover idle file-sync transport loss with bounded, cancellable attempts against the original engine and verified sync helper, retaining healthy session commands and application forwards.
+- Verify the last acknowledged remote baseline before resuming. Pause uncertain transfers or exhausted recovery without replaying a batch or restarting application services.
+- Show sync recovery and paused diagnostics in CLI status and the dashboard's Engine tab; keep process interruption, ownership changes, cancellation and uncertain outcomes covered by regression tests.
+- Record bounded sync-only recovery explicitly in the forwarding acceptance runner, with independent control, HTTP, process and ownership checks. Shipping the runner does not establish a completed soak.
+
 ## 0.2.4 (2026-09-27)
 
 - Accept complete dashboard Docker HTTP responses, including `Connection: close` responses whose declared body has been fully consumed, without reading a closed socket again.
