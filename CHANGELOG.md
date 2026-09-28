@@ -2,6 +2,11 @@
 
 User-visible changes are recorded here. Release Please manages versioned entries after the first public release.
 
+## 0.2.7 (2026-09-28)
+
+- Return one JSON document for `doctor --json` success, check/configuration errors and interruption, while preserving ordinary text output.
+- Flush fixed startup phase messages to the session log before engine readiness, source copy, Compose build/readiness and forwarding work, so callers can inspect a slow startup.
+
 ## 0.2.6 (2026-09-27)
 
 - Clarify bounded idle file-sync recovery versus paused uncertain transfers, including when `up --refresh` is required.
