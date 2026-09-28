@@ -168,6 +168,7 @@ include tests/test_runtime_cleanup_review.py
 include tests/test_runtime_recovery.py
 include tests/test_soak_forwarding.py
 include tests/test_startup_cancel.py
+include tests/test_startup_progress.py
 include tests/test_state.py
 include tests/test_storage_public.py
 include tests/test_sync.py

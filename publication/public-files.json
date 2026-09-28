@@ -168,6 +168,7 @@
     "tests/test_runtime_recovery.py",
     "tests/test_soak_forwarding.py",
     "tests/test_startup_cancel.py",
+    "tests/test_startup_progress.py",
     "tests/test_state.py",
     "tests/test_storage_public.py",
     "tests/test_sync.py",

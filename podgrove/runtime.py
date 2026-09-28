@@ -216,12 +216,20 @@ def _remote_build_output(output: str) -> str:
         r"\s*View build details:\s+docker-desktop://dashboard/build/\S+\s*", line))
 
 
+def _startup_phase(message: str) -> None:
+    # Fixed phase labels only: never print configuration, credentials or argv.
+    # The detached supervisor writes to a buffered file, so flush before work.
+    print(f"Startup: {message}", flush=True)
+
+
 def launch_stack(compose: Compose, model: dict, env: dict, ident: str, timeout: int = 600):
     sync = Synchronizer(compose.config.root, compose.sync_paths(model), env, ident,
                         exclude=getattr(compose.config, "sync_exclude", []))
     try:
+        _startup_phase("copying the initial workspace snapshot")
         sync.start()
         started = time.monotonic()
+        _startup_phase("building and starting Compose services")
         result = run(compose.command("up", "--detach", "--build"), env=env, cwd=compose.config.root, timeout=timeout)
         stdout, stderr = _remote_build_output(result.stdout), _remote_build_output(result.stderr)
         if stdout:
@@ -229,6 +237,7 @@ def launch_stack(compose: Compose, model: dict, env: dict, ident: str, timeout: 
         if stderr:
             print(stderr, file=sys.stderr, flush=True)
         deadline = time.monotonic() + timeout
+        _startup_phase("waiting for Compose service readiness")
         while True:
             rows = service_status(compose, env)
             ready, problems = readiness(model, rows)
@@ -457,18 +466,22 @@ def serve(path: Path) -> int:
         persist()
         controller = threading.Thread(target=handle_control, name="podgrove-control", daemon=True)
         controller.start()
+        _startup_phase("loading and validating Compose configuration")
         config = load_config(state.configuration_root(data), Path(data["config_path"]) if data.get("config_path") else None,
                              data.get("files"))
         compose = Compose(config)
         model = compose.model()
         compose.validate(model)
+        _startup_phase("waiting for engine Pod readiness")
         kube.wait(data["identity"], data["timeout"])
         api_port = free_port()
+        _startup_phase("opening the Docker API connection")
         api_tunnel = DockerTunnel(kube, data["identity"], api_port).start()
         tunnels.append(api_tunnel)
         persist()  # Capture immutable engine UIDs before info, initial sync or a long build.
         env = docker_environment(f"tcp://127.0.0.1:{api_port}")
         # Explicitly target the engine throughout. Never select or mutate a Docker context.
+        _startup_phase("checking Docker engine readiness")
         run(["docker", "info"], env=env, timeout=30)
         sync, elapsed, rows = launch_stack(compose, model, env, data["identity"], data["timeout"])
         # Capture the original engine proof, not a later same-name replacement.
@@ -480,6 +493,7 @@ def serve(path: Path) -> int:
         ports = port_plan(compose.published_ports(model), config.forward, data["identity"],
                           observed=rows, project=model.get("name"))
         if ports:
+            _startup_phase("opening application port forwards")
             app_tunnel = Tunnel(kube, data["identity"], [(p["local"], p["published"]) for p in ports])
             app_tunnel.on_change = forward_changed
             tunnels.append(app_tunnel.start())
@@ -489,6 +503,7 @@ def serve(path: Path) -> int:
             data["forward_status"] = {"state": "disabled", "error": None, "attempts": 0,
                                       "changed_at": time.time(), "checked_at": time.time()}
         if compose.has_watch(model):
+            _startup_phase("starting Compose watch")
             watch = subprocess.Popen(compose.command("watch", "--no-up"), env=env, cwd=config.root,
                                      stdin=subprocess.DEVNULL)
         watch_activity = WatchActivity(model)
@@ -501,6 +516,7 @@ def serve(path: Path) -> int:
                                      "last_success_at": time.time()}
             session_health()
             persist()
+        _startup_phase("ready")
         sync_worker = SyncWorker(sync, watch_activity, on_status=sync_changed)
         sync_worker.start()
         last_heartbeat = 0.0
