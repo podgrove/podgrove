@@ -69,6 +69,52 @@ def test_listing_without_state_never_creates_the_state_directory(tmp_path, monke
     assert not home.exists()
 
 
+def test_sync_recovery_summary_projects_only_sanitized_bounded_diagnostics(environment):
+    root, data, backend = environment
+    data["sync_status"] = {"state": "reconnecting", "attempts": 2, "next_retry_at": 123.5,
+                           "checked_at": 120.5, "error": "Bearer private-credential token=another-secret " + "x" * 3000,
+                           "docker_host": "private-host", "helper_id": "private-helper", "token": "private-token"}
+    state.write(state.state_path(root, data["context"]), data)
+    result = backend.environments()["environments"][0]["sync_status"]
+    assert result["state"] == "reconnecting" and result["attempts"] == 2
+    assert result["next_retry_at"] == 123.5 and result["checked_at"] == 120.5
+    assert set(result) == {"state", "attempts", "next_retry_at", "checked_at", "error"}
+    assert "private-" not in json.dumps(result) and "another-secret" not in result["error"]
+    assert "[REDACTED]" in result["error"] and len(result["error"]) == 1024
+
+
+@pytest.mark.parametrize("invalid", [None, [], "invalid", {"state": "private-secret", "attempts": True,
+                                                         "checked_at": float("nan"), "next_retry_at": -1}])
+def test_sync_recovery_summary_rejects_malformed_metadata(invalid):
+    result = web._sync_status({"sync_status": invalid})
+    assert result == {"state": "unknown", "attempts": 0, "checked_at": None, "next_retry_at": None, "error": ""}
+
+
+@pytest.mark.parametrize("quote", ['"', "'"])
+def test_sync_recovery_redacts_quoted_credentials_before_clipping(quote):
+    error = "password=" + quote + "private-multiword " * 300 + quote + " safe diagnostic"
+    result = web._sync_status({"sync_status": {"state": "disconnected", "error": error}})
+    assert result["error"] == "password=[REDACTED] safe diagnostic"
+    assert "private-multiword" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("current", ["reconnecting", "disconnected", "ready"])
+def test_sync_recovery_detail_uses_control_state_without_writing_or_hiding_engine(engine, monkeypatch, current):
+    data, backend, *_ = engine
+    before = state.state_path(Path(data["root"]), data["context"]).read_bytes()
+    monkeypatch.setattr(web, "control", Mock(return_value={
+        "ok": True, "status": "ready" if current == "ready" else "degraded",
+        "sync_status": {"state": current, "attempts": 1, "error": "token=hidden-credential"},
+        "forward_status": {"state": "ready"}}))
+    result = backend.detail(data["identity"])
+    assert result["sync_status"]["state"] == current
+    assert result["sync_status"]["error"] == "token=[REDACTED]"
+    assert result["forward_status"]["state"] == "ready"
+    assert result["engine"]["pod"]["ready"] is True
+    assert result["status"] == ("ready" if current == "ready" else "degraded")
+    assert state.state_path(Path(data["root"]), data["context"]).read_bytes() == before
+
+
 def test_listing_filters_other_context_and_namespace(environment):
     _, data, _ = environment
     assert web.Dashboard("other-context").environments()["environments"] == []

@@ -14,7 +14,7 @@ import time
 import pytest
 
 from podgrove.errors import PodgroveError
-from podgrove.sync_transport import RECEIVER, STDERR_BYTES, TarStream
+from podgrove.sync_transport import RECEIVER, STDERR_BYTES, SyncStreamError, TarStream
 
 NONCE = "0123456789abcdef" * 2
 PREAMBLE = f"""
@@ -179,6 +179,46 @@ def test_ready_handshake_must_match_nonce_before_any_frame_is_sent():
         with pytest.raises(PodgroveError, match="invalid acknowledgement"):
             connection.ready()
         assert connection.sequence == 1 and connection.process.poll() is not None
+
+
+def test_idle_exit_after_committed_ack_is_reconnectable_but_does_not_resend(tmp_path):
+    signal_file = tmp_path / "exit"
+    script = PREAMBLE + READ_FRAME + f'''
+emit(('ACK '+nonce+' '+sequence+'\\n').encode())
+while not os.path.exists({str(signal_file)!r}): time.sleep(.01)
+'''
+    with stream(script) as (connection, _):
+        connection.ready()
+        connection.transfer(io.BytesIO(b"committed"))
+        signal_file.touch()
+        connection.process.wait(timeout=2)
+        with pytest.raises(SyncStreamError) as error:
+            connection.check()
+        assert error.value.reconnectable and not connection._batch_pending
+        assert connection.sequence == 2
+
+
+def test_idle_protocol_bytes_followed_by_exit_are_not_reconnectable(tmp_path):
+    signal_file = tmp_path / "invalid-and-exit"
+    script = PREAMBLE + f'''
+while not os.path.exists({str(signal_file)!r}): time.sleep(.01)
+emit(('ACK '+nonce+' 0000000000000001\\n').encode())
+'''
+    with stream(script) as (connection, _):
+        connection.ready()
+        signal_file.touch()
+        connection.process.wait(timeout=2)
+        with pytest.raises(SyncStreamError, match="unexpected idle acknowledgement") as error:
+            connection.check()
+        assert not error.value.reconnectable and connection.sequence == 1
+
+
+def test_lost_commit_ack_remains_non_reconnectable_even_after_zero_exit():
+    with stream(PREAMBLE + READ_FRAME + "sys.exit(0)\n") as (connection, _):
+        connection.ready()
+        with pytest.raises(SyncStreamError) as error:
+            connection.transfer(io.BytesIO(b"unknown commit"))
+        assert not error.value.reconnectable and connection._batch_pending
 
 
 def test_actual_receiver_shell_preserves_twelve_frame_boundaries_and_applies_before_ack(tmp_path):

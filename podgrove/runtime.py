@@ -24,11 +24,14 @@ from .kube import HeartbeatUnavailable, Kube
 from .process import docker_environment, run
 from .reaper import reason
 from .sync import SnapshotRace, Synchronizer
+from .sync_recovery import SyncRecoveryUnavailable, verify_engine as verify_sync_engine
+from .sync_transport import SyncStreamError
 
 HEALTH_INTERVAL = 30.0
 HEARTBEAT_RETRY_DELAYS = (1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
 STATUS_RETRY_DELAYS = (0.2, 0.5)
 STATUS_READ_TIMEOUT = 10
+SYNC_RETRY_DELAYS = (0.25, 1.0, 2.0)
 _TRANSIENT_READ = re.compile(
     r"connection reset by peer|connection refused|unexpected eof|\beof\b|broken pipe|"
     r"i/o timeout|docker timed out after", re.IGNORECASE)
@@ -45,7 +48,7 @@ class SessionStopped(Exception):
 class SyncWorker:
     """One serialized sync loop, independent of slower Kubernetes/health reads."""
 
-    def __init__(self, sync, watch_activity, interval=0.4, on_status=None):
+    def __init__(self, sync, watch_activity, interval=0.4, on_status=None, retry_delays=None):
         self.sync, self.watch_activity, self.interval = sync, watch_activity, interval
         self.stopping = threading.Event()
         self.cycle = threading.Lock()
@@ -53,6 +56,7 @@ class SyncWorker:
         self._activity = 0.0
         self._error = None
         self.on_status = on_status
+        self.retry_delays = tuple(SYNC_RETRY_DELAYS if retry_delays is None else retry_delays)
         self._status = {"state": "ready", "error": None, "checked_at": time.time()}
         self.thread = threading.Thread(target=self._run, name="podgrove-file-sync", daemon=True)
         sync.activity_callback = self._touch
@@ -75,25 +79,39 @@ class SyncWorker:
         with self._lock:
             return dict(self._status)
 
-    def _report(self, state_name, error=None):
+    def _report(self, state_name, error=None, *, attempts=0, retry_in=None):
         with self._lock:
-            changed = self._status["state"] != state_name or self._status["error"] != error
-            self._status = {"state": state_name, "error": error, "checked_at": time.time()}
+            changed = (self._status["state"] != state_name or self._status["error"] != error
+                       or self._status.get("attempts", 0) != attempts)
+            self._status = {"state": state_name, "error": error, "checked_at": time.time(),
+                            "attempts": attempts, "next_retry_at": time.time() + retry_in if retry_in is not None else None}
             current = dict(self._status)
         if changed and self.on_status:
             self.on_status(current)
 
     def _run(self):
         races = 0
+        reconnecting, disconnected = False, False
+        attempts, recovered_at = 0, None
         try:
             while not self.stopping.is_set():
                 delay = self.interval
+                if disconnected:
+                    # Never hold the cycle lock while paused: TTL shutdown
+                    # must remain able to acquire it and stop this worker.
+                    self.stopping.wait(delay)
+                    continue
                 try:
                     with self.cycle:
                         if self.stopping.is_set():
                             return
                         if self.watch_activity.changed():
                             self._touch()
+                        if reconnecting:
+                            attempts += 1
+                            self._report("reconnecting", "File sync is reconnecting to the original engine", attempts=attempts)
+                            self.sync.reconnect()
+                            reconnecting, recovered_at = False, time.monotonic()
                         started = time.monotonic()
                         changed = self.sync.sync_once()
                         if changed:
@@ -103,7 +121,24 @@ class SyncWorker:
                                       if isinstance(timing, dict) and timing else "")
                             print(f"Bind sync: {changed} changed entries in {time.monotonic() - started:.3f}s{detail}", flush=True)
                     races = 0
-                    self._report("ready")
+                    if recovered_at is not None and time.monotonic() - recovered_at >= 30:
+                        attempts, recovered_at = 0, None
+                    self._report("ready", attempts=attempts)
+                except (SyncStreamError, SyncRecoveryUnavailable) as exc:
+                    if self.stopping.is_set():
+                        return
+                    retryable = isinstance(exc, SyncRecoveryUnavailable) or exc.reconnectable
+                    if retryable and attempts < len(self.retry_delays):
+                        reconnecting = True
+                        delay = self.retry_delays[attempts]
+                        self._report("reconnecting", "File sync transport unavailable; retrying the original engine",
+                                     attempts=attempts, retry_in=delay)
+                    else:
+                        disconnected = True
+                        self.sync.pause()
+                        self._report("disconnected", "File sync paused: " + str(exc)
+                                     + ". No batch was replayed; inspect the mirror and run podgrove up --refresh to reconnect",
+                                     attempts=attempts)
                 except SnapshotRace as exc:
                     # This type is raised only during local preparation, before
                     # remote bytes/ACK ambiguity. Keep existing forwards alive.
@@ -342,7 +377,7 @@ def serve(path: Path) -> int:
         if data.get("status") not in ("ready", "unhealthy", "degraded"):
             return
         degraded = (data.get("forward_status", {}).get("state") in ("reconnecting", "disconnected")
-                    or data.get("sync_status", {}).get("state") == "retrying"
+                    or data.get("sync_status", {}).get("state") in ("retrying", "reconnecting", "disconnected")
                     or data.get("health_status", {}).get("state") == "unavailable"
                     or data.get("heartbeat_status", {}).get("state") == "unavailable"
                     or data.get("docker_status", {}).get("verification", {}).get("state") in ("unavailable", "expired"))
@@ -436,6 +471,12 @@ def serve(path: Path) -> int:
         # Explicitly target the engine throughout. Never select or mutate a Docker context.
         run(["docker", "info"], env=env, timeout=30)
         sync, elapsed, rows = launch_stack(compose, model, env, data["identity"], data["timeout"])
+        # Capture the original engine proof, not a later same-name replacement.
+        # The sync event cancels these reads before the worker is joined.
+        captured_identity = getattr(api_tunnel, "identity_snapshot", lambda: {})()
+        expected_sync_uids = captured_identity.get("expected") if isinstance(captured_identity, dict) else None
+        sync.reconnect_guard = lambda cancelled, **kwargs: verify_sync_engine(
+            kube, data["identity"], expected_sync_uids, cancelled, **kwargs)
         ports = port_plan(compose.published_ports(model), config.forward, data["identity"],
                           observed=rows, project=model.get("name"))
         if ports:

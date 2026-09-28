@@ -151,6 +151,42 @@ def test_worker_does_not_retry_unknown_remote_error():
         worker.close()
 
 
+def test_reconnect_uses_one_total_deadline_and_retains_acknowledged_restart_phase(mirror, monkeypatch):
+    from types import SimpleNamespace
+    from podgrove import sync as sync_module
+    from podgrove.sync_recovery import SyncRecoveryUnavailable
+    sync, _source = mirror
+    now = [0.0]
+    monkeypatch.setattr(sync_module, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    budgets = []
+    def guard(_cancelled, *, timeout):
+        budgets.append(timeout)
+        now[0] += 4
+    def helper():
+        now[0] += 10
+        sync._recovery_remaining()
+    original = sync._docker
+    def docker(*args, **kwargs):
+        if args[0] == "restart":
+            budgets.append(kwargs["timeout"])
+            now[0] += 2
+        return original(*args, **kwargs)
+    sync.reconnect_guard = guard
+    monkeypatch.setattr(sync, "_verify_helper", helper)
+    monkeypatch.setattr(sync, "_docker", docker)
+    baseline = Mock()
+    receiver = Mock()
+    monkeypatch.setattr(sync, "_verify_baseline", baseline)
+    monkeypatch.setattr(sync, "_start_receiver", receiver)
+    with pytest.raises(SyncRecoveryUnavailable, match="timed out"):
+        sync.reconnect()
+    assert now[0] == 30 and all(0 < value <= 15 for value in budgets)
+    assert sync._recovery_phase == "baseline" and not sync._recovery_blocked
+    assert len([call for call in sync.calls if call[0] == "restart"]) == 1
+    baseline.assert_not_called()
+    receiver.assert_not_called()
+
+
 def test_source_replaced_with_fifo_between_stat_and_open_never_blocks(mirror, monkeypatch):
     import os
     sync, source = mirror

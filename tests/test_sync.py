@@ -34,7 +34,7 @@ class FakeSynchronizer(Synchronizer):
         self.mirror_empty = False
         super().__init__(root, paths, {}, kwargs.get("identity", "unit-test"), exclude=kwargs.get("exclude"))
 
-    def _start_receiver(self):
+    def _start_receiver(self, **_kwargs):
         pass  # Real framed receiver behavior is covered by the Docker checks.
 
     def _send_archive(self, archive):
@@ -43,7 +43,7 @@ class FakeSynchronizer(Synchronizer):
         from podgrove.sync import _RECEIVE, _APPLY
         self._docker("exec", "-i", self.container, "sh", "-c", _RECEIVE + _APPLY, stdin=archive)
 
-    def _docker(self, *args, stdin=None, check=True):
+    def _docker(self, *args, stdin=None, check=True, timeout=300):
         self.calls.append(args)
         output = b""
         if args[:2] in (("container", "inspect"), ("volume", "inspect")):
@@ -55,6 +55,7 @@ class FakeSynchronizer(Synchronizer):
             self.volume_exists = True
         elif args[0] == "run":
             self.container_exists = True
+            output = b"a" * 64 + b"\n"
         elif args[0] == "rm":
             self.container_exists = False
         elif args[0] == "exec" and stdin is not None:
@@ -326,6 +327,36 @@ def test_sync_cleanup_failure_preserves_primary_startup_error(tmp_path, monkeypa
     with pytest.raises(PodgroveError, match="Invalid remote sync baseline"):
         sync.start()
     assert "secondary inspect reset" in capsys.readouterr().err
+
+
+def test_cleanup_never_removes_same_name_replacement_when_captured_helper_is_gone(tmp_path, monkeypatch):
+    (tmp_path / "file").write_text("initial")
+    sync = FakeSynchronizer(tmp_path, [tmp_path])
+    sync.start()
+    inspected = []
+    def labels(kind, name):
+        inspected.append((kind, name))
+        return None if name == "a" * 64 else sync.labels
+    monkeypatch.setattr(sync, "_inspect_labels", labels)
+    before = len(sync.calls)
+    sync.close()
+    assert inspected == [("container", "a" * 64)]
+    assert not any(call[0] == "rm" for call in sync.calls[before:])
+
+
+@pytest.mark.parametrize("output", [b"", b"--all", b"a" * 63, b"a" * 64 + b"\nother-id"])
+def test_invalid_created_helper_id_never_becomes_a_cleanup_target(tmp_path, monkeypatch, output):
+    (tmp_path / "file").write_text("initial")
+    sync = FakeSynchronizer(tmp_path, [tmp_path])
+    original = sync._docker
+    def docker(*args, **kwargs):
+        result = original(*args, **kwargs)
+        return subprocess.CompletedProcess(args, 0, output, b"") if args[0] == "run" else result
+    monkeypatch.setattr(sync, "_docker", docker)
+    with pytest.raises(PodgroveError, match="immutable file sync helper ID"):
+        sync.start()
+    assert sync._container_id is None and not sync._created
+    assert not any(call[0] == "rm" for call in sync.calls)
 
 
 def test_cancel_reaps_only_owned_transport_child_and_preserves_baseline(tmp_path):
@@ -612,7 +643,7 @@ def test_dead_persistent_helper_requires_reconnect_and_preserves_remote_only_con
         sync._docker("exec", sync.container, "sh", "-c", "echo retained > /workspace/remote-only")
         sync._docker("rm", "--force", sync.container)
         sync._receiver.process.wait(timeout=5)
-        with pytest.raises(PodgroveError, match="exited.*reconnect"):
+        with pytest.raises(PodgroveError, match="(exited|closed).*reconnect"):
             sync.sync_once()
         sync.close()
         resumed = DisposableDockerSynchronizer(tmp_path, [tmp_path], identity)

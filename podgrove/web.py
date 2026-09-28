@@ -334,6 +334,26 @@ def _redact_logs(text: str) -> str:
     return text
 
 
+def _sync_status(data: dict) -> dict:
+    """Expose recovery diagnostics without copying private runtime metadata."""
+    raw = data.get("sync_status")
+    raw = raw if isinstance(raw, dict) else {}
+    current = raw.get("state")
+    if current not in ("ready", "retrying", "reconnecting", "disconnected", "disabled"):
+        current = "unknown"
+    if data.get("status") in ("disconnected", "error", "reaped"):
+        current = "disconnected"
+    # Redact before clipping: cutting off a closing quote can turn one secret
+    # containing spaces into several apparently unrelated words.
+    error = raw.get("error") if isinstance(raw.get("error"), str) else ""
+    result = {"state": current, "attempts": _integer(raw.get("attempts")),
+              "error": _redact_logs(error)[:1024]}
+    for key in ("checked_at", "next_retry_at"):
+        value = raw.get(key)
+        result[key] = value if type(value) in (int, float) and 0 <= value <= 253402300799 else None
+    return result
+
+
 def _docker_log_text(raw: bytes) -> str:
     # Non-TTY Docker logs use an eight-byte stream header. Return complete or
     # truncated payloads, never their binary framing. TTY logs are plain text.
@@ -393,6 +413,7 @@ class Dashboard:
                 "last_activity": data.get("last_activity") if isinstance(data.get("last_activity"), (int, float)) else None,
                 "ttl_seconds": _integer(data.get("ttl_seconds")), "ports": ports, "services": services, "counts": counts,
                 "forward_status": {"state": data["forward_status"]["state"]},
+                "sync_status": _sync_status(data),
                 "ports_truncated": bool(omitted_ports), "ports_omitted": omitted_ports,
                 "services_truncated": bool(omitted_services), "service_observations_omitted": omitted_services,
                 "source": "local_snapshot", "health_fresh": False, "health_observed_at": None,
@@ -562,7 +583,8 @@ class Dashboard:
         except PodgroveError:
             health = observed(data, connected=False)
         result.update(status=health["status"], ports=_ports(health),
-                      forward_status={"state": health["forward_status"]["state"]})
+                      forward_status={"state": health["forward_status"]["state"]},
+                      sync_status=_sync_status(health))
         try:
             _, controller, pod, pvc = self._engine(data)
             status, spec = pod.get("status", {}), pod.get("spec", {})

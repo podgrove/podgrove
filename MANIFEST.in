@@ -75,6 +75,7 @@ include podgrove/session_status.py
 include podgrove/state.py
 include podgrove/sync.py
 include podgrove/sync_filter.py
+include podgrove/sync_recovery.py
 include podgrove/sync_transport.py
 include podgrove/web.py
 include podgrove/web_logs.py
@@ -173,6 +174,7 @@ include tests/test_sync.py
 include tests/test_sync_exclude.py
 include tests/test_sync_filter.py
 include tests/test_sync_races.py
+include tests/test_sync_recovery.py
 include tests/test_sync_transport_review.py
 include tests/test_verify_package.py
 include tests/test_web.py

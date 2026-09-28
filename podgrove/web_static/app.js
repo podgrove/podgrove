@@ -363,6 +363,14 @@
         ["StatefulSet", controller.name], ["Ready replicas", controller.ready_replicas === undefined ? null : `${controller.ready_replicas} / ${controller.replicas}`], ["Pod", pod.name], ["Phase", pod.phase], ["Ready", pod.ready === undefined ? null : pod.ready ? "Yes" : "No"], ["Restarts", pod.restarts], ["Node", pod.node], ...[["cpu", "CPU"], ["memory", "Memory"], ["ephemeral-storage", "Ephemeral storage"]].map(([key, label]) => [`${label} request / limit`, pod.resources ? `${friendly(requests[key], "Not set")} / ${friendly(limits[key], "Not set")}` : null]),
       ]));
     } else $("engine").replaceChildren(node("p", "Engine details have not been observed. Refresh to read the worktree’s pod.", "panel-empty"));
+    const sync = env.sync_status || {};
+    const syncLabels = { ready: "Ready", retrying: "Retrying local snapshot", reconnecting: "Reconnecting", disconnected: "Paused — inspect the mirror, then run podgrove up --refresh", disabled: "Disabled" };
+    $("engine").append(detailsList([
+      ["File sync", syncLabels[sync.state] || "Not observed"],
+      ["Sync recovery attempts", sync.attempts],
+      ["Next sync retry", sync.next_retry_at ? time(sync.next_retry_at) : null],
+      ["Sync diagnostic", sync.error || null],
+    ]));
   }
   function configurationWorktrees() {
     $("config-worktree").replaceChildren(...state.environments.map((env) => new Option(`${env.name || env.identity} · ${env.namespace}`, env.identity)));

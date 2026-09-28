@@ -42,6 +42,7 @@ Selecting a worktree reads its owned StatefulSet, engine Pod, and PVC, then read
 
 - Compose service state, health, replicas, image, and forwarded application ports.
 - Engine Pod readiness, restart count, node, and observed CPU/memory requests and limits. Configuration → Resources also shows ephemeral storage and initializer allocations.
+- File-sync state, recovery attempts, next retry, and a bounded diagnostic in the Engine tab. Reconnecting or paused sync marks the session degraded without hiding healthy services and endpoints.
 - PVC phase, requested and allocated capacity, and class/bound-volume names reported by the owned PVC. No StorageClass or PV object is read.
 - Snapshot or live logs for one selected Compose service or the engine's Docker container, with a fullscreen reader.
 

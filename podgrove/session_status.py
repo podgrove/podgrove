@@ -32,7 +32,8 @@ def observed(data: dict, *, connected: bool | None = None, ping: dict | None = N
     forward["state"] = current
     result["forward_status"] = forward
     result["ports"] = [dict(port, status=current) for port in data.get("ports", []) if isinstance(port, dict)]
-    retrying = isinstance(result.get("sync_status"), dict) and result["sync_status"].get("state") == "retrying"
+    retrying = (isinstance(result.get("sync_status"), dict)
+                and result["sync_status"].get("state") in ("retrying", "reconnecting", "disconnected"))
     stale_health = (isinstance(result.get("health_status"), dict)
                     and result["health_status"].get("state") == "unavailable")
     stale_heartbeat = (isinstance(result.get("heartbeat_status"), dict)

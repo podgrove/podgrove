@@ -10,6 +10,7 @@ import hashlib
 import errno
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import stat
@@ -24,7 +25,8 @@ from typing import BinaryIO
 
 from .errors import PodgroveError
 from .sync_filter import excluded, validate_patterns
-from .sync_transport import RECEIVER, TarStream
+from .sync_transport import RECEIVER, SyncStreamError, TarStream
+from .sync_recovery import SyncRecoveryUnavailable
 
 _IMAGE = "alpine:3.21"
 _ID_LABEL = "io.podgrove.sync.identity"
@@ -141,6 +143,11 @@ class Synchronizer:
         self._process_lock = threading.Lock()
         self._process = None
         self._receiver = None
+        self._container_id = None
+        self.reconnect_guard = None
+        self._recovery_phase = "verify"
+        self._recovery_blocked = False
+        self._recovery_deadline = None
         self._validate_root()
         for source in paths:
             path = Path(os.path.abspath(source if source.is_absolute() else self.root / source))
@@ -304,7 +311,8 @@ class Synchronizer:
                     raise
                 self._cancelled.wait(LOCAL_RETRY_DELAYS[attempt])
 
-    def _docker(self, *args: str, stdin: BinaryIO | None = None, check: bool = True) -> subprocess.CompletedProcess:
+    def _docker(self, *args: str, stdin: BinaryIO | None = None, check: bool = True,
+                timeout: float = 300) -> subprocess.CompletedProcess:
         process = None
         try:
             with self._process_lock:
@@ -312,7 +320,7 @@ class Synchronizer:
                 process = subprocess.Popen([self.docker, *args], env=self.env, stdin=stdin,
                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 self._process = process
-            stdout, stderr = process.communicate(timeout=300)
+            stdout, stderr = process.communicate(timeout=timeout)
             result = subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
         except (OSError, subprocess.TimeoutExpired) as exc:
             if process is not None and process.poll() is None:
@@ -354,15 +362,126 @@ class Synchronizer:
             if self._receiver is not None:
                 self._receiver.cancel()
 
-    def _start_receiver(self) -> None:
+    def _start_receiver(self, *, timeout=300) -> None:
         if self._receiver is None:
             nonce = uuid.uuid4().hex
-            command = [self.docker, "exec", "-i", self.container, "sh", "-c", RECEIVER,
+            command = [self.docker, "exec", "-i", self._container_id, "sh", "-c", RECEIVER,
                        "podgrove-sync-stream", nonce, _RECEIVE + _APPLY]
             with self._process_lock:
                 self._check_cancelled()
-                self._receiver = TarStream(command, self.env, self._cancelled, nonce)
+                self._receiver = TarStream(command, self.env, self._cancelled, nonce, timeout=timeout)
             self._receiver.ready()
+            # Only reconnect setup has the shorter deadline. Existing large
+            # file batches retain the established transfer timeout.
+            self._receiver.timeout = 300
+
+    def _recovery_read(self, *args):
+        try:
+            result = self._docker(*args, check=False, timeout=self._recovery_remaining())
+        except PodgroveError as exc:
+            raise SyncRecoveryUnavailable("File sync recovery read is unavailable") from exc
+        self._recovery_remaining()
+        if result.returncode:
+            detail = result.stderr.decode(errors="replace").lower()
+            if "no such" in detail or "not found" in detail:
+                raise SyncStreamError("File sync helper or committed baseline is missing; reconnect manually")
+            raise SyncRecoveryUnavailable("File sync recovery read is unavailable")
+        try:
+            return json.loads(result.stdout)
+        except (ValueError, UnicodeError) as exc:
+            raise SyncRecoveryUnavailable("File sync recovery response is incomplete") from exc
+
+    def _recovery_remaining(self):
+        self._check_cancelled()
+        remaining = self._recovery_deadline - time.monotonic() if self._recovery_deadline is not None else 15
+        if remaining <= 0:
+            raise SyncRecoveryUnavailable("File sync reconnect attempt timed out")
+        return min(15, remaining)
+
+    def _verify_helper(self):
+        helper = self._recovery_read("container", "inspect", "--format", "{{json .}}", self._container_id)
+        try:
+            mounts = helper["Mounts"]
+            valid = (helper["Id"] == self._container_id and helper["Name"] == "/" + self.container
+                     and helper["State"]["Running"] is True
+                     and all(helper["Config"]["Labels"].get(k) == v for k, v in self.labels.items())
+                     and len(mounts) == 2
+                     and any(m.get("Type") == "bind" and m.get("Source") == str(self.root)
+                             and m.get("Destination") == "/workspace" and m.get("RW") is True for m in mounts)
+                     and any(m.get("Type") == "volume" and m.get("Name") == self.volume
+                             and m.get("Destination") == "/metadata" and m.get("RW") is True for m in mounts))
+        except (KeyError, AttributeError, TypeError):
+            valid = False
+        if not valid:
+            raise SyncStreamError("File sync helper identity, ownership or mounts changed; reconnect manually")
+        volume = self._recovery_read("volume", "inspect", "--format", "{{json .}}", self.volume)
+        if (not isinstance(volume, dict) or volume.get("Name") != self.volume
+                or not isinstance(volume.get("Labels"), dict)
+                or any(volume["Labels"].get(k) != v for k, v in self.labels.items())):
+            raise SyncStreamError("File sync metadata volume ownership changed; reconnect manually")
+
+    def _verify_baseline(self):
+        saved = self._recovery_read("exec", self._container_id, "cat", "/metadata/baseline.json")
+        try:
+            entries = saved["entries"]
+            if isinstance(entries, dict):
+                entries = {path: entry for path, entry in entries.items() if self._in_scope(path)}
+            valid = (saved["version"] == 1 and saved["root"] == str(self.root)
+                     and isinstance(entries, dict) and set(entries) == set(self._baseline)
+                     and all(isinstance(entry, dict) and self._content_equal(self._baseline[path], entry)
+                             for path, entry in entries.items()))
+        except (KeyError, TypeError):
+            valid = False
+        if not valid:
+            raise SyncStreamError("File sync committed baseline differs; previous batch was not replayed. "
+                                  "Inspect the mirror and run podgrove up --refresh to reconnect")
+
+    def reconnect(self):
+        """Replace an idle receiver, never replay an unacknowledged transfer.
+
+        The worker calls this only after a typed idle transport loss. Restart
+        only the pinned disposable helper to quiesce its old remote shell;
+        Compose containers, mounts and persistent baseline remain intact.
+        """
+        self._check_cancelled()
+        self._recovery_deadline = time.monotonic() + 30
+        if (self._recovery_blocked or not self._started or not self._container_id
+                or not callable(self.reconnect_guard)):
+            raise SyncStreamError("File sync recovery cannot prove the original helper and engine; reconnect manually")
+        if self._receiver is not None:
+            if self._receiver._batch_pending:
+                raise SyncStreamError("File sync batch completion is uncertain; previous batch was not replayed")
+            self._receiver.close()
+            self._receiver = None
+        self.reconnect_guard(self._cancelled, timeout=self._recovery_remaining())
+        self._verify_helper()
+        if self._recovery_phase == "verify":
+            # If this mutation's response is lost, do not issue it a second
+            # time. A later explicit refresh can reconcile that uncertainty.
+            timeout = self._recovery_remaining()
+            self._recovery_blocked = True
+            try:
+                self._docker("restart", "-t", "2", self._container_id, timeout=timeout)
+            except PodgroveError as exc:
+                raise SyncStreamError("File sync helper restart completion is uncertain; restart was not retried. "
+                                      "Run podgrove up --refresh to reconnect") from exc
+            self._recovery_blocked = False
+            self._recovery_phase = "baseline"
+        self.reconnect_guard(self._cancelled, timeout=self._recovery_remaining())
+        self._verify_helper()
+        self._verify_baseline()
+        self._recovery_phase = "verify"
+        self._start_receiver(timeout=self._recovery_remaining())
+        self.reconnect_guard(self._cancelled, timeout=self._recovery_remaining())
+        self._recovery_remaining()
+        self._receiver.check()
+
+    def pause(self):
+        """Dispose only the local stream; leave uncertain remote work untouched."""
+        self._recovery_blocked = True
+        if self._receiver is not None:
+            self._receiver.close()
+            self._receiver = None
 
     def _send_archive(self, archive: BinaryIO) -> None:
         self._start_receiver()
@@ -409,7 +528,11 @@ class Synchronizer:
                      f"type=volume,source={self.volume},target=/metadata", "--entrypoint", "sh", _IMAGE,
                      "-c", "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done"))
         try:
-            self._docker(*args)
+            result = self._docker(*args)
+            container_id = result.stdout.decode(errors="replace").strip()
+            if not re.fullmatch(r"[a-f0-9]{64}", container_id):
+                raise PodgroveError("Docker did not return an immutable file sync helper ID")
+            self._container_id = container_id
             self._created = True
             initialized = self._docker("exec", self.container, "sh", "-c", _INITIALIZE)
             mirror_empty = initialized.stdout.strip() == b"empty"
@@ -563,7 +686,8 @@ class Synchronizer:
             self._receiver = None
         self._cancelled.clear()  # The owning worker has stopped before helper cleanup.
         if self._created:
-            if self._inspect_labels("container", self.container) is not None:
-                self._docker("rm", "--force", self.container)
+            captured = self._container_id or self.container
+            if self._inspect_labels("container", captured) is not None:
+                self._docker("rm", "--force", captured)
             self._created = False
         self._started = False

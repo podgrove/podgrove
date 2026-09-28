@@ -301,6 +301,26 @@ def test_worktree_search_selection_services_storage_engine_and_readonly_requests
     assert all(server.token not in url for _, url in requests)
 
 
+@pytest.mark.parametrize("sync_state,expected", [
+    ("reconnecting", "Reconnecting"), ("disconnected", "Paused — inspect the mirror, then run podgrove up --refresh"),
+])
+def test_sync_recovery_is_visible_without_hiding_healthy_services(page, dashboard, sync_state, expected):
+    server, backend = dashboard
+    backend.snapshots[IDENT].update(status="degraded", sync_status={
+        "state": sync_state, "attempts": 2, "next_retry_at": 1750000500,
+        "error": UNSAFE_LOG, "checked_at": 1750000400})
+    open_dashboard(page, server)
+    expect(page.locator("#running-count")).to_have_text("2 / 2")
+    expect(page.locator("#environment-state")).to_contain_text("degraded", ignore_case=True)
+    choose_tab(page, "Engine")
+    expect(page.locator("#engine")).to_contain_text("File sync")
+    expect(page.locator("#engine")).to_contain_text(expected)
+    expect(page.locator("#engine")).to_contain_text(UNSAFE_LOG)
+    expect(page.locator("#engine")).to_contain_text(f"pg-{IDENT}-0")
+    assert page.evaluate("window.__log_xss") is None
+    assert not any(call[0] not in ("environments", "detail") for call in backend.calls)
+
+
 def test_service_logs_tail_wrap_copy_and_xss_are_plain_text(page, dashboard):
     server, backend = dashboard
     page.context.grant_permissions(["clipboard-read", "clipboard-write"], origin=server.origin)

@@ -17,6 +17,14 @@ STDERR_BYTES = 4096
 HEADER_BYTES = 72
 MAX_FRAME_BYTES = 10**16 - 1
 
+
+class SyncStreamError(PodgroveError):
+    """Only an idle transport loss permits replacing the receiver automatically."""
+
+    def __init__(self, message, *, reconnectable=False):
+        super().__init__(message)
+        self.reconnectable = reconnectable
+
 # The archive is fully received before the existing tar/apply program runs in
 # its own shell. Its EXIT traps cannot replace this loop's frame cleanup trap.
 # User file paths occur only inside the tar, never in this shell program.
@@ -64,13 +72,14 @@ class TarStream:
         self.sequence = 1
         self._failure = None
         self._ready = False
+        self._batch_pending = False
         self._stderr = bytearray()
         self._stderr_lock = threading.Lock()
         try:
             self.process = subprocess.Popen(command, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                             stderr=subprocess.PIPE, bufsize=0)
         except OSError as exc:
-            raise PodgroveError(f"Cannot start file sync stream: {exc}") from exc
+            raise SyncStreamError(f"Cannot start file sync stream: {exc}", reconnectable=True) from exc
         os.set_blocking(self.process.stdin.fileno(), False)
         os.set_blocking(self.process.stdout.fileno(), False)
         self._reader = threading.Thread(target=self._read_stderr, name="podgrove-sync-stderr", daemon=True)
@@ -85,29 +94,42 @@ class TarStream:
         except OSError:
             pass
 
-    def _error(self, message):
+    def _error(self, message, *, reconnectable=None):
         with self._stderr_lock:
             detail = bytes(self._stderr).decode(errors="replace").strip()
-        return PodgroveError(f"File sync stream {message}" + (f": {detail}" if detail else ""))
+        return SyncStreamError(f"File sync stream {message}" + (f": {detail}" if detail else ""),
+                               reconnectable=not self._batch_pending if reconnectable is None else reconnectable)
 
     def _check(self):
         if self.cancelled.is_set():
             raise PodgroveError("File synchronization cancelled")
         if self._failure:
-            raise self._error(self._failure)
+            raise self._failure
         if self.process.poll() is not None:
             self._reader.join(timeout=1)
-            raise self._error("exited; run podgrove up to reconnect")
+            raise self._error("exited; reconnect required")
 
     def check(self):
-        self._check()
+        # Drain the idle protocol boundary before treating a child's exit as
+        # reconnectable: an unsolicited ACK followed by exit is still invalid.
+        if self.cancelled.is_set() or self._failure:
+            self._check()
         if self._ready:
             with selectors.DefaultSelector() as selector:
                 selector.register(self.process.stdout, selectors.EVENT_READ)
                 if selector.select(timeout=0):
-                    self._failure = "closed or sent an unexpected idle acknowledgement; reconnect required"
+                    try:
+                        chunk = os.read(self.process.stdout.fileno(), 1)
+                    except BlockingIOError:
+                        return
+                    except OSError:
+                        chunk = b""
+                    self._failure = self._error(
+                        "sent an unexpected idle acknowledgement; reconnect required" if chunk
+                        else "closed while idle; reconnect required", reconnectable=not bool(chunk))
                     self.cancel()
-                    raise self._error(self._failure)
+                    raise self._failure
+        self._check()
 
     def ready(self):
         self._exchange(b"", None, 0, f"READY {self.nonce}\n".encode())
@@ -116,15 +138,17 @@ class TarStream:
     def transfer(self, archive: BinaryIO):
         self.check()
         if not self._ready:
-            raise self._error("has not completed its ready handshake")
+            raise self._error("has not completed its ready handshake", reconnectable=False)
         archive.seek(0, os.SEEK_END)
         size = archive.tell()
         archive.seek(0)
         if not 0 < size <= MAX_FRAME_BYTES or self.sequence > MAX_FRAME_BYTES:
-            raise self._error("archive size or sequence exceeds protocol bounds")
+            raise self._error("archive size or sequence exceeds protocol bounds", reconnectable=False)
         header = f"PGS1 {self.nonce} {self.sequence:016d} {size:016d}\n".encode()
         assert len(header) == HEADER_BYTES
+        self._batch_pending = True
         self._exchange(header, archive, size, f"ACK {self.nonce} {self.sequence:016d}\n".encode())
+        self._batch_pending = False
         self.sequence += 1
 
     def _exchange(self, header: bytes, archive: BinaryIO | None, remaining: int, expected: bytes):
@@ -159,17 +183,17 @@ class TarStream:
                                 raise self._error("closed before acknowledging its batch; reconnect required")
                             response.extend(chunk)
                             if len(response) > len(expected) or not expected.startswith(response):
-                                raise self._error("returned an invalid acknowledgement; reconnect required")
+                                raise self._error("returned an invalid acknowledgement; reconnect required", reconnectable=False)
                             if response == expected:
                                 if pending or remaining:
                                     raise self._error("acknowledged a batch before receiving its complete archive")
                                 self._check()
                                 return
         except BaseException as exc:
-            self._failure = str(exc)
+            self._failure = self._error("transport failed; reconnect required") if isinstance(exc, OSError) else exc
             self.cancel()
             if isinstance(exc, OSError):
-                raise self._error("transport failed; reconnect required") from exc
+                raise self._failure from exc
             raise
 
     def cancel(self):
