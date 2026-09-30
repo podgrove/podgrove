@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 386" role="img" aria-labelledby="title desc">
+<title id="title">One engine for each worktree</title>
+<desc id="desc">Two local worktrees sync source into separate Docker engines inside an approved Kubernetes namespace. Each engine runs its own Compose services and persistent volume. Service endpoints are forwarded back to localhost.</desc>
+<style>:root{--ink:oklch(0.255 0.008 28);--muted:oklch(0.485 0.01 28);--rule:oklch(0.875 0.005 28);--surface:oklch(1 0 0);--soft:oklch(0.948 0.026 30);--accent:oklch(0.52 0.135 30);--none:transparent;--font:"Avenir Next","Segoe UI",system-ui,sans-serif}text{font-family:var(--font);fill:var(--ink);font-size:18px}.muted{fill:var(--muted);font-size:16px}.label{font-weight:600}.box{fill:var(--surface);stroke:var(--rule)}.engine{fill:var(--soft);stroke:var(--accent)}.wire{fill:var(--none);stroke:var(--accent);stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}</style>
+<text x="1" y="23" class="label">On your laptop</text>
+<rect x="1" y="40" width="184" height="58" rx="8" class="box"/>
+<rect x="215" y="40" width="184" height="58" rx="8" class="box"/>
+<path d="M18 58v20m0-14h10m-10 10h10" class="wire"/>
+<path d="M232 58v20m0-14h10m-10 10h10" class="wire"/>
+<text x="39" y="76">Worktree A</text><text x="253" y="76">Worktree B</text>
+<path d="M81 112v66m-5-5 5 5 5-5m18 5v-66m-5 5 5-5 5 5M295 112v66m-5-5 5 5 5-5m18 5v-66m-5 5 5-5 5 5" class="wire"/>
+<text x="200" y="140" text-anchor="middle" class="muted">Source sync ↓</text>
+<text x="200" y="164" text-anchor="middle" class="muted">localhost ↑</text>
+<text x="1" y="213" class="label">Kubernetes namespace</text>
+<rect x="1" y="231" width="184" height="144" rx="8" class="engine"/>
+<rect x="215" y="231" width="184" height="144" rx="8" class="engine"/>
+<text x="18" y="261" class="label">Docker engine A</text><text x="232" y="261" class="label">Docker engine B</text>
+<rect x="17" y="280" width="152" height="37" rx="5" class="box"/>
+<rect x="231" y="280" width="152" height="37" rx="5" class="box"/>
+<text x="93" y="305" text-anchor="middle" class="muted">Compose services</text><text x="307" y="305" text-anchor="middle" class="muted">Compose services</text>
+<path d="M22 338h18v17H22zM22 343h18" class="wire"/><path d="M236 338h18v17h-18zM236 343h18" class="wire"/>
+<text x="48" y="352" class="muted">Own volume</text><text x="262" y="352" class="muted">Own volume</text>
+</svg>

@@ -1,0 +1,74 @@
+name: Documentation
+
+on:
+  push:
+    branches: [main]
+    paths: ['site/**', 'docs/**', 'deploy/README.md', 'tests/README.md', 'CONTRIBUTING.md', 'SECURITY.md', '.github/workflows/docs.yml', 'uv.lock']
+  pull_request:
+    paths: ['site/**', 'docs/**', 'deploy/README.md', 'tests/README.md', 'CONTRIBUTING.md', 'SECURITY.md', '.github/workflows/docs.yml', 'uv.lock']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: documentation-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+      - run: npm ci --ignore-scripts --no-fund --no-audit
+        working-directory: site
+      - run: npm test && npm run build
+        working-directory: site
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.14'
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: '0.12.18'
+      - run: uv sync --locked --extra web-test
+      - name: Verify public source and built links
+        run: |
+          uv run --no-sync python -c 'from pathlib import Path; from scripts.prepare_public import snapshot_sources; snapshot_sources(Path.cwd())'
+          uv run --no-sync python site/tests/check_build.py
+      - run: uv run --no-sync playwright install --with-deps chromium
+      - name: Check navigation, themes and search in a browser
+        run: uv run --no-sync python site/tests/browser.py --output artifacts/site
+      - name: Preserve browser evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: documentation-browser
+          path: artifacts/site/
+          if-no-files-found: ignore
+      - name: Upload only the static documentation site
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site/dist
+  deploy:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

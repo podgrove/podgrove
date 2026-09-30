@@ -1,0 +1,120 @@
+---
+title: Podgrove
+description: Keep your source local and run a separate Docker Compose environment in Kubernetes for every worktree.
+template: splash
+tableOfContents: false
+hero:
+  title: Your Compose stack.<br />Every worktree.
+  tagline: Keep your editor local. Run a separate Docker engine in Kubernetes for each worktree, with your Compose services and data.
+  image:
+    light: ../../assets/worktrees-light.svg
+    dark: ../../assets/worktrees-dark.svg
+    alt: Two local worktrees sync to two separate Docker engines in an approved Kubernetes namespace. Each engine contains its own Compose services and persistent volume.
+  actions:
+    - text: Get started
+      link: /podgrove/getting-started/
+      icon: right-arrow
+      variant: primary
+    - text: View on GitHub
+      link: https://github.com/podgrove/podgrove
+      icon: github
+      variant: secondary
+prev: false
+next: false
+---
+
+<div class="pg-intro-note">
+  macOS &amp; Linux <span aria-hidden="true">·</span> Your existing Compose files <span aria-hidden="true">·</span> No local Docker daemon needed
+</div>
+
+<section class="pg-story" aria-labelledby="why-podgrove">
+  <div class="pg-section-heading">
+    <h2 id="why-podgrove">Keep the workflow.<br />Separate the stacks.</h2>
+    <p>Another branch shouldn’t mean another stack competing for your laptop’s memory, or a shared database that someone else’s tests can change.</p>
+    <a href="/podgrove/how-it-works/">How Podgrove works <span aria-hidden="true">→</span></a>
+  </div>
+  <dl class="pg-principles">
+    <div>
+      <dt>Compose stays Compose</dt>
+      <dd>Keep services, networks, volumes and healthchecks in your Compose files. Add <code>podgrove.yml</code> for the cluster target and runtime settings.</dd>
+    </div>
+    <div>
+      <dt>Each worktree gets its own engine</dt>
+      <dd>Separate Docker networks and persistent storage, even when worktrees share one Kubernetes namespace. Set CPU, memory and storage per worktree.</dd>
+    </div>
+    <div>
+      <dt>Your development loop stays local</dt>
+      <dd>Edit source on your machine and use forwarded <code>localhost</code> endpoints. A background session manages source sync and connections.</dd>
+    </div>
+  </dl>
+</section>
+
+<section class="pg-start" aria-labelledby="first-worktree">
+  <div class="pg-section-heading">
+    <h2 id="first-worktree">Start with your Compose files</h2>
+    <p>Use an approved development cluster and an existing namespace. An administrator prepares access, storage, networking and admission for the privileged engine.</p>
+  </div>
+  <ol class="pg-steps">
+    <li>
+      <div>
+        <h3><a href="/podgrove/getting-started/#install">Install Podgrove</a></h3>
+        <p>Install a verified release into a versioned environment. The guide covers the required CLI tools and upgrades. Homebrew is not available yet.</p>
+      </div>
+    </li>
+    <li>
+      <div>
+        <h3><a href="/podgrove/compose-migration/">Prepare your worktree</a></h3>
+        <p>Keep the original Compose files. Set the explicit context, namespace and storage class in <code>podgrove.yml</code>, then generate the administrator’s bootstrap manifests.</p>
+      </div>
+    </li>
+    <li>
+      <div>
+        <h3><a href="/podgrove/compose-migration/#4-verify-the-adopted-project">Start and verify</a></h3>
+        <p>After access is ready, validate the project, start the stack, and run your own tests against its local endpoints. Check that a source edit reaches the running service.</p>
+      </div>
+    </li>
+  </ol>
+  <div class="pg-run">
+    <div>
+      <h3>From the application worktree</h3>
+      <p>With <code>PODGROVE_BIN</code> set by the installation guide and namespace setup complete:</p>
+    </div>
+
+```sh frame="none"
+"$PODGROVE_BIN" validate
+"$PODGROVE_BIN" doctor
+"$PODGROVE_BIN" up
+"$PODGROVE_BIN" web
+```
+
+  </div>
+</section>
+
+<section class="pg-guides" aria-labelledby="find-your-guide">
+  <div class="pg-section-heading">
+    <h2 id="find-your-guide">Find your next step</h2>
+    <p>Practical guides for developers, agents and the platform team.</p>
+  </div>
+  <dl class="pg-guide-list">
+    <div>
+      <dt><a href="/podgrove/configuration/">Configure a worktree <span aria-hidden="true">→</span></a></dt>
+      <dd>Resources, persistent storage, namespace modes and optional node placement.</dd>
+    </div>
+    <div>
+      <dt><a href="/podgrove/web/">Open the dashboard <span aria-hidden="true">→</span></a></dt>
+      <dd>A read-only view of services, endpoints, storage, configuration and live logs.</dd>
+    </div>
+    <div>
+      <dt><a href="/podgrove/connectivity/">Connect services <span aria-hidden="true">→</span></a></dt>
+      <dd>Declare access to a local TCP service or a service in another worktree.</dd>
+    </div>
+    <div>
+      <dt><a href="/podgrove/administration/">Prepare namespace access <span aria-hidden="true">→</span></a></dt>
+      <dd>Review and apply the generated manifests with the platform owner.</dd>
+    </div>
+  </dl>
+</section>
+
+<aside class="pg-boundary" aria-label="Deployment boundaries">
+  <p><strong>Built for approved development infrastructure.</strong> Engines are privileged and share their node’s kernel. Podgrove does not create namespaces or change cluster-wide settings. <a href="/podgrove/known-limits/">Read the limits</a> and <a href="/podgrove/operations/">cleanup behavior</a> before adopting it.</p>
+</aside>

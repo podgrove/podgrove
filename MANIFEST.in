@@ -1,5 +1,3 @@
-# Generated from publication/public-files.json; review and update both together.
-# Start empty so local operational files and stale egg-info cannot enter an sdist.
 global-exclude *
 include .github/ISSUE_TEMPLATE/bug_report.yml
 include .github/ISSUE_TEMPLATE/config.yml
@@ -8,6 +6,7 @@ include .github/build-constraints.txt
 include .github/dependabot.yml
 include .github/pull_request_template.md
 include .github/workflows/ci.yml
+include .github/workflows/docs.yml
 include .github/workflows/release.yml
 include .gitignore
 include .pre-commit-config.yaml
@@ -113,6 +112,29 @@ include scripts/verify_loop.py
 include scripts/verify_package.py
 include scripts/verify_package_installed.py
 include scripts/verify_release.py
+include site/DESIGN.md
+include site/PRODUCT.md
+include site/README.md
+include site/astro.config.mjs
+include site/package-lock.json
+include site/package.json
+include site/public/favicon.svg
+include site/scripts/links.mjs
+include site/scripts/pages.mjs
+include site/scripts/prepare.mjs
+include site/src/assets/logo-dark.svg
+include site/src/assets/logo-light.svg
+include site/src/assets/logo.svg
+include site/src/assets/worktrees-dark.svg
+include site/src/assets/worktrees-light.svg
+include site/src/content.config.ts
+include site/src/content/docs/404.md
+include site/src/content/docs/index.mdx
+include site/src/styles/custom.css
+include site/tests/browser.py
+include site/tests/check_build.py
+include site/tests/links.test.mjs
+include site/tsconfig.json
 include tests/README.md
 include tests/fixtures/invalid/compose.yml
 include tests/fixtures/invalid/podgrove.yml

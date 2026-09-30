@@ -4,6 +4,8 @@
 
 **Your Compose stack, a separate environment for every worktree.**
 
+[Documentation](https://podgrove.github.io/podgrove/) · [Getting started](https://podgrove.github.io/podgrove/getting-started/) · [Releases](https://github.com/podgrove/podgrove/releases)
+
 Working on several branches often means running several copies of the same stack: databases, queues, builds and application services competing for your laptop’s memory and ports. Sharing one development stack creates a different problem: one person’s changes or test data can interrupt another’s work.
 
 Podgrove was built to give each worktree its own environment while keeping the Docker Compose workflow you already use. It runs a separate Docker engine in Kubernetes for each worktree, syncs your local source, and brings service endpoints back to `localhost`. Your editor and test commands stay local; the stack runs on the cluster.

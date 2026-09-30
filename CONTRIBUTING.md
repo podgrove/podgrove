@@ -17,6 +17,10 @@ On Linux, `playwright install --with-deps chromium` installs browser system depe
 
 Use the development checkout for edits. Install released wheels into separate virtual environments; do not point running shared environments at an editable checkout. Coordinate supervisor upgrades with the owners of active worktrees.
 
+## Documentation website
+
+The [public documentation](https://podgrove.github.io/podgrove/) is built from the existing Markdown guides. Edit those source files so GitHub and the website stay consistent. The [website guide](site/README.md) covers local preview, link and browser checks, and GitHub Pages deployment.
+
 ## Changes and reviews
 
 Create a focused branch, explain the user-visible problem and resulting behavior, and include the checks you actually ran. Add regression coverage for changed runtime behavior. Update README/configuration/schema/examples together when adding a configuration key. Keep generated manifests generic and namespace-scoped.

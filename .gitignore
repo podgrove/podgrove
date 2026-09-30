@@ -15,3 +15,11 @@ __pycache__/
 /.env
 /.env.*
 .DS_Store
+
+# Documentation website dependencies and generated output.
+/site/node_modules/
+/site/.astro/
+/site/dist/
+/site/src/content/docs/generated/
+/site/public/brand/
+/site/test-results/

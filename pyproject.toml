@@ -24,8 +24,8 @@ classifiers = [
 dependencies = ["PyYAML>=6.0.2,<7", "jsonschema>=4.23,<5"]
 
 [project.urls]
-Homepage = "https://github.com/podgrove/podgrove"
-Documentation = "https://github.com/podgrove/podgrove#readme"
+Homepage = "https://podgrove.github.io/podgrove/"
+Documentation = "https://podgrove.github.io/podgrove/getting-started/"
 Repository = "https://github.com/podgrove/podgrove"
 Issues = "https://github.com/podgrove/podgrove/issues"
 Changelog = "https://github.com/podgrove/podgrove/blob/main/CHANGELOG.md"
