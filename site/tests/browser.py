@@ -62,6 +62,24 @@ def select_theme(page, theme):
         page.get_by_role("button", name="Menu", exact=True).click()
 
 
+def open_search_with_keyboard(page, expect):
+    page.wait_for_load_state("load", timeout=15000)
+    page.wait_for_function("() => !!customElements.get('site-search')", timeout=15000)
+    # Starlight enables its button before its idle callback creates the Pagefind input.
+    page.locator("site-search dialog .pagefind-ui__search-input").wait_for(state="attached", timeout=20000)
+    search = page.get_by_role("button", name="Search", exact=True)
+    expect(search).to_be_enabled(timeout=15000)
+    search.focus()
+    expect(search).to_be_focused()
+    page.keyboard.press("Enter")
+    dialog = page.get_by_role("dialog", name="Search", exact=True)
+    expect(dialog).to_be_visible()
+    search_input = dialog.get_by_role("textbox", name="Search", exact=True)
+    expect(search_input).to_be_visible(timeout=15000)
+    expect(search_input).to_be_focused()
+    return search_input
+
+
 def assert_overview(page, expect, theme):
     content = page.locator("main .sl-markdown-content")
     words = content.inner_text().split()
@@ -160,12 +178,7 @@ def run(dist: Path, output: Path):
                             configuration.click()
                             expect(page).to_have_url(origin + BASE + "configuration/")
                             report["checks"].append({"navigation": "home → getting started → configuration", "width": width, "theme": theme})
-                            search = page.get_by_role("button", name="Search", exact=True)
-                            expect(search).to_be_enabled()
-                            search.focus()
-                            page.keyboard.press("Enter")
-                            search_input = page.get_by_role("dialog", name="Search", exact=True).get_by_role("textbox", name="Search", exact=True)
-                            expect(search_input).to_be_visible()
+                            search_input = open_search_with_keyboard(page, expect)
                             search_input.fill("reverse")
                             result = page.locator("dialog[open] .pagefind-ui__result-link").first
                             expect(result).to_be_visible(timeout=20000)
