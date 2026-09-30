@@ -580,8 +580,8 @@ def test_connection_limit_is_bounded_and_existing_streams_survive(reverse, servi
             payload = bytes([index])
             client.sendall(payload)
             assert client.recv(1) == payload
-        with dial(tunnel) as extra:
-            with pytest.raises(ConnectionResetError):
+        with pytest.raises(ConnectionResetError):
+            with dial(tunnel) as extra:
                 extra.recv(1)
         assert tunnel.snapshot()["active_connections"] == protocol.MAX_CONNECTIONS
         clients[0].sendall(b"survives")
