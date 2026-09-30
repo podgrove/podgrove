@@ -55,7 +55,7 @@ Changed regular files are written **in place**, preserving the inode used by an 
 
 New files, edits, numeric UID/GID ownership, mode changes, renames, and tracked deletions are transferred. Ownership IDs are preserved numerically, allowing a Compose service running as the same UID/GID to write its bind directory; account names are not translated between the laptop and container. Deleting a local directory removes its tracked remote entries; independently generated remote files are preserved, so a nonempty remote directory can remain. A persisted baseline lets reconnects retain remote contents when the corresponding local source has not changed. This is a one-way mirror, not bidirectional reconciliation; remote edits are never copied back to the laptop.
 
-Only requested source trees are scanned. `.git` entries are always skipped by this synchronizer, including worktree pointer files. Required missing sources, symlinks, special files, and paths outside the worktree are refused. File names with spaces, Unicode, newlines, or shell metacharacters are handled as data.
+Only requested source trees are scanned. `.git` entries are always skipped by this synchronizer, including worktree pointer files. Required missing sources, symlinks, special files, and paths outside the [configuration and allowed-source boundary](configuration.md#two-directory-settings) are refused. File names with spaces, Unicode, newlines, or shell metacharacters are handled as data.
 
 ### Compose watch
 
