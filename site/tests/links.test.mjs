@@ -8,9 +8,10 @@ test('documentation links keep route fragments and the GitHub Pages base', () =>
   assert.equal(rewriteUrl('../docs/web.md', 'deploy/README.md'), '/podgrove/web/');
 });
 
-test('source examples stay on GitHub while brand assets resolve locally', () => {
+test('source examples stay on GitHub while documentation images resolve locally', () => {
   assert.equal(rewriteUrl('../examples/shared/podgrove.yml', 'docs/configuration.md'), 'https://github.com/podgrove/podgrove/blob/main/examples/shared/podgrove.yml');
   assert.equal(rewriteUrl('assets/logo-dark.svg', 'docs/branding.md'), '/podgrove/brand/logo-dark.svg');
+  assert.equal(rewriteUrl('assets/architecture.svg', 'docs/how-it-works.md'), '/podgrove/diagrams/architecture.svg');
 });
 
 test('external links and in-page fragments remain intact', () => {

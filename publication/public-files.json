@@ -28,6 +28,8 @@
     "deploy/reaper/00-kubeconfig.yaml.example",
     "deploy/reaper/10-cronjob.yaml.example",
     "deploy/reaper/20-network-policy.yaml.example",
+    "docs/architecture.md",
+    "docs/assets/architecture.svg",
     "docs/assets/logo-dark.svg",
     "docs/assets/logo-light.svg",
     "docs/assets/logo.svg",

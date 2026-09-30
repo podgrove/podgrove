@@ -26,6 +26,8 @@ include deploy/node-group.tf.example
 include deploy/reaper/00-kubeconfig.yaml.example
 include deploy/reaper/10-cronjob.yaml.example
 include deploy/reaper/20-network-policy.yaml.example
+include docs/architecture.md
+include docs/assets/architecture.svg
 include docs/assets/logo-dark.svg
 include docs/assets/logo-light.svg
 include docs/assets/logo.svg

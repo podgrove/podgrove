@@ -9,6 +9,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import re
 import threading
 from urllib.parse import unquote, urlsplit
 
@@ -61,6 +62,40 @@ def select_theme(page, theme):
         page.get_by_role("button", name="Menu", exact=True).click()
 
 
+def assert_overview(page, expect, theme):
+    content = page.locator("main .sl-markdown-content")
+    words = content.inner_text().split()
+    assert len(words) <= 450, ("Overview should stay concise; details belong in architecture", len(words))
+    expect(page.locator('main [class*="language-mermaid"]:visible')).to_have_count(0)
+    assert not re.search(r"\b(?:flowchart|graph)\s+(?:LR|TD|TB|RL|BT)\b", content.inner_text(), re.I), "Raw chart syntax is visible"
+    expect(content.locator(f'a[href="{BASE}architecture/"]')).to_be_visible()
+    diagram = content.locator(f'img[src="{BASE}diagrams/architecture.svg"]')
+    expect(diagram).to_have_count(1)
+    expect(diagram).to_be_visible()
+    expect(diagram).to_have_js_property("complete", True)
+    image = diagram.evaluate("""e => ({
+        src: e.currentSrc, alt: e.alt, naturalWidth: e.naturalWidth, naturalHeight: e.naturalHeight,
+        width: e.getBoundingClientRect().width, height: e.getBoundingClientRect().height,
+        colorScheme: getComputedStyle(e).colorScheme
+    })""")
+    assert image["naturalWidth"] > 0 and image["naturalHeight"] > 0, ("Diagram did not decode", image)
+    assert image["width"] > 0 and image["height"] > 0 and len(image["alt"].strip()) >= 16, image
+    assert image["colorScheme"] == theme, ("Diagram does not inherit the manually selected theme", image)
+    bounds = content.evaluate("""root => ({
+        viewport: innerWidth,
+        offenders: [root, ...root.querySelectorAll('*')].filter(e => {
+            const r = e.getBoundingClientRect();
+            const c = getComputedStyle(e);
+            return r.width > 0 && r.height > 0 && c.visibility !== 'hidden'
+                && (r.left < -1 || r.right > innerWidth + 1);
+        }).slice(0, 10).map(e => ({tag: e.tagName, class: String(e.className),
+            left: e.getBoundingClientRect().left, right: e.getBoundingClientRect().right}))
+    })""")
+    assert not bounds["offenders"], ("Overview content extends outside viewport", bounds)
+    return {"overview": "loaded SVG, concise content, linked detail, no raw chart or overflow",
+            "word_count": len(words), "image": image, **bounds}
+
+
 def run(dist: Path, output: Path):
     from playwright.sync_api import expect, sync_playwright
 
@@ -104,11 +139,13 @@ def run(dist: Path, output: Path):
                             page.reload(wait_until="networkidle")
                             expect(page.locator("html")).to_have_attribute("data-theme", theme)
                             report["checks"].append({"theme_persistence": theme, "width": width})
-                            for route in ("", "getting-started/", "configuration/"):
+                            for route in ("", "getting-started/", "configuration/", "how-it-works/"):
                                 page.goto(origin + BASE + route, wait_until="networkidle")
                                 expect(page.locator("main h1")).to_be_visible()
                                 expect(page.locator("html")).to_have_attribute("data-theme", theme)
                                 report["checks"].append(assert_fit(page, f"{width}-{theme}-{route or 'home'}"))
+                                if route == "how-it-works/":
+                                    report["checks"].append({"width": width, "theme": theme, **assert_overview(page, expect, theme)})
                                 name = f"{width}-{theme}-{route.strip('/') or 'home'}.png"
                                 page.screenshot(path=str(output / name), full_page=True)
                                 report["screenshots"].append(name)

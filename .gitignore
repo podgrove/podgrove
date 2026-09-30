@@ -22,4 +22,5 @@ __pycache__/
 /site/dist/
 /site/src/content/docs/generated/
 /site/public/brand/
+/site/public/diagrams/
 /site/test-results/

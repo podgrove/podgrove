@@ -205,6 +205,19 @@ starlight-theme-select select {
   max-width: 72ch;
 }
 
+.sl-markdown-content img[src$="/architecture.svg"] {
+  display: block;
+  width: 100%;
+  max-width: 30rem;
+  height: auto;
+  margin: 1.5rem auto;
+  color-scheme: dark;
+}
+
+:root[data-theme="light"] .sl-markdown-content img[src$="/architecture.svg"] {
+  color-scheme: light;
+}
+
 .sl-markdown-content a:not(.sl-link-button) {
   text-decoration-thickness: 1px;
 }

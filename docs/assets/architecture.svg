@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="360" viewBox="0 0 480 360" role="img" aria-labelledby="title description">
+  <title id="title">From a local worktree to its Kubernetes engine</title>
+  <desc id="description">Your laptop keeps the worktree files and Docker Compose client. An authenticated connection syncs source and sends Compose operations to that worktree's Docker engine in Kubernetes. The engine runs Compose services and uses its own persistent volume. Localhost forwards bring service endpoints back to your browser and tests.</desc>
+  <style>
+    :root { --ink: oklch(0.255 0.008 28); --muted: oklch(0.485 0.01 28); --rule: oklch(0.875 0.005 28); --surface: oklch(1 0 0); --soft: oklch(0.948 0.026 30); --accent: oklch(0.52 0.135 30); --none: transparent; --font: "Avenir Next", "Segoe UI", system-ui, sans-serif; }
+    @media (prefers-color-scheme: dark) { :root { --ink: oklch(0.92 0.006 28); --muted: oklch(0.73 0.009 28); --rule: oklch(0.36 0.007 28); --surface: oklch(0.27 0.007 28); --soft: oklch(0.32 0.035 40); --accent: oklch(0.77 0.11 40); } }
+    text { font-family: var(--font); fill: var(--ink); font-size: 22px; }
+    .heading { font-size: 24px; font-weight: 600; }
+    .muted { fill: var(--muted); font-size: 20px; }
+    .box { fill: var(--surface); stroke: var(--rule); stroke-width: 1.5; }
+    .engine { fill: var(--soft); stroke: var(--accent); stroke-width: 1.5; }
+    .arrow { fill: var(--none); stroke: var(--accent); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  </style>
+  <rect x="1" y="1" width="478" height="103" rx="10" class="box" />
+  <text x="22" y="32" class="heading">Your laptop</text>
+  <text x="22" y="62">Worktree files + Compose client</text>
+  <text x="22" y="88" class="muted">Browser / tests on localhost</text>
+  <path d="M47 114v82m-6-6 6 6 6-6" class="arrow" />
+  <text x="72" y="147">Authenticated</text>
+  <text x="72" y="174">connection</text>
+  <path d="M433 196v-82m-6 6 6-6 6 6" class="arrow" />
+  <text x="409" y="147" text-anchor="end" class="muted">localhost</text>
+  <text x="409" y="174" text-anchor="end" class="muted">forwards</text>
+  <rect x="1" y="207" width="478" height="152" rx="10" class="engine" />
+  <text x="22" y="240" class="heading">Worktree Docker engine</text>
+  <text x="22" y="265" class="muted">in Kubernetes</text>
+  <rect x="22" y="283" width="276" height="54" rx="6" class="box" />
+  <rect x="314" y="283" width="144" height="54" rx="6" class="box" />
+  <text x="160" y="318" text-anchor="middle">Compose services</text>
+  <text x="386" y="318" text-anchor="middle">Own PVC</text>
+</svg>

@@ -10,6 +10,7 @@ export function rewriteUrl(url, source) {
   if (page) return `${base}${page.slug}/${match[2]}`;
   if (resolved === 'README.md') return `${base}${match[2]}`;
   if (/^docs\/assets\/logo(?:-light|-dark)?\.svg$/.test(resolved)) return `${base}brand/${path.posix.basename(resolved)}${match[2]}`;
+  if (resolved === 'docs/assets/architecture.svg') return `${base}diagrams/architecture.svg${match[2]}`;
   return `${repository}/blob/main/${resolved.split('/').map(encodeURIComponent).join('/')}${match[2]}`;
 }
 

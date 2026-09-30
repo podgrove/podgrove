@@ -12,6 +12,7 @@ export const pages = [
   { source: 'docs/dogfood-workflows.md', slug: 'workflows', label: 'Development workflows', group: 'Use Podgrove' },
   { source: 'docs/known-limits.md', slug: 'known-limits', label: 'Known limits', group: 'Use Podgrove' },
   { source: 'deploy/README.md', slug: 'administration', label: 'Namespace administration', group: 'For maintainers' },
+  { source: 'docs/architecture.md', slug: 'architecture', label: 'Architecture and implementation', group: 'For maintainers' },
   { source: 'docs/verification.md', slug: 'verification', label: 'Verification', group: 'For maintainers' },
   { source: 'tests/README.md', slug: 'testing', label: 'Test lanes', group: 'For maintainers' },
   { source: 'CONTRIBUTING.md', slug: 'contributing', label: 'Contributing', group: 'For maintainers' },

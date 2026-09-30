@@ -14,7 +14,7 @@ forward:
 
 This fragment assumes `api` exists and publishes that target. Omit `forward` for automatic selection, supply a list to restrict it, or use `forward: []` to disable application tunnels. Optional `local: 43123` fixes a laptop port; normally omit it so concurrent worktrees can choose available ports. An occupied explicit port is an error. Automatic ports prefer a stable worktree-specific number and choose another if needed. Printed `http://` addresses are conveniences; Redis, MongoDB, TLS, and other TCP services still need their own client/protocol.
 
-Bind/config/secret files are copied before service startup, then local changes are mirrored one way. Remote edits do not sync back. Image-only source needs a declared Compose `develop.watch` action or an explicit `up --refresh`; Podgrove does not invent reload rules. A declared watch rebuild action can rebuild an image. Build contexts still follow the project's `.dockerignore`. See [file-sync architecture](how-it-works.md#storage-and-file-sync).
+Bind/config/secret files are copied before service startup, then local changes are mirrored one way. Remote edits do not sync back. Image-only source needs a declared Compose `develop.watch` action or an explicit `up --refresh`; Podgrove does not invent reload rules. A declared watch rebuild action can rebuild an image. Build contexts still follow the project's `.dockerignore`. See [file-sync architecture](architecture.md#storage-and-file-sync).
 
 To exclude local generated files from the mirror, opt in explicitly:
 

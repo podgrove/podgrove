@@ -22,8 +22,13 @@ for (const page of pages) {
   ].join('\n');
   await writeFile(resolve(destination, `${page.slug}.md`), frontmatter + markdown.slice(match[0].length));
 }
-for (const name of ['logo.svg', 'logo-light.svg', 'logo-dark.svg']) {
-  const output = resolve(site, 'public/brand', name);
+for (const [name, directory] of [
+  ['logo.svg', 'brand'],
+  ['logo-light.svg', 'brand'],
+  ['logo-dark.svg', 'brand'],
+  ['architecture.svg', 'diagrams'],
+]) {
+  const output = resolve(site, 'public', directory, name);
   await mkdir(dirname(output), { recursive: true });
   await copyFile(resolve(root, 'docs/assets', name), output);
 }

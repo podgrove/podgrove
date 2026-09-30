@@ -15,6 +15,8 @@ Follow the printed localhost URL, including its `/podgrove/` prefix. Edit the ex
 
 ## Check the result
 
+Diagrams are accessible SVG images in `docs/assets/`, so they render on both GitHub and the website. Add each site's image path explicitly to `scripts/prepare.mjs` and `scripts/links.mjs`; fenced Mermaid blocks are displayed as code. Keep the overview in `docs/how-it-works.md` short and put implementation details in the [architecture reference](../docs/architecture.md).
+
 ```sh
 npm test
 npm run build
