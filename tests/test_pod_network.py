@@ -4,6 +4,7 @@ import json
 from types import SimpleNamespace
 import threading
 import time
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -242,14 +243,19 @@ class MemoryKube:
 
     def call(self, *args, **kwargs):
         self.calls.append((args, kwargs))
-        if args[:2] == ('get', 'pods,configmaps'):
-            namespace = kwargs['namespace']
-            assert args[2:] == ('-l', f'{network.MANAGED}=podgrove', '-o', 'json')
-            assert namespace in self.allowed_namespaces
+        if args[:2] == ('get', '--raw'):
+            url = urlsplit(args[2])
+            fields = url.path.split('/')
+            assert fields[:4] == ['', 'api', 'v1', 'namespaces'] and len(fields) == 6
+            namespace, kind = fields[4:]
+            assert namespace in self.allowed_namespaces and kind in ('pods', 'configmaps')
+            query = parse_qs(url.query)
+            assert query['labelSelector'] == [f'{network.MANAGED}=podgrove']
+            assert query['limit'] == [str(network.MAX_PEERS)]
             if self.forbidden:
                 raise PodgroveError('Forbidden: peer namespace read access is not granted')
-            result = self.list_override or {'kind': 'List', 'items': [deepcopy(value)
-                for (ns, resource, _), value in self.inventory.items() if ns == namespace and resource in ('pods', 'configmaps')]}
+            result = self.list_override or {'metadata': {}, 'items': [deepcopy(value)
+                for (ns, resource, _), value in self.inventory.items() if ns == namespace and resource == kind]}
         elif args[0] == 'get':
             assert args[3:] == ('-o', 'json', '--ignore-not-found')
             result = self.get(args[1], args[2])
@@ -359,8 +365,8 @@ def test_peer_namespace_rbac_denial_revokes_instead_of_guessing_or_widening(mana
 
 
 @pytest.mark.parametrize('response', [
-    {'kind': 'List'}, {'kind': 'List', 'items': {}}, {'kind': 'List', 'items': [{'kind': 'Secret'}]},
-    {'kind': 'List', 'items': [{'kind': 'Pod', 'metadata': {}}] * 129},
+    {'metadata': {'continue': 'more'}, 'items': []},
+    {'metadata': {}, 'items': [{}] * 129}, {'metadata': {}, 'items': {}},
 ])
 def test_incomplete_or_unbounded_peer_list_never_creates_a_partial_grant(manager, response):
     instance, kube = manager
@@ -457,7 +463,7 @@ def test_withdrawal_never_rewrites_a_policy_owned_by_another_environment(manager
     assert kube.policies == before
 
 
-@pytest.mark.parametrize('count', [1, 2, 8])
+@pytest.mark.parametrize('count', [1, 2, 6])
 def test_refresh_call_count_is_bounded_by_namespace_count(manager, count):
     instance, kube = manager
     namespaces = [TARGET_NS] + [f'peer-{index}' for index in range(1, count)]
@@ -467,13 +473,13 @@ def test_refresh_call_count_is_bounded_by_namespace_count(manager, count):
     instance.refresh([])
     kube.calls.clear()
     instance.refresh()
-    assert len([args for args, _ in kube.calls if args[:2] == ('get', 'pods,configmaps')]) == count
-    assert len(kube.calls) <= count + 7
+    assert len([args for args, _ in kube.calls if args[:2] == ('get', '--raw')]) == 2 * count
+    assert len(kube.calls) <= 2 * count + 7
 
 
 def test_validated_namespace_maximum_fits_the_reconcile_budget():
     from podgrove.network import MAX_NAMESPACES
-    assert MAX_NAMESPACES + 7 <= network.RECONCILE_TIMEOUT - network.CLEANUP_TIMEOUT
+    assert 2 * MAX_NAMESPACES + 7 <= network.RECONCILE_TIMEOUT - network.CLEANUP_TIMEOUT
     too_many = {'pod_to_pod': 'selected', 'connect': [
         {'namespace': f'peer-{index}', 'worktree': '*', 'ports': [80]} for index in range(MAX_NAMESPACES + 1)]}
     with pytest.raises(PodgroveError, match=f'at most {MAX_NAMESPACES} distinct peer namespaces'):
@@ -543,7 +549,7 @@ def test_cancellation_stops_blocked_discovery_and_revokes_with_fresh_cleanup_eve
     original = kube.call
     errors = []
     def gated(*args, **kwargs):
-        if args[:2] == ('get', 'pods,configmaps'):
+        if args[:2] == ('get', '--raw'):
             blocked.set()
             if not kwargs['cancel_event'].wait(2):
                 raise AssertionError('Discovery did not receive the cancellation event')
@@ -674,3 +680,106 @@ def test_peer_pod_with_a_foreign_environment_label_never_receives_a_grant(manage
     result = instance.refresh([])
     assert TARGET not in granted(kube)
     assert any('ignored' in note for note in result['pending'])
+
+
+def test_nesting_bomb_declaration_is_refused_as_malformed():
+    bomb = '[' * 16000 + ']' * 16000
+    assert len(bomb) <= network.MAX_DECLARATION_BYTES
+    with pytest.raises(PodgroveError, match='malformed'):
+        network._checked_declaration(bomb)
+
+
+def test_nesting_bomb_peer_is_skipped_while_other_links_survive(manager):
+    instance, kube = manager
+    add_second_target(kube)
+    kube.inventory[(TARGET_NS, 'configmaps', f'pg-{TARGET}')]['data'][network.DECLARATION] = '[' * 16000 + ']' * 16000
+    result = instance.refresh([])
+    assert result['state'] == 'waiting' and granted(kube) == {THIRD}
+    assert any(note.startswith(f'{TARGET_NS}/pg-{TARGET}: peer ignored') for note in result['pending'])
+
+
+def test_unexpected_refresh_error_withdraws_grants_and_degrades_status(manager):
+    from podgrove.session_status import observed
+    instance, kube = manager
+    assert instance.refresh([])['state'] == 'ready' and granted(kube) == {TARGET}
+    def broken():
+        raise RuntimeError('unexpected discovery defect')
+    instance._peers = broken
+    result = instance.refresh()
+    assert result['state'] == 'unavailable' and 'RuntimeError: unexpected discovery defect' in result['error']
+    assert kube.policies[-1]['spec'] == policy_spec(SOURCE)
+    session = observed({'status': 'ready'}, ping={'ok': True, 'status': 'ready', 'pod_network_status': result})
+    assert session['status'] == 'degraded'
+
+
+def test_monitor_reports_a_refresh_that_cannot_start(manager, monkeypatch):
+    instance, kube = manager
+    monkeypatch.setattr(network, 'INTERVAL', 0.01)
+    instance.start([])
+    try:
+        def refuse():
+            raise RuntimeError('lock unavailable')
+        instance.refresh = refuse
+        deadline = time.monotonic() + 2
+        while instance.snapshot()['state'] != 'unavailable' and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert 'RuntimeError: lock unavailable' in instance.snapshot()['error']
+        assert instance.worker.is_alive()
+    finally:
+        instance.close()
+
+
+@pytest.mark.filterwarnings('ignore::pytest.PytestUnhandledThreadExceptionWarning')
+def test_dead_monitor_thread_is_visible_in_status(manager, monkeypatch):
+    instance, kube = manager
+    monkeypatch.setattr(network, 'INTERVAL', 0.01)
+    instance.start([])
+    assert instance.snapshot()['state'] == 'ready'
+    def fatal():
+        raise SystemExit('monitor killed')
+    instance.refresh = fatal
+    instance.worker.join(2)
+    assert not instance.worker.is_alive()
+    snapshot = instance.snapshot()
+    assert snapshot['state'] == 'unavailable' and 'monitor stopped unexpectedly' in snapshot['error']
+
+
+def test_own_pod_replaced_before_publish_never_advertises_the_old_identity(manager):
+    instance, kube = manager
+    assert instance.refresh([])['state'] == 'ready'
+    lease = kube.inventory[(SOURCE_NS, 'configmaps', f'pg-{SOURCE}')]
+    lease['data'].pop(network.DECLARATION)
+    kube.inventory[(SOURCE_NS, 'pods', f'pg-{SOURCE}-0')]['metadata']['uid'] = 'replacement'
+    before = len(kube.calls)
+    assert instance.refresh()['state'] == 'unavailable'
+    published = [json.loads(json.loads(args[5])[2]['value']) for args, _ in kube.calls[before:] if args[0] == 'patch']
+    assert published and all(item['pod_uid'] is None for item in published)
+
+
+def test_own_pod_replaced_during_discovery_never_receives_the_computed_grant(manager):
+    instance, kube = manager
+    assert instance.refresh([])['state'] == 'ready'
+    kube.policies.clear()
+    original = kube.call
+    def swap(*args, **kwargs):
+        if args[:2] == ('get', '--raw'):
+            kube.inventory[(SOURCE_NS, 'pods', f'pg-{SOURCE}-0')]['metadata']['uid'] = 'replacement'
+        return original(*args, **kwargs)
+    kube.call = swap
+    assert instance.refresh()['state'] == 'unavailable'
+    assert all(policy['spec'] == policy_spec(SOURCE) for policy in kube.policies)
+
+
+def test_runtime_open_mode_never_advertises_a_docker_api_publication():
+    rows = application_rows()
+    rows[0]['Publishers'].append({'TargetPort': 2375, 'PublishedPort': 2375, 'Protocol': 'tcp', 'URL': '0.0.0.0'})
+    ports = network.observed_ports(network_settings({'pod_to_pod': 'open'}), application_model(), rows)
+    assert ports == PORTS
+
+
+def test_runtime_open_mode_refuses_more_than_128_ports_with_its_own_reason():
+    rows = application_rows()
+    rows[0]['Publishers'] = [{'TargetPort': 8000 + index, 'PublishedPort': 20000 + index, 'Protocol': 'tcp', 'URL': '0.0.0.0'}
+                             for index in range(129)]
+    with pytest.raises(PodgroveError, match='more than 128 published TCP ports'):
+        network.observed_ports(network_settings({'pod_to_pod': 'open'}), application_model(), rows)

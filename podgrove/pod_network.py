@@ -7,6 +7,7 @@ import json
 import re
 import threading
 import time
+from urllib.parse import urlencode
 
 from .errors import PodgroveError
 from .kube import Kube
@@ -94,6 +95,8 @@ def observed_ports(settings, model, rows):
                 raise PodgroveError(f"network.expose: {item['service']}:{item['published']} is not running with a "
                                     "verified 0.0.0.0 published binding; peer access remains closed")
         return declared
+    if len(observed) > 128:
+        raise PodgroveError("network.pod_to_pod open: more than 128 published TCP ports cannot be advertised")
     return [{"service": service, "target": target, "published": published}
             for service, target, published in sorted(observed)]
 
@@ -203,8 +206,12 @@ def _checked_declaration(value):
                     or any(type(item[key]) is not int or not 1 <= item[key] <= 65535 for key in ("target", "published"))):
                 raise ValueError
         return profile
-    except (ValueError, TypeError, KeyError) as error:
+    except (ValueError, TypeError, KeyError, RecursionError) as error:
         raise PodgroveError("Peer network declaration is malformed; refusing its grants") from error
+
+
+def _reason(error):
+    return str(error) if isinstance(error, PodgroveError) else f"{type(error).__name__}: {error}"
 
 
 class _BoundedKube(Kube):
@@ -241,13 +248,11 @@ class PodNetwork:
         self.lease_uid = None
         self.current = {"state": "starting", "mode": self.settings.get("pod_to_pod", "disabled"), "endpoints": []}
 
-    def _call(self, *args, namespace=None, **kwargs):
+    def _call(self, *args, **kwargs):
         remaining = self.deadline - time.monotonic() if self.deadline is not None else 15
         if self.cancel_event.is_set() or remaining <= 0:
             raise PodgroveError("Pod networking reconciliation cancelled or its deadline expired")
         timeout = min(15, remaining, kwargs.pop("timeout", 15))
-        if namespace is not None:
-            kwargs["namespace"] = namespace
         result = self.kube.call(*args, timeout=timeout, cancel_event=self.cancel_event, **kwargs)
         if len(result.stdout.encode("utf-8")) > MAX_RESPONSE_BYTES:
             raise PodgroveError("Pod networking API response exceeds 8 MiB")
@@ -259,21 +264,17 @@ class PodNetwork:
         result = self._call("get", kind, name, "-o", "json", "--ignore-not-found")
         return json.loads(result.stdout) if result.stdout.strip() else {}
 
-    def _list(self, namespace):
-        """One labelled list call returns both the Pods and the leases of a namespace."""
-        response = self._call("get", "pods,configmaps", "-l", f"{MANAGED}=podgrove", "-o", "json", namespace=namespace)
+    def _list(self, namespace, kind):
+        """One server-bounded labelled list per kind per namespace."""
+        query = urlencode({"labelSelector": f"{MANAGED}=podgrove", "limit": MAX_PEERS})
+        response = self._call("get", "--raw", f"/api/v1/namespaces/{namespace}/{kind}?{query}")
         value = json.loads(response.stdout)
-        if not isinstance(value, dict) or not isinstance(value.get("items"), list):
-            raise PodgroveError(f"Pod networking discovery response for {namespace} is malformed")
-        kinds = {"Pod": [], "ConfigMap": []}
-        for item in value["items"]:
-            kind = item.get("kind") if isinstance(item, dict) else None
-            if kind not in kinds:
-                raise PodgroveError(f"Pod networking discovery in {namespace} returned an unexpected object")
-            kinds[kind].append(item)
-        if any(len(items) > MAX_PEERS for items in kinds.values()):
+        if not isinstance(value, dict) or not isinstance(value.get("metadata", {}), dict):
+            raise PodgroveError("Pod networking discovery response is malformed")
+        items = value.get("items")
+        if not isinstance(items, list) or len(items) > MAX_PEERS or value.get("metadata", {}).get("continue"):
             raise PodgroveError(f"Pod networking discovery in {namespace} exceeds {MAX_PEERS} objects")
-        return kinds["Pod"], kinds["ConfigMap"]
+        return items
 
     def _own_controller(self):
         controller = self._get("statefulset", f"pg-{self.ident}")
@@ -349,19 +350,18 @@ class PodNetwork:
         namespaces.update(source["namespace"] for rule in self.settings["expose"] for source in rule["from"])
         peers, skipped = [], []
         for namespace in sorted(namespaces):
-            pod_items, leases = self._list(namespace)
             pods = {}
-            for pod in pod_items:
-                name = pod.get("metadata", {}).get("name") if isinstance(pod.get("metadata"), dict) else None
+            for pod in self._list(namespace, "pods"):
+                name = pod.get("metadata", {}).get("name") if isinstance(pod, dict) and isinstance(pod.get("metadata"), dict) else None
                 if not isinstance(name, str):
                     skipped.append(f"{namespace}: ignored a managed Pod with malformed metadata")
                     continue
                 pods[name] = None if name in pods else pod
-            for lease in leases:
-                label = lease.get("metadata", {}).get("name") if isinstance(lease.get("metadata"), dict) else None
+            for lease in self._list(namespace, "configmaps"):
+                label = lease.get("metadata", {}).get("name") if isinstance(lease, dict) and isinstance(lease.get("metadata"), dict) else None
                 try:
                     found = self._peer(namespace, lease, pods)
-                except (PodgroveError, ValueError, KeyError, TypeError, AttributeError) as error:
+                except Exception as error:  # any defect in one peer's data skips only that peer
                     skipped.append(f"{namespace}/{label if isinstance(label, str) else '?'}: peer ignored: {error}")
                     continue
                 if found:
@@ -433,21 +433,18 @@ class PodNetwork:
                 self._apply(ingress, egress)
             current = {"state": "waiting" if pending else "ready", "mode": self.settings.get("pod_to_pod", "disabled"),
                        "endpoints": addresses(self.kube.namespace, self.ident, ports), "pending": pending}
-        except (PodgroveError, ValueError, KeyError, TypeError, AttributeError, OSError) as error:
-            detail = str(error)
+        except Exception as error:  # fail closed: any failure withdraws this engine's grants
+            detail = _reason(error)
             if self.settings.get("pod_to_pod") in ("selected", "open"):
                 try:
                     self.deadline = deadline
                     self.cancel_event = threading.Event()
                     self._withdraw()
-                except (PodgroveError, ValueError, KeyError, TypeError, AttributeError, OSError) as revoke_error:
-                    detail += f"; unable to withdraw peer access: {revoke_error}"
+                except Exception as revoke_error:
+                    detail += f"; unable to withdraw peer access: {_reason(revoke_error)}"
             current = {"state": "unavailable", "mode": self.settings.get("pod_to_pod"), "endpoints": [], "error": detail}
         current["checked_at"] = time.time()
-        with self.lock:
-            self.current = current
-        if self.on_change:
-            self.on_change(current)
+        self._record(current)
         return current
 
     def start(self, rows, *, deadline=None, cancel_event=None):
@@ -462,7 +459,11 @@ class PodNetwork:
         active()
         def monitor():
             while not self.stopping.wait(INTERVAL):
-                self.refresh()
+                try:
+                    self.refresh()
+                except Exception as error:  # a refresh that cannot even start is reported, never silent
+                    self._record({"state": "unavailable", "mode": self.settings.get("pod_to_pod"), "endpoints": [],
+                                  "error": f"Pod networking refresh failed: {_reason(error)}", "checked_at": time.time()})
         self.worker = threading.Thread(target=monitor, name="podgrove-pod-network", daemon=True)
         self.worker.start()
         return self
@@ -471,9 +472,18 @@ class PodNetwork:
         with self.lock:
             self.rows = copy.deepcopy(rows)
 
+    def _record(self, current):
+        with self.lock:
+            self.current = current
+        if self.on_change:
+            self.on_change(current)
+
     def snapshot(self):
         with self.lock:
-            return copy.deepcopy(self.current)
+            current = copy.deepcopy(self.current)
+        if self.worker is not None and not self.worker.is_alive() and not self.stopping.is_set():
+            current.update(state="unavailable", endpoints=[], error="Pod networking monitor stopped unexpectedly; peer grants are no longer reconciled")
+        return current
 
     def close(self):
         self.stopping.set()

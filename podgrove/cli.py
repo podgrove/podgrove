@@ -212,6 +212,11 @@ def _resolve_target(args, root: Path | None) -> None:
     _set_target(args, target)
 
 
+def _refuse_legacy_grants(record: dict) -> None:
+    if record.get("connect") or record.get("reconcile_connections"):
+        raise PodgroveError("Existing legacy connect grants require scoped down with the previous Podgrove version before migration to network; save data first because down deletes it")
+
+
 def up(args, root: Path) -> int:
     from .runtime import control, is_running, spawn
     root = _project_paths(args, root)
@@ -258,8 +263,7 @@ def up(args, root: Path) -> int:
         if path.exists():
             old = state.read(path)
             state.validate_binding(old, root, args.context)
-            if old.get("connect") or old.get("reconcile_connections"):
-                raise PodgroveError("Existing legacy connect grants require scoped down with the previous Podgrove version before migration to network; save data first because down deletes it")
+            _refuse_legacy_grants(old)
             args.mr_url = args.mr_url or old.get("mr_url", "")
             if args.mr_url:
                 mr_endpoint(args.mr_url)
@@ -403,6 +407,9 @@ def execute(args) -> int:
         _set_target(args, load_cluster(args._config_root, args.config), required=False)
         config = load_config(args._config_root, args.config, args.files)
         refuse_legacy_connect(config)
+        recorded = state.state_path(root, args.context, create=False) if args.context else None
+        if recorded is not None and recorded.exists():
+            _refuse_legacy_grants(state.read(recorded))
         compose = Compose(config)
         model = compose.model()
         compose.validate(model)

@@ -23,7 +23,7 @@ PRIVATE_AND_SPECIAL_IPV4 = (
 
 MANAGED = "app.kubernetes.io/managed-by"
 ENVIRONMENT = "podgrove.dev/environment"
-MAX_NAMESPACES = 8
+MAX_NAMESPACES = 6
 NAMESPACE_SCHEMA = {"type": "string", "minLength": 1, "maxLength": 63,
                     "pattern": r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"}
 WORKTREE_SCHEMA = {"type": "string", "minLength": 1, "maxLength": 128,
@@ -40,9 +40,10 @@ NETWORK_SCHEMA = {
             "description": "Additional infrastructure CIDRs excluded from public web egress; built-in exclusions always remain.",
         },
         "pod_to_pod": {"type": "string", "enum": ["disabled", "open", "selected"], "default": "disabled",
-                       "description": "Disabled isolates engines; open permits all ports between Podgrove engines in this namespace and any listed in network.namespaces; selected requires declared ingress and egress."},
-        "namespaces": {"type": "array", "maxItems": MAX_NAMESPACES, "uniqueItems": True, "items": NAMESPACE_SCHEMA,
-                       "description": "Open mode only: additional exact namespaces whose Podgrove engines may connect; the engine's own namespace is always included."},
+                       "description": "Disabled isolates engines; open permits all ports to and from Pods labelled managed-by podgrove in this namespace and any listed in network.namespaces; selected requires declared ingress and egress."},
+        "namespaces": {"type": "array", "maxItems": MAX_NAMESPACES, "uniqueItems": True,
+                       "items": {**NAMESPACE_SCHEMA, "not": {"pattern": "^kube-"}},
+                       "description": "Open mode only: extra exact namespaces whose Pods labelled managed-by podgrove are admitted, so list only namespaces with a Podgrove bootstrap; each side must list the other's namespace."},
         "expose": {
             "type": "array", "maxItems": 32, "uniqueItems": True,
             "items": {"type": "object", "additionalProperties": False, "required": ["service", "from"],
@@ -178,12 +179,18 @@ def validate_model(network: dict | None, model: dict) -> list[dict]:
     settings = network_settings(network)
     services = model.get("services", {}) if isinstance(model, dict) else {}
     if settings.get("pod_to_pod") == "open":
+        published_ports = set()
         for name, service in sorted(services.items() if isinstance(services, dict) else []):
             for port in (service.get("ports") or []) if isinstance(service, dict) else []:
                 published = port.get("published") if isinstance(port, dict) else None
                 if str(published) in ("2375", "2376"):
                     raise PodgroveError(f"network.pod_to_pod open: service {name} publishes Docker API port {published}; "
                                         "open peers would reach it, so publish it on another port")
+                if published not in (None, "", 0):
+                    published_ports.add((name, port.get("target"), str(published)))
+        if len(published_ports) > 128:
+            raise PodgroveError(f"network.pod_to_pod open: {len(published_ports)} published TCP ports exceed the 128 "
+                                "an engine can advertise; publish fewer ports")
         return []
     if settings.get("pod_to_pod") != "selected":
         return []

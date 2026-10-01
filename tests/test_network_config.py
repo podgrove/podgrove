@@ -295,3 +295,44 @@ def test_validate_and_dry_run_refuse_an_oversized_declaration(tmp_path, monkeypa
     args = cli.parser().parse_args([*command, '--context', 'test-context', '--namespace', 'podgrove-testing'])
     with pytest.raises(PodgroveError, match='the limit is 32768 bytes'):
         cli.execute(args)
+
+
+def test_open_mode_refuses_more_than_128_published_ports_offline():
+    model = {'services': {'many': {'ports': [{'target': 8000 + index, 'published': str(20000 + index)} for index in range(129)]}}}
+    with pytest.raises(PodgroveError, match='129 published TCP ports exceed the 128'):
+        validate_model({'pod_to_pod': 'open'}, model)
+    model['services']['many']['ports'].pop()
+    assert validate_model({'pod_to_pod': 'open'}, model) == []
+
+
+@pytest.mark.parametrize('namespace', ['kube-system', 'kube-public'])
+def test_published_schema_refuses_system_namespaces_for_open(tmp_path, namespace):
+    import jsonschema
+    from podgrove.config import CONFIG_SCHEMA
+    document = {'network': {'pod_to_pod': 'open', 'namespaces': [namespace]}}
+    assert not jsonschema.Draft202012Validator(CONFIG_SCHEMA).is_valid(document)
+    published = json.loads((Path(__file__).resolve().parents[1] / 'schema' / 'podgrove-v1.schema.json').read_text())
+    assert not jsonschema.Draft202012Validator(published).is_valid(document)
+    assert jsonschema.Draft202012Validator(published).is_valid({'network': {'pod_to_pod': 'open', 'namespaces': ['team-b']}})
+
+
+def test_validate_refuses_recorded_legacy_grants_offline(tmp_path, monkeypatch):
+    from podgrove import state
+
+    class FakeCompose:
+        def __init__(self, config):
+            pass
+
+    project = tmp_path / 'project'
+    project.mkdir()
+    (project / 'compose.yaml').write_text('services: {}\n')
+    monkeypatch.setenv('PODGROVE_STATE_HOME', str(tmp_path / 'state'))
+    monkeypatch.chdir(project)
+    monkeypatch.setattr(cli, 'Compose', FakeCompose)
+    path = state.state_path(project.resolve(), 'test-context')
+    assert path.is_relative_to(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state.write(path, {'root': str(project.resolve()), 'context': 'test-context', 'connect': [{'name': 'db'}]})
+    args = cli.parser().parse_args(['validate', '--context', 'test-context', '--namespace', 'podgrove-testing'])
+    with pytest.raises(PodgroveError, match='Existing legacy connect grants'):
+        cli.execute(args)

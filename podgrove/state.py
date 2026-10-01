@@ -28,9 +28,9 @@ def state_home(*, create: bool = True) -> Path:
     return base
 
 
-def state_path(root: Path, context: str) -> Path:
+def state_path(root: Path, context: str, *, create: bool = True) -> Path:
     cluster = hashlib.sha256(context.encode()).hexdigest()[:8]
-    return state_home() / f"{identity(root)}-{cluster}.json"
+    return state_home(create=create) / f"{identity(root)}-{cluster}.json"
 
 
 def read(path: Path) -> dict:
