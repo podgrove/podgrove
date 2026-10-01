@@ -1,5 +1,7 @@
 """Independent local children/sockets exercise idle application-forward recovery."""
 from copy import deepcopy
+import errno
+import io
 import json
 import socket
 import sys
@@ -327,12 +329,121 @@ def test_cancelled_command_never_launches(tmp_path):
     assert not marker.exists()
 
 
+@pytest.mark.parametrize("outcome", ["killed", "missing"])
+def test_cancellation_and_finally_signal_owned_group_once_even_when_second_call_would_be_eperm(monkeypatch, outcome):
+    from podgrove import process as commands
+    import signal
+    entered, cleanup_waiting, release = threading.Event(), threading.Event(), threading.Event()
+    cancelled = threading.Event()
+    calls, waited = [], []
+    caller = threading.get_ident()
+    child = SimpleNamespace(pid=24680, returncode=None, stdin=io.StringIO(), stdout=io.StringIO(), stderr=io.StringIO())
+
+    class TerminationLock:
+        def __init__(self):
+            self.lock = threading.Lock()
+
+        def __enter__(self):
+            if threading.get_ident() == caller:
+                cleanup_waiting.set()
+            self.lock.acquire()
+
+        def __exit__(self, *_):
+            self.lock.release()
+
+    def communicate(*, input, timeout):
+        cancelled.set()
+        assert entered.wait(2), "Cancellation monitor never attempted group termination"
+        return "", ""
+
+    def killpg(pid, sig):
+        calls.append((pid, sig))
+        if len(calls) > 1:
+            raise PermissionError(errno.EPERM, "Exited Darwin process group cannot be signalled twice")
+        assert threading.current_thread().name == "podgrove-command-cancel"
+        child.returncode = -signal.SIGKILL if outcome == "killed" else 0
+        entered.set()
+        assert release.wait(3), "Cleanup did not contend with the cancellation monitor"
+        if outcome == "missing":
+            raise ProcessLookupError(errno.ESRCH, "Owned group already gone")
+
+    child.communicate = communicate
+    child.wait = lambda *, timeout: waited.append(timeout) or child.returncode
+    monkeypatch.setattr(commands.subprocess, "Popen", lambda *_args, **_kwargs: child)
+    monkeypatch.setattr(commands, "os", SimpleNamespace(killpg=killpg))
+    monkeypatch.setattr(commands, "threading", SimpleNamespace(Event=threading.Event, Thread=threading.Thread, Lock=TerminationLock))
+
+    def allow_signal_to_finish():
+        cleanup_waiting.wait(2)
+        release.set()
+
+    coordinator = threading.Thread(target=allow_signal_to_finish)
+    coordinator.start()
+    try:
+        with pytest.raises(PodgroveError, match="fixture cancelled"):
+            commands.run(["fixture"], timeout=5, cancel_event=cancelled)
+        assert cleanup_waiting.is_set()
+        assert calls == [(child.pid, signal.SIGKILL)]
+        assert waited == [2]
+        assert all(pipe.closed for pipe in (child.stdin, child.stdout, child.stderr))
+        assert not any(thread.name == "podgrove-command-cancel" for thread in threading.enumerate())
+    finally:
+        release.set()
+        coordinator.join(3)
+        for thread in threading.enumerate():
+            if thread.name == "podgrove-command-cancel":
+                thread.join(3)
+        assert not coordinator.is_alive()
+
+
+@pytest.mark.parametrize("where", ["monitor", "finally"])
+@pytest.mark.parametrize("still_live", [False, True])
+def test_first_group_permission_error_is_reported_and_cleanup_still_waits_and_closes(monkeypatch, where, still_live):
+    from podgrove import process as commands
+    import subprocess
+    attempted, cancelled = threading.Event(), threading.Event()
+    calls, waited = [], []
+    denial = PermissionError(errno.EPERM, "First group termination denied")
+    child = SimpleNamespace(pid=24680, returncode=None if still_live else 0,
+                            stdin=io.StringIO(), stdout=io.StringIO(), stderr=io.StringIO())
+
+    def communicate(*, input, timeout):
+        if where == "monitor":
+            cancelled.set()
+            assert attempted.wait(2)
+        return "", ""
+
+    def killpg(pid, sig):
+        calls.append((pid, sig))
+        attempted.set()
+        if len(calls) == 1:
+            raise denial
+
+    def wait(*, timeout):
+        waited.append(timeout)
+        if still_live:
+            raise subprocess.TimeoutExpired("fixture", timeout)
+        return child.returncode
+
+    child.communicate, child.wait = communicate, wait
+    monkeypatch.setattr(commands.subprocess, "Popen", lambda *_args, **_kwargs: child)
+    monkeypatch.setattr(commands, "os", SimpleNamespace(killpg=killpg))
+    with pytest.raises(PermissionError) as error:
+        commands.run(["fixture"], timeout=5, cancel_event=cancelled)
+    assert error.value is denial
+    assert len(calls) == 1 and waited == [2]
+    assert all(pipe.closed for pipe in (child.stdin, child.stdout, child.stderr))
+    assert not any(thread.name == "podgrove-command-cancel" for thread in threading.enumerate())
+
+
 def test_cancellation_kills_owned_helpers_after_process_group_leader_exits(tmp_path, monkeypatch):
     import os
     import signal
     import subprocess
     marker = tmp_path / "helper-pid"
     original = subprocess.Popen
+    signal_group = os.killpg
+    signals = []
     leaders = []
     cancelled = threading.Event()
 
@@ -342,6 +453,13 @@ def test_cancellation_kills_owned_helpers_after_process_group_leader_exits(tmp_p
         return child
 
     monkeypatch.setattr(subprocess, "Popen", launch)
+
+    def killpg(pid, sig):
+        assert leaders and pid == leaders[0].pid and sig == signal.SIGKILL
+        signals.append((pid, sig))
+        return signal_group(pid, sig)
+
+    monkeypatch.setattr(os, "killpg", killpg)
 
     def cancel_after_leader_exit():
         deadline = time.monotonic() + 2
@@ -355,6 +473,7 @@ def test_cancellation_kills_owned_helpers_after_process_group_leader_exits(tmp_p
     watcher = threading.Thread(target=cancel_after_leader_exit)
     watcher.start()
     started = time.monotonic()
+    helper_inactive = False
     try:
         with pytest.raises(PodgroveError, match="cancelled"):
             run([sys.executable, "-c",
@@ -364,14 +483,16 @@ def test_cancellation_kills_owned_helpers_after_process_group_leader_exits(tmp_p
                 timeout=5, cancel_event=cancelled)
         assert time.monotonic() - started < 2
         assert leaders[0].returncode == 0
+        assert signals == [(leaders[0].pid, signal.SIGKILL)]
         assert not any(thread.name == "podgrove-command-cancel" for thread in threading.enumerate())
         helper = int(marker.read_text())
         # A terminated orphan may briefly remain a zombie until the OS reaps it.
         status = original(["ps", "-o", "stat=", "-p", str(helper)], stdout=subprocess.PIPE, text=True)
         assert status.communicate(timeout=2)[0].strip() in ("", "Z", "Z+")
+        helper_inactive = True
     finally:
         watcher.join(timeout=3)
-        if marker.exists():
+        if not helper_inactive and marker.exists():
             try:
                 os.kill(int(marker.read_text()), signal.SIGKILL)
             except ProcessLookupError:

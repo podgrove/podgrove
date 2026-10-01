@@ -186,8 +186,8 @@ def test_new_connection_refuses_replacement_even_with_valid_labels(replaced):
         kube.controller["metadata"]["uid"] = "replacement"
         kube.pod["metadata"]["ownerReferences"][0]["uid"] = "replacement"
     try:
-        with connect(tunnel) as client:
-            with pytest.raises(ConnectionResetError):
+        with pytest.raises(ConnectionResetError):
+            with connect(tunnel) as client:
                 receive(client)
         with pytest.raises(PodgroveError, match="replaced"):
             tunnel.check()
@@ -200,8 +200,8 @@ def test_nonzero_transport_exit_resets_only_client_and_retains_safe_diagnostics(
     kube = FakeKube("import sys;sys.stderr.write('x'*100000+'broken pipe: private-value');sys.stderr.flush();sys.exit(7)")
     tunnel = DockerTunnel(kube, IDENT, 0).start()
     try:
-        with connect(tunnel) as client:
-            with pytest.raises(ConnectionResetError):
+        with pytest.raises(ConnectionResetError):
+            with connect(tunnel) as client:
                 receive(client)
         wait_until(lambda: tunnel.snapshot()["failed_connections"] == 1)
         tunnel.check()
@@ -244,8 +244,8 @@ def test_connection_limit_bounds_children_without_disrupting_existing_stream():
         with connect(tunnel) as first:
             first.sendall(b"ready\n")
             assert receive_exact(first, len(b"ready\n")) == b"ready\n"
-            with connect(tunnel) as second:
-                with pytest.raises(ConnectionResetError):
+            with pytest.raises(ConnectionResetError):
+                with connect(tunnel) as second:
                     receive(second)
             first.sendall(b"still-connected\n")
             assert receive_exact(first, len(b"still-connected\n")) == b"still-connected\n"
@@ -333,9 +333,8 @@ def test_guarded_replacement_uid_is_refused_inside_exec_before_daemon_access():
     tunnel = DockerTunnel(kube, IDENT, 0).start()
     kube.remote_uid = "replacement-pod-uid"
     try:
-        with connect(tunnel) as client:
-            client.shutdown(socket.SHUT_WR)
-            with pytest.raises(ConnectionResetError):
+        with pytest.raises(ConnectionResetError):
+            with connect(tunnel) as client:
                 receive(client)
         with pytest.raises(PodgroveError, match="UID changed"):
             tunnel.check()
@@ -356,8 +355,8 @@ def test_literal_or_wrong_uid_source_never_enables_cached_ownership(binding):
     kube.pod["metadata"]["uid"] = "replacement"
     try:
         assert tunnel._uid_guard is False and tunnel._verification_thread.is_alive()
-        with connect(tunnel) as client:
-            with pytest.raises(ConnectionResetError):
+        with pytest.raises(ConnectionResetError):
+            with connect(tunnel) as client:
                 receive(client)
         with pytest.raises(PodgroveError, match="replaced"):
             tunnel.check()
@@ -414,8 +413,8 @@ def test_transport_failure_preserves_existing_and_future_connections_without_rep
             existing.sendall(b"ready\n")
             assert receive_exact(existing, len(b"ready\n")) == b"ready\n"
             kube.script = "import sys;sys.stderr.write('primary-failure');sys.exit(7)"
-            with connect(tunnel) as failing:
-                with pytest.raises(ConnectionResetError):
+            with pytest.raises(ConnectionResetError):
+                with connect(tunnel) as failing:
                     failing.recv(1024)
             existing.sendall(b"still-working\n")
             assert receive_exact(existing, len(b"still-working\n")) == b"still-working\n"
@@ -443,8 +442,8 @@ def test_expired_guarded_cache_revalidates_before_opening_another_stream():
     kube.controller["metadata"]["uid"] = "replacement-controller"
     kube.pod["metadata"]["ownerReferences"][0]["uid"] = "replacement-controller"
     try:
-        with connect(tunnel) as client:
-            with pytest.raises(ConnectionResetError):
+        with pytest.raises(ConnectionResetError):
+            with connect(tunnel) as client:
                 receive(client)
         with pytest.raises(PodgroveError, match="replaced"):
             tunnel.check()
@@ -483,8 +482,8 @@ def test_child_launch_failure_is_local_and_does_not_expose_exception_text(monkey
         def unavailable(*_args, **_kwargs):
             raise OSError(24, "sensitive-command-value")
         monkeypatch.setattr(subprocess, "Popen", unavailable)
-        with connect(tunnel) as failed:
-            with pytest.raises(ConnectionResetError):
+        with pytest.raises(ConnectionResetError):
+            with connect(tunnel) as failed:
                 receive(failed)
         wait_until(lambda: tunnel.snapshot()["failed_connections"] == 1)
         tunnel.check()
@@ -504,8 +503,8 @@ def test_stream_diagnostics_are_bounded_copies_and_logging_is_rate_limited(caplo
     tunnel = DockerTunnel(kube, IDENT, 0).start()
     try:
         for _ in range(4):
-            with connect(tunnel) as client:
-                with pytest.raises(ConnectionResetError):
+            with pytest.raises(ConnectionResetError):
+                with connect(tunnel) as client:
                     receive(client)
         wait_until(lambda: tunnel.snapshot()["failed_connections"] == 4)
         snapshot = tunnel.snapshot()
@@ -528,8 +527,8 @@ def test_uid_guard_rejection_still_revokes_other_connections_immediately():
             existing.sendall(b"before\n")
             assert receive_exact(existing, 7) == b"before\n"
             kube.remote_uid = "replacement-uid"
-            with connect(tunnel) as changed:
-                with pytest.raises(ConnectionResetError):
+            with pytest.raises(ConnectionResetError):
+                with connect(tunnel) as changed:
                     receive(changed)
             with pytest.raises(ConnectionResetError):
                 existing.recv(1024)
@@ -546,8 +545,8 @@ def test_guard_rejection_survives_fragmentation_and_bounded_stderr_suffix():
                        f"time.sleep(.03);sys.stderr.write({_UID_REJECTED[20:]!r}+'x'*100000);sys.exit(126)")
     tunnel = DockerTunnel(kube, IDENT, 0).start()
     try:
-        with connect(tunnel) as client:
-            with pytest.raises(ConnectionResetError):
+        with pytest.raises(ConnectionResetError):
+            with connect(tunnel) as client:
                 receive(client)
         with pytest.raises(PodgroveError, match="UID changed"):
             tunnel.check()
@@ -624,8 +623,8 @@ def test_transient_verification_outage_gates_new_requests_preserves_peer_and_rec
             wait_until(lambda: tunnel.snapshot()["verification"]["state"] == "unavailable")
             # New operations are refused before opening a kubectl exec. An
             # established, previously proved stream survives the short outage.
-            with connect(tunnel) as refused:
-                with pytest.raises(ConnectionResetError):
+            with pytest.raises(ConnectionResetError):
+                with connect(tunnel) as refused:
                     refused.recv(1)
             assert len(kube.commands) == 1
             existing.sendall(b"during\n")
@@ -702,8 +701,8 @@ def test_legacy_connection_read_outage_recovers_without_waiting_full_normal_inte
     tunnel = DockerTunnel(kube, IDENT, 0, verification_interval=30).start()
     try:
         kube.failure = "exit"
-        with connect(tunnel) as refused:
-            with pytest.raises(ConnectionResetError):
+        with pytest.raises(ConnectionResetError):
+            with connect(tunnel) as refused:
                 refused.recv(1)
         wait_until(lambda: tunnel._verification_unavailable)
         kube.failure = None

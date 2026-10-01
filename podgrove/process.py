@@ -45,19 +45,34 @@ def _cancellable(args, *, env, cwd, input, timeout, cancel_event):
                                stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     finished = threading.Event()
+    termination_lock = threading.Lock()
+    terminated = False
+    termination_error = None
 
     def terminate():
-        # The leader can exit while an authentication helper still holds our
-        # capture pipes. Its private process group remains ours to terminate.
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        nonlocal terminated, termination_error
+        # An exited leader can leave pipe-holding helpers; signal its owned group exactly once.
+        with termination_lock:
+            if termination_error is not None:
+                raise termination_error
+            if terminated:
+                return
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError as error:
+                termination_error = error
+                raise
+            terminated = True
 
     def cancel():
         while not finished.wait(.1):
             if cancel_event.is_set():
-                terminate()
+                try:
+                    terminate()
+                except OSError:
+                    pass  # The synchronous cleanup path reports the retained first failure.
                 return
 
     monitor = threading.Thread(target=cancel, name="podgrove-command-cancel", daemon=True)
@@ -69,10 +84,24 @@ def _cancellable(args, *, env, cwd, input, timeout, cancel_event):
         return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
     finally:
         finished.set()
-        terminate()
-        process.wait(timeout=2)
+        cleanup_error = None
+        try:
+            terminate()
+        except OSError as error:
+            cleanup_error = error
+        try:
+            process.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            if cleanup_error is None:
+                cleanup_error = error
         if monitor.ident is not None:
             monitor.join(timeout=1)
         for pipe in (process.stdin, process.stdout, process.stderr):
             if pipe is not None:
-                pipe.close()
+                try:
+                    pipe.close()
+                except OSError as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+        if cleanup_error is not None:
+            raise cleanup_error
