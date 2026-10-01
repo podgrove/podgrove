@@ -53,6 +53,10 @@ jobs:
       github.ref == 'refs/heads/main' && vars.RELEASE_AUTOMATION_ENABLED == 'true' &&
       (needs.release-please.outputs.created == 'true' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    # Draft releases are listed only for a token with push access.
+    permissions:
+      contents: write
+      actions: read
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
       sha: ${{ steps.resolve.outputs.sha }}

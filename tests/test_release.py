@@ -336,13 +336,15 @@ def test_workflow_permissions_pins_and_publication_guards():
     assert "release" not in release["on"], "Do not rely on GITHUB_TOKEN release events triggering workflows"
     assert "RELEASE_AUTOMATION_ENABLED" in release["jobs"]["release-please"]["if"]
     assert "RELEASE_AUTOMATION_ENABLED" in release["jobs"]["resolve"]["if"]
+    assert release["jobs"]["resolve"]["permissions"] == {"contents": "write", "actions": "read"}, "Drafts are invisible to a read token"
     assert release["on"]["workflow_dispatch"]["inputs"]["artifact_run_id"]["required"] == "true"
     assert release["jobs"]["publish"]["environment"] == "release"
     assert release["jobs"]["homebrew-pr"]["environment"] == "homebrew"
     assert "HOMEBREW_TAP_REPOSITORY" in release["jobs"]["homebrew-pr"]["if"]
     config = json.loads((ROOT / "release-please-config.json").read_text())
     assert config["draft"] is True and config["force-tag-creation"] is True
-    assert config["packages"]["."]["extra-files"][0]["jsonpath"] == "$.package[?(@.name=='podgrove')].version"
+    # release-please's TOML parser wraps scalars as {start, end, value}, so the filter must read .value.
+    assert config["packages"]["."]["extra-files"][0]["jsonpath"] == "$.package[?(@.name.value=='podgrove')].version"
 
 
 def test_other_release_artifact_cannot_be_published(bundle, github):
