@@ -220,12 +220,12 @@ def _refuse_legacy_grants(record: dict) -> None:
 def _refuse_recorded_legacy_grants(path: Path) -> None:
     """Read-only legacy check for validate; unreadable state names its path and the fix."""
     try:
-        present = path.exists()
-    except OSError as exc:
+        os.stat(path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:  # Path.exists() hides PermissionError on newer Pythons, so stat explicitly
         raise PodgroveError(f"Cannot read the Podgrove state directory {path.parent}: {exc.strerror or exc}. "
                             "Restore its permissions (chmod 700) or set PODGROVE_STATE_HOME to a readable directory") from exc
-    if not present:
-        return
     try:
         record = state.read(path)
     except PodgroveError as exc:
