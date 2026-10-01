@@ -172,7 +172,7 @@ def test_partial_application_failure_returns_nonzero_retains_state_and_endpoints
 
 @pytest.mark.parametrize("setting", [
     {"reverse": [{"local_port": 8080}]},
-    {"connect": [{"name": "db", "environment": "abcdef123456", "service": "db", "port": 27017}]},
+    {"network": {"pod_to_pod": "open"}},
 ])
 def test_changed_connectivity_configuration_invalidates_fast_path_and_is_saved(project, capsys, setting):
     original = project.record()
@@ -184,8 +184,6 @@ def test_changed_connectivity_configuration_invalidates_fast_path_and_is_saved(p
     assert [call.args[1] for call in project.control.call_args_list] == ["ping", "stop"]
     for key in setting:
         assert saved[key]
-    if "connect" in setting:
-        assert saved["reconcile_connections"] is True
     project.kube.destroy.assert_not_called()
 
 
@@ -198,3 +196,50 @@ def test_doctor_refuses_missing_engine_safeguards_without_repairing_them(project
     project.kube.reconcile_engine_protection.assert_not_called()
     project.kube.create_environment.assert_not_called()
     assert not project.path.exists()
+
+
+def test_existing_legacy_connect_grants_refuse_before_mutation(project):
+    original = project.record()
+    original["connect"] = [{"name": "db", "environment": "abcdef123456", "service": "db", "port": 27017}]
+    state.write(project.path, original)
+    with pytest.raises(PodgroveError, match="previous Podgrove version"):
+        invoke()
+    project.kube.create_environment.assert_not_called()
+    project.kube.reconcile_network_policy.assert_not_called()
+    project.control.assert_not_called()
+
+
+@pytest.mark.parametrize("before,after", [("selected", "open"), ("open", "disabled"), ("disabled", "selected")])
+def test_network_change_stops_previous_monitor_before_applying_new_rules(project, capsys, before, after):
+    (project.root / "podgrove.yml").write_text(yaml.safe_dump({**project.settings, "network": {"pod_to_pod": before}}))
+    project.record(network=load_config(project.root).network)
+    (project.root / "podgrove.yml").write_text(yaml.safe_dump({**project.settings, "network": {"pod_to_pod": after}}))
+    project.kube.create_environment.side_effect = lambda *_: project.events.append("create") if project.control.call_args.args[1] == "stop" else pytest.fail("policy written before monitor stopped")
+    assert invoke() == 0
+    capsys.readouterr()
+    project.kube.reconcile_network_policy.assert_not_called()
+    assert project.events == ["create", "anchor", "spawn"]
+
+
+def test_idempotent_selected_up_does_not_erase_resolved_peer_rules(project, capsys):
+    (project.root / "podgrove.yml").write_text(yaml.safe_dump({**project.settings, "network": {"pod_to_pod": "selected"}}))
+    project.record(network=load_config(project.root).network)
+    assert invoke() == 0
+    capsys.readouterr()
+    project.kube.reconcile_network_policy.assert_not_called()
+    project.kube.create_environment.assert_not_called()
+    assert [call.args[1] for call in project.control.call_args_list] == ["ping"]
+
+
+def test_completed_startup_with_unavailable_peer_discovery_returns_diagnostic(project, capsys):
+    def unavailable(path):
+        saved = state.read(path)
+        saved.update(status="degraded", startup_status={"state": "ready"},
+                     pod_network_status={"state": "unavailable", "endpoints": [], "error": "Peer namespace read forbidden"})
+        state.write(path, saved)
+    project.spawn.side_effect = unavailable
+    assert invoke() == 1
+    output = json.loads(capsys.readouterr().out)
+    assert output["pod_network_status"]["error"] == "Peer namespace read forbidden"
+    assert state.read(project.path)["status"] == "degraded"
+    project.kube.destroy.assert_not_called()

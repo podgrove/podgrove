@@ -6,6 +6,7 @@ cluster:
   namespace_mode: shared
   storage_class: your-delete-storage-class
 network:
+  pod_to_pod: disabled
   # These are documentation addresses, already excluded by built-in defaults.
   # Supply the administrator's actual Pod/Service/node/control-plane and
   # protected ingress CIDRs, especially any outside private address space.
@@ -13,6 +14,22 @@ network:
     - 203.0.113.0/24
     - 2001:db8::/32
 # To disable public web egress entirely, use blocked_cidrs: ["0.0.0.0/0"].
-# The explicit cluster-DNS exception remains; builds/pulls may then fail.
+# Cluster DNS and separately declared peer rules remain; builds/pulls may fail.
+# For all managed engines in this namespace, change pod_to_pod to open; list other namespaces in network.namespaces.
+# Selected server example (requires api-gateway's fixed wildcard TCP publication):
+# network:
+#   pod_to_pod: selected
+#   expose:
+#     - service: api-gateway
+#       from:
+#         - namespace: your-development-namespace
+#           worktree: "web-*"
+# Selected client example (18080 is the server's published engine port):
+# network:
+#   pod_to_pod: selected
+#   connect:
+#     - namespace: your-development-namespace
+#       worktree: "apis-*"
+#       ports: [18080]
 node_mode: shared
 ttl: 8h

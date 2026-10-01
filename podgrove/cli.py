@@ -16,7 +16,9 @@ from pathlib import Path
 from . import __version__, state
 from .compose import Compose
 from .connect import validate_connectivity
-from .config import default_tainted_nodes, load_cluster, load_config, storage_class_name
+from .pod_network import check_declaration
+from .repository import worktree_name
+from .config import default_tainted_nodes, load_cluster, load_config, refuse_legacy_connect, storage_class_name
 from .errors import PodgroveError
 from .fingerprint import FORMAT as FINGERPRINT_FORMAT, launch_fingerprint
 from .forward import validate_port_plan
@@ -119,6 +121,12 @@ def print_state(data: dict, as_json=False) -> None:
         print(f"  {port['service']}:{port['target']}  {port['url']}  [{readiness}]")
     for row in data.get("services", []):
         print(f"  {row.get('Service', '?')}: {row.get('State', '?')} {row.get('Health', '')}".rstrip())
+    for endpoint in data.get("peer_endpoints", []):
+        print(f"  Peer {endpoint['service']}:{endpoint['target']}  {endpoint['url']}")
+    for pending in data.get("pod_network_status", {}).get("pending", []):
+        print(f"  Peer access waiting: {pending}")
+    if data.get("pod_network_status", {}).get("error"):
+        print(f"  Peer access: {data['pod_network_status']['error']}")
     if data.get("error"):
         print(f"  {data['error']}")
     if data.get("health_status", {}).get("state") == "unavailable":
@@ -204,6 +212,28 @@ def _resolve_target(args, root: Path | None) -> None:
     _set_target(args, target)
 
 
+def _refuse_legacy_grants(record: dict) -> None:
+    if record.get("connect") or record.get("reconcile_connections"):
+        raise PodgroveError("Existing legacy connect grants require scoped down with the previous Podgrove version before migration to network; save data first because down deletes it")
+
+
+def _refuse_recorded_legacy_grants(path: Path) -> None:
+    """Read-only legacy check for validate; unreadable state names its path and the fix."""
+    try:
+        os.stat(path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:  # Path.exists() hides PermissionError on newer Pythons, so stat explicitly
+        raise PodgroveError(f"Cannot read the Podgrove state directory {path.parent}: {exc.strerror or exc}. "
+                            "Restore its permissions (chmod 700) or set PODGROVE_STATE_HOME to a readable directory") from exc
+    try:
+        record = state.read(path)
+    except PodgroveError as exc:
+        raise PodgroveError(f"Cannot read recorded environment state {path}: {exc}. If no environment is running "
+                            "for this worktree, move the file aside and rerun validate") from exc
+    _refuse_legacy_grants(record)
+
+
 def up(args, root: Path) -> int:
     from .runtime import control, is_running, spawn
     root = _project_paths(args, root)
@@ -211,10 +241,12 @@ def up(args, root: Path) -> int:
     _set_target(args, load_cluster(config_root, args.config), required=not args.dry_run)
     _check_legacy_identity(root, args.context)
     config = load_config(config_root, args.config, args.files)
+    refuse_legacy_connect(config)
     node_mode = args.node_mode or config.node_mode
     compose = Compose(config)
     model = compose.model()
     compose.validate(model)
+    check_declaration(config.network, model, worktree_name(root))
     fingerprint = launch_fingerprint(model, config)
     ident = state.identity(root)
     validate_connectivity(config, model, ident)
@@ -243,12 +275,12 @@ def up(args, root: Path) -> int:
         return 0
     kube = Kube(args.context, namespace, namespace_mode=args.namespace_mode)
     path = state.state_path(root, args.context)
-    reconcile_connections = bool(config.connect)
+    kube.refuse_legacy_connections(ident)
     with state.lock(path):
         if path.exists():
             old = state.read(path)
             state.validate_binding(old, root, args.context)
-            reconcile_connections = reconcile_connections or bool(old.get("connect")) or old.get("reconcile_connections", False)
+            _refuse_legacy_grants(old)
             args.mr_url = args.mr_url or old.get("mr_url", "")
             if args.mr_url:
                 mr_endpoint(args.mr_url)
@@ -279,16 +311,16 @@ def up(args, root: Path) -> int:
                 # An incompatible refresh must not stop a working supervisor.
                 kube.check_engine_settings(resources)
                 kube.check_storage(resources)
-                # Even an unchanged running stack must not retain a missing or
-                # weakened policy. Reconcile only this owned engine's policy.
-                kube.reconcile_network_policy(resources, ident)
+                # Selected rules belong to the running monitor; changed intent waits for its shutdown.
+                if old.get("network", {"blocked_cidrs": []}) == config.network and config.network.get("pod_to_pod") != "selected":
+                    kube.reconcile_network_policy(resources, ident)
                 kube.reconcile_engine_protection(resources, ident)
                 ping = control(old, "ping") if "forward_status" in old else None
                 if ping is not None and (not isinstance(ping, dict) or ping.get("ok") is not True):
                     raise PodgroveError("Session is stopping or rejected the control request; retry up after it stops")
                 health = observed(old, connected=True, ping=ping)
                 changed = (bool(old.get("compose_fingerprint")) and not fingerprint.matches(
-                    old["compose_fingerprint"], old.get("compose_fingerprint_format"))) or args.mr_url != old.get("mr_url", "")
+                    old["compose_fingerprint"], old.get("compose_fingerprint_format"))) or args.mr_url != old.get("mr_url", "") or old.get("network", {"blocked_cidrs": []}) != config.network
                 retry_application = (health["status"] == "unhealthy" or bool(compose.sync_paths(model))
                                      or health.get("startup_status", {}).get("state") == "failed")
                 if not args.refresh and not changed and not retry_application and health["forward_status"]["state"] != "disconnected":
@@ -323,8 +355,8 @@ def up(args, root: Path) -> int:
                 "node_mode": node_mode,
                 "tainted_nodes": config.tainted_nodes,
                 "placement": config.placement, "reverse": config.reverse, "connect": config.connect,
-                "reconcile_connections": reconcile_connections,
                 "network": config.network,
+                "worktree_name": worktree_name(root), "peer_endpoints": [],
                 "resources": budget, "init_resources": init_budget,
                 "storage": {"size": storage_size, "storage_class": effective_storage_class},
                 "compose_fingerprint": fingerprint.digest, "compose_fingerprint_format": FINGERPRINT_FORMAT,
@@ -348,6 +380,9 @@ def up(args, root: Path) -> int:
                 print_state(data, args.json)
                 return 0
             if data.get("startup_status", {}).get("state") == "failed" and data["status"] in ("unhealthy", "degraded"):
+                print_state(data, args.json)
+                return 1
+            if data.get("startup_status", {}).get("state") == "ready" and data.get("pod_network_status", {}).get("state") == "unavailable":
                 print_state(data, args.json)
                 return 1
             if data["status"] == "error":
@@ -388,9 +423,13 @@ def execute(args) -> int:
     if args.command == "validate":
         _set_target(args, load_cluster(args._config_root, args.config), required=False)
         config = load_config(args._config_root, args.config, args.files)
+        refuse_legacy_connect(config)
+        if args.context:
+            _refuse_recorded_legacy_grants(state.state_path(root, args.context, create=False))
         compose = Compose(config)
         model = compose.model()
         compose.validate(model)
+        check_declaration(config.network, model, worktree_name(root))
         validate_connectivity(config, model, state.identity(root))
         validate_port_plan(compose.published_ports(model), config.forward, state.identity(root))
         print(json.dumps({"valid": True, "services": sorted(model["services"]), "sync_paths": [str(p) for p in compose.sync_paths(model)]}, indent=2))
@@ -419,7 +458,8 @@ def execute(args) -> int:
             public = {key: data[key] for key in ("identity", "root", "context", "namespace", "status", "created_at",
                                                  "last_activity", "ttl_seconds", "node_mode", "namespace_mode", "ports", "error",
                                                  "forward_status", "sync_status", "health_status", "docker_status",
-                                                 "heartbeat_status", "engine_identity", "startup_status", "connectivity_status") if key in data}
+                                                 "heartbeat_status", "engine_identity", "startup_status", "connectivity_status",
+                                                 "worktree_name", "peer_endpoints", "pod_network_status") if key in data}
             rows.append(public)
         if args.json:
             print(json.dumps({"environments": rows}, indent=2))

@@ -15,7 +15,7 @@ Services, volumes, networks, healthchecks and watch rules stay in your existing 
 - Run concurrent worktrees without sharing databases or Docker networks.
 - Keep data across reconnects and refreshes; choose CPU, memory and storage per worktree.
 - Inspect services, endpoints, storage and live logs in a read-only browser dashboard.
-- Declare connections to a local API or another worktree with [reverse forwards and environment links](docs/connectivity.md).
+- Declare connections to a local API or another worktree with [reverse forwards and Pod-to-Pod rules](docs/connectivity.md).
 
 [How it works](docs/how-it-works.md) · [Design choices](docs/why-not.md) · [Known limits](docs/known-limits.md)
 
@@ -89,6 +89,12 @@ Both modes give each worktree a separate engine and PVC. Compose services run in
 | `worktree` | One derived `<base>-wt-<worktree-id>` namespace per worktree | Prepare and bootstrap each derived namespace |
 
 Both require `cluster.namespace`. Node placement is independent: shared nodes are the default; a tainted pool is optional. See [namespace examples](docs/getting-started.md#namespace-modes) and [node placement](docs/configuration.md#node-placement).
+
+## Connect worktrees
+
+`network.pod_to_pod` controls traffic between Podgrove engines: `disabled` is the default, `open` allows any port to or from Podgrove-managed Pods in the engine's own namespace and any namespaces listed in `network.namespaces`, and `selected` allows declared peers and published TCP ports. Both ends must allow a connection; selected links require selected mode and matching declarations at both ends. DNS and filtered public HTTP(S) egress retain their separate rules.
+
+Use `network.expose` on the server and `network.connect` on the client for selected access. Exact namespaces and worktree-name globs select peers. `status --json` reports this worktree's own `peer_endpoints`, the DNS addresses other engines use to reach it; read them in the server worktree. [Server/client examples and migration from the old top-level `connect`](docs/connectivity.md). Existing namespaces need administrator-approved discovery access; Podgrove never lists or creates Namespace objects.
 
 ## Everyday use
 

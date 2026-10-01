@@ -1177,3 +1177,16 @@ def test_all_logs_requests_selected_history_for_snapshot_and_live_with_visible_l
     page.get_by_label("Lines", exact=True).select_option("100")
     expect(page.locator("#log-output")).to_contain_text("api ready")
     assert ("logs", IDENT, kind, service, 100) in backend.calls
+
+
+@pytest.mark.parametrize("connect", [[None], [{"bogus": 1}], [{"name": "db"}, {"name": "cache"}]])
+def test_configuration_view_survives_malformed_legacy_connect(page, dashboard, connect):
+    server, backend = dashboard
+    settings = backend.snapshots[IDENT]["configuration"]["settings"]
+    settings["connect"] = connect
+    settings["network"] = {"blocked_cidrs": [], "pod_to_pod": "open"}
+    open_dashboard(page, server)
+    open_configuration(page)
+    expect(page.locator("#configuration")).to_contain_text(f"{len(connect)} legacy entr")
+    expect(page.locator("#configuration")).to_contain_text("up refuses them")
+    expect(page.locator("#configuration")).to_contain_text("open")

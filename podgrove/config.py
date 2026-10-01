@@ -12,7 +12,7 @@ import jsonschema
 import yaml
 
 from .errors import PodgroveError
-from .network import network_settings
+from .network import NETWORK_SCHEMA, mode_mismatch, network_settings
 from .placement import PLACEMENT_SCHEMA, placement_spec, validate_placement
 from .sync_filter import validate_patterns
 from .resources import QUANTITY_SCHEMA, RESOURCE_SCHEMA, quantity_text, resource_budget
@@ -94,17 +94,8 @@ CONFIG_SCHEMA: dict[str, Any] = {
                       }},
         },
         "connect": {
-            "type": "array", "maxItems": 32,
-            "items": {"type": "object", "additionalProperties": False,
-                      "required": ["name", "environment", "service", "port"],
-                      "properties": {
-                          "name": {"type": "string", "minLength": 1, "maxLength": 63,
-                                   "pattern": r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"},
-                          "environment": {"type": "string", "pattern": r"^[a-f0-9]{12}$"},
-                          "service": {"type": "string", "minLength": 1, "maxLength": 128,
-                                      "pattern": r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$"},
-                          "port": {"type": "integer", "minimum": 1, "maximum": 65535},
-                      }},
+            "deprecated": True,
+            "description": "Legacy top-level connect. up and validate refuse any nonempty value with migration guidance; down and status still read the file. Use network.connect with pod_to_pod: selected.",
         },
         "sync": {
             "type": "object", "additionalProperties": False,
@@ -119,16 +110,7 @@ CONFIG_SCHEMA: dict[str, Any] = {
                     "properties": {"size": {**QUANTITY_SCHEMA, "default": "20Gi"}}},
         "node_mode": {"type": "string", "enum": ["shared", "tainted"], "default": "shared"},
         "placement": PLACEMENT_SCHEMA,
-        "network": {
-            "type": "object", "additionalProperties": False,
-            "properties": {
-                "blocked_cidrs": {
-                    "type": "array", "maxItems": 128, "uniqueItems": True,
-                    "items": {"type": "string", "minLength": 3, "maxLength": 49},
-                    "description": "Additional infrastructure CIDRs excluded from public web egress; built-in exclusions always remain.",
-                },
-            },
-        },
+        "network": NETWORK_SCHEMA,
         "tainted_nodes": {
             "type": "object", "additionalProperties": False,
             "properties": {
@@ -193,24 +175,20 @@ def normalize_reverse(value: list | None) -> list[dict]:
     return result
 
 
-def normalize_connect(value: list | None) -> list[dict]:
-    entries = [] if value is None else value
-    errors = list(jsonschema.Draft202012Validator(CONFIG_SCHEMA["properties"]["connect"]).iter_errors(entries))
-    if errors:
-        raise PodgroveError(f"connect: {errors[0].message}")
-    result, names = [], set()
-    reserved = {"localhost", "host", "docker", "podgrove", "host-docker-internal", "gateway-docker-internal"}
-    for entry in entries:
-        name = entry["name"]
-        if name in reserved:
-            raise PodgroveError("connect.name: reserved host or Docker alias")
-        if name in names:
-            raise PodgroveError("connect.name: duplicate connection alias")
-        if entry["port"] in (2375, 2376):
-            raise PodgroveError("connect.port: Docker API ports 2375 and 2376 are reserved")
-        names.add(name)
-        result.append(dict(entry))
-    return result
+LEGACY_CONNECT = ("Top-level connect is no longer supported: use network.pod_to_pod: selected and network.connect, "
+                  "with network.expose in the target worktree")
+
+
+def normalize_connect(value) -> list:
+    """Carry any legacy value unparsed so down and status still load; up and validate refuse it."""
+    if value is None or value == []:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+def refuse_legacy_connect(config) -> None:
+    if config.connect:
+        raise PodgroveError(LEGACY_CONNECT)
 
 
 def storage_class_name(value: str) -> str:
@@ -287,6 +265,9 @@ def _configuration_data(root: Path, config_path: Path | None) -> tuple[Path, dic
             raise PodgroveError(f"Cannot read {selected}: {exc}") from exc
         if data is None:
             data = {}
+    mismatch = mode_mismatch(data.get("network")) if isinstance(data, dict) else None
+    if mismatch:
+        raise PodgroveError(mismatch)
     errors = sorted(jsonschema.Draft202012Validator(CONFIG_SCHEMA).iter_errors(data), key=lambda e: str(e.path))
     if errors:
         error = errors[0]

@@ -10,7 +10,8 @@ from podgrove import cli
 from podgrove.compose import Compose
 from podgrove.config import load_cluster, load_config
 from podgrove.errors import PodgroveError
-from podgrove.network import network_settings
+from podgrove.network import MAX_NAMESPACES, network_settings, validate_model
+from podgrove import pod_network
 
 
 @pytest.fixture
@@ -81,3 +82,339 @@ def test_invalid_network_is_refused_before_bootstrap_output_or_external_tools(pr
     with pytest.raises(PodgroveError, match='network.blocked_cidrs'):
         cli.execute(args)
     assert not Path(output).exists()
+
+
+INVALID_MODE_SETTINGS = [
+    {'pod_to_pod': None}, {'pod_to_pod': True}, {'pod_to_pod': 'all'},
+    {'expose': []}, {'connect': []}, {'pod_to_pod': 'disabled', 'expose': []},
+    {'pod_to_pod': 'open', 'connect': []},
+    {'pod_to_pod': 'selected', 'expose': [{'service': 'api'}]},
+    {'pod_to_pod': 'selected', 'expose': [{'service': 'api', 'from': []}]},
+    {'pod_to_pod': 'selected', 'expose': [{'service': 'api', 'from': [{}]}]},
+    {'pod_to_pod': 'selected', 'expose': [{'service': 'api', 'from': [{'namespace': '*'}]}]},
+    {'pod_to_pod': 'selected', 'connect': [{'namespace': 'team', 'ports': [80]}]},
+    {'pod_to_pod': 'selected', 'connect': [{'namespace': 'team', 'worktree': '*', 'ports': []}]},
+    {'pod_to_pod': 'selected', 'connect': [{'namespace': 'team', 'worktree': '*', 'ports': [80, 80]}]},
+    {'pod_to_pod': 'selected', 'connect': [{'namespace': 'team', 'worktree': '*', 'ports': [80], 'context': 'other'}]},
+]
+INVALID_MODE_SETTINGS += [
+    {'pod_to_pod': 'selected', 'connect': [{'namespace': 'team', 'worktree': '*', 'ports': [port]}]}
+    for port in (0, 65536, 2375, 2376, True, '80', 80.0)
+]
+INVALID_MODE_SETTINGS += [
+    {'pod_to_pod': 'selected', 'connect': [{'namespace': 'team', 'worktree': pattern, 'ports': [80]}]}
+    for pattern in ('', ' ', '.', '..', 'api/*', 'api\\*', 'api\n*', 'api\n', '*' * 129)
+]
+INVALID_MODE_SETTINGS.append({'pod_to_pod': 'selected', 'connect': [
+    {'namespace': 'team\n', 'worktree': '*', 'ports': [80]},
+]})
+
+
+@pytest.mark.parametrize('loader', [load_cluster, load_config])
+@pytest.mark.parametrize('network', INVALID_MODE_SETTINGS)
+def test_network_modes_reject_invalid_intent_before_compose_or_cluster(project, loader, network):
+    (project / 'podgrove.yml').write_text(yaml.safe_dump({'network': network}))
+    with pytest.raises(PodgroveError, match='network'):
+        loader(project)
+
+
+@pytest.mark.parametrize('mode', [None, 'disabled'])
+def test_disabled_mode_preserves_the_persisted_legacy_network_shape(mode):
+    configured = {} if mode is None else {'pod_to_pod': mode}
+    assert network_settings(configured) == {'blocked_cidrs': []}
+
+
+def test_selected_rules_are_normalized_without_mutating_or_sharing_user_data():
+    configured = {'pod_to_pod': 'selected', 'expose': [{'service': 'api', 'from': [{'namespace': 'team'}]}],
+                  'connect': [{'namespace': 'other-team', 'worktree': 'apis-[ab]?', 'ports': [8080]}]}
+    first, second = network_settings(configured), network_settings(configured)
+    first['connect'][0]['ports'].append(8443)
+    assert configured['connect'][0]['ports'] == second['connect'][0]['ports'] == [8080]
+    assert second['expose'][0]['from'] == [{'namespace': 'team'}]
+    assert second['blocked_cidrs'] == []
+
+
+def test_duplicate_exposure_service_requires_combining_its_peer_rules():
+    config = {'pod_to_pod': 'selected', 'expose': [
+        {'service': 'api', 'from': [{'namespace': 'team-a'}]},
+        {'service': 'api', 'from': [{'namespace': 'team-b'}]},
+    ]}
+    with pytest.raises(PodgroveError, match='duplicate service'):
+        network_settings(config)
+
+
+@pytest.fixture
+def selected_network():
+    return {'pod_to_pod': 'selected', 'expose': [{'service': 'api', 'from': [{'namespace': 'team', 'worktree': 'web-*'}]}]}
+
+
+def test_expose_model_resolves_published_not_container_ports_offline(selected_network):
+    model = {'services': {'api': {'ports': [{'target': 8080, 'published': '18080'},
+                                          {'target': 8443, 'published': 18443, 'protocol': 'tcp', 'host_ip': '0.0.0.0'}]},
+                          'private': {'ports': [{'target': 9000}]}}}
+    assert validate_model(selected_network, model) == [
+        {'service': 'api', 'target': 8080, 'published': 18080},
+        {'service': 'api', 'target': 8443, 'published': 18443},
+    ]
+    assert model['services']['api']['ports'][0]['published'] == '18080'
+
+
+INVALID_EXPOSED_SERVICES = [
+    ({}, 'publish at least one'), ({'expose': ['8080']}, 'publish at least one'),
+    ({'ports': [{'target': 8080}]}, 'stable published'),
+    ({'ports': [{'target': 8080, 'published': 18080, 'protocol': 'udp'}]}, '0.0.0.0 TCP'),
+    ({'ports': [{'target': 8080, 'published': 18080}, {'target': 8080, 'published': 18081}]}, 'ambiguous'),
+    ({'scale': 2, 'ports': [{'target': 8080, 'published': 18080}]}, 'one service replica'),
+    ({'deploy': {'replicas': 0}, 'ports': [{'target': 8080, 'published': 18080}]}, 'one service replica'),
+]
+INVALID_EXPOSED_SERVICES += [
+    ({'ports': [{'target': 8080, 'published': value}]}, 'stable published')
+    for value in (0, '0', '18080-18090', -1, 65536, 'junk', None, True, 80.0)
+]
+INVALID_EXPOSED_SERVICES += [
+    ({'ports': [{'target': 8080, 'published': 18080, 'host_ip': value}]}, '0.0.0.0 TCP')
+    for value in ('127.0.0.1', '::', '::1', '192.168.1.2')
+]
+INVALID_EXPOSED_SERVICES += [
+    ({'ports': [{'target': 8080, 'published': value}]}, 'reserved') for value in (2375, 2376)
+]
+
+
+@pytest.mark.parametrize('service,match', INVALID_EXPOSED_SERVICES)
+def test_invalid_local_exposure_refused_without_remote_discovery(selected_network, service, match):
+    with pytest.raises(PodgroveError, match=match):
+        validate_model(selected_network, {'services': {'api': service}})
+
+
+def test_inactive_profile_service_cannot_be_exposed(selected_network):
+    with pytest.raises(PodgroveError, match='not active'):
+        validate_model(selected_network, {'services': {'worker': {}}})
+
+
+@pytest.mark.parametrize('settings', [None, {'pod_to_pod': 'disabled'}, {'pod_to_pod': 'open'}])
+def test_exposure_restrictions_do_not_change_other_modes_compose_ports(settings):
+    assert validate_model(settings, {'services': {'api': {'ports': [{'target': 8080}]}}}) == []
+
+
+def test_exposure_port_inventory_is_bounded(selected_network):
+    ports = [{'target': index + 10000, 'published': index + 20000} for index in range(129)]
+    with pytest.raises(PodgroveError, match='at most 128'):
+        validate_model(selected_network, {'services': {'api': {'ports': ports}}})
+
+
+def test_peer_namespace_bound_applies_across_connect_and_expose():
+    configured = {'pod_to_pod': 'selected', 'expose': [
+        {'service': 'api', 'from': [{'namespace': f'team-{index}'} for index in range(MAX_NAMESPACES)]},
+    ]}
+    assert len(network_settings(configured)['expose'][0]['from']) == MAX_NAMESPACES
+    configured['connect'] = [{'namespace': 'one-more', 'worktree': '*', 'ports': [80]}]
+    with pytest.raises(PodgroveError, match=f'at most {MAX_NAMESPACES} distinct peer namespaces'):
+        network_settings(configured)
+
+
+@pytest.mark.parametrize('value,message', [
+    ({'pod_to_pod': 'open', 'expose': [{'service': 'api', 'from': [{'namespace': 'team'}]}]},
+     'network.expose: requires pod_to_pod: selected (configured mode is open)'),
+    ({'connect': [{'namespace': 'team', 'worktree': '*', 'ports': [80]}]},
+     'network.connect: requires pod_to_pod: selected (configured mode is disabled)'),
+    ({'pod_to_pod': 'selected', 'namespaces': ['team']}, 'network.namespaces: requires pod_to_pod: open (configured mode is selected)'),
+])
+def test_mode_mismatch_is_one_readable_line(tmp_path, value, message):
+    with pytest.raises(PodgroveError) as direct:
+        network_settings(value)
+    (tmp_path / 'compose.yaml').write_text('services: {}\n')
+    (tmp_path / 'podgrove.yml').write_text(yaml.safe_dump({'network': value}))
+    with pytest.raises(PodgroveError) as loaded:
+        load_config(tmp_path)
+    assert str(direct.value) == str(loaded.value) == message
+
+
+@pytest.mark.parametrize('published', ['2375', 2376])
+def test_open_mode_refuses_a_docker_api_publication_offline(published):
+    model = {'services': {'dind': {'ports': [{'target': 2375, 'published': published}]}}}
+    with pytest.raises(PodgroveError, match='Docker API port'):
+        validate_model({'pod_to_pod': 'open'}, model)
+
+
+def large_selected(count):
+    return {'pod_to_pod': 'selected', 'expose': [
+        {'service': f'service-{index}', 'from': [{'namespace': 'team', 'worktree': f'{"w" * 100}-{source}'}
+                                                for source in range(32)]} for index in range(count)]}
+
+
+def large_model(count):
+    return {'services': {f'service-{index}': {'ports': [{'target': 8080, 'published': str(10000 + index)}]}
+                         for index in range(count)}}
+
+
+def test_schema_valid_config_with_an_oversized_declaration_is_refused_offline():
+    settings = large_selected(32)
+    assert network_settings(settings)
+    with pytest.raises(PodgroveError, match=r'renders to \d+ bytes; the limit is 32768 bytes \(32 KiB\)'):
+        pod_network.check_declaration(settings, large_model(32), 'web-main')
+
+
+def test_declaration_limit_boundary(monkeypatch):
+    settings, model = large_selected(2), large_model(2)
+    profile = pod_network.declaration(network_settings(settings), 'web-main',
+                                      validate_model(settings, model), pod_network.SIZING_UID)
+    size = len(pod_network.declaration_text(profile).encode())
+    monkeypatch.setattr(pod_network, 'MAX_DECLARATION_BYTES', size)
+    pod_network.check_declaration(settings, model, 'web-main')
+    monkeypatch.setattr(pod_network, 'MAX_DECLARATION_BYTES', size - 1)
+    with pytest.raises(PodgroveError, match=f'renders to {size} bytes; the limit is {size - 1} bytes'):
+        pod_network.check_declaration(settings, model, 'web-main')
+
+
+def test_runtime_declaration_check_uses_the_same_limit(monkeypatch):
+    profile = pod_network.declaration(network_settings({'pod_to_pod': 'open'}), 'web-main', [], 'uid')
+    text = pod_network.declaration_text(profile)
+    monkeypatch.setattr(pod_network, 'MAX_DECLARATION_BYTES', len(text.encode()) - 1)
+    with pytest.raises(PodgroveError, match='exceeds 32 KiB'):
+        pod_network._checked_declaration(text)
+
+
+@pytest.mark.parametrize('command', [['validate'], ['up', '--dry-run']])
+def test_validate_and_dry_run_refuse_an_oversized_declaration(tmp_path, monkeypatch, command):
+    from podgrove import cli
+
+    class FakeCompose:
+        def __init__(self, config):
+            pass
+
+        def model(self):
+            return large_model(32)
+
+        def validate(self, model):
+            pass
+
+    (tmp_path / 'compose.yaml').write_text('services: {}\n')
+    (tmp_path / 'podgrove.yml').write_text(yaml.safe_dump({'network': large_selected(32)}))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, 'Compose', FakeCompose)
+    args = cli.parser().parse_args([*command, '--context', 'test-context', '--namespace', 'podgrove-testing'])
+    with pytest.raises(PodgroveError, match='the limit is 32768 bytes'):
+        cli.execute(args)
+
+
+def test_open_mode_refuses_more_than_128_published_ports_offline():
+    model = {'services': {'many': {'ports': [{'target': 8000 + index, 'published': str(20000 + index)} for index in range(129)]}}}
+    with pytest.raises(PodgroveError, match='129 published TCP ports exceed the 128'):
+        validate_model({'pod_to_pod': 'open'}, model)
+    model['services']['many']['ports'].pop()
+    assert validate_model({'pod_to_pod': 'open'}, model) == []
+
+
+@pytest.mark.parametrize('namespace', ['kube-system', 'kube-public'])
+def test_published_schema_refuses_system_namespaces_for_open(tmp_path, namespace):
+    import jsonschema
+    from podgrove.config import CONFIG_SCHEMA
+    document = {'network': {'pod_to_pod': 'open', 'namespaces': [namespace]}}
+    assert not jsonschema.Draft202012Validator(CONFIG_SCHEMA).is_valid(document)
+    published = json.loads((Path(__file__).resolve().parents[1] / 'schema' / 'podgrove-v1.schema.json').read_text())
+    assert not jsonschema.Draft202012Validator(published).is_valid(document)
+    assert jsonschema.Draft202012Validator(published).is_valid({'network': {'pod_to_pod': 'open', 'namespaces': ['team-b']}})
+
+
+def test_validate_refuses_recorded_legacy_grants_offline(tmp_path, monkeypatch):
+    from podgrove import state
+
+    class FakeCompose:
+        def __init__(self, config):
+            pass
+
+    project = tmp_path / 'project'
+    project.mkdir()
+    (project / 'compose.yaml').write_text('services: {}\n')
+    monkeypatch.setenv('PODGROVE_STATE_HOME', str(tmp_path / 'state'))
+    monkeypatch.chdir(project)
+    monkeypatch.setattr(cli, 'Compose', FakeCompose)
+    path = state.state_path(project.resolve(), 'test-context')
+    assert path.is_relative_to(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state.write(path, {'root': str(project.resolve()), 'context': 'test-context', 'connect': [{'name': 'db'}]})
+    args = cli.parser().parse_args(['validate', '--context', 'test-context', '--namespace', 'podgrove-testing'])
+    with pytest.raises(PodgroveError, match='Existing legacy connect grants'):
+        cli.execute(args)
+
+
+@pytest.mark.parametrize('namespace', ['kube-system', 'kube-public'])
+def test_system_namespace_gets_the_friendly_one_line_message(tmp_path, namespace):
+    value = {'pod_to_pod': 'open', 'namespaces': ['team-b', namespace]}
+    message = f"network.namespaces: '{namespace}' must be an exact non-system Kubernetes namespace name"
+    with pytest.raises(PodgroveError) as direct:
+        network_settings(value)
+    (tmp_path / 'compose.yaml').write_text('services: {}\n')
+    (tmp_path / 'podgrove.yml').write_text(yaml.safe_dump({'network': value}))
+    with pytest.raises(PodgroveError) as loaded:
+        load_config(tmp_path)
+    assert str(direct.value) == str(loaded.value) == message
+
+
+def open_model(*extra):
+    return {'services': {'many': {'ports': [{'target': 8000 + index, 'published': str(20000 + index)}
+                                            for index in range(128)] + list(extra)}}}
+
+
+@pytest.mark.parametrize('extra,refused', [
+    ({'target': 9000, 'published': '30000', 'protocol': 'udp'}, False),
+    ({'target': 9000, 'published': '30000', 'host_ip': '127.0.0.1'}, False),
+    ({'target': 9000}, True),
+    ({'target': 9000, 'published': '30000'}, True),
+])
+def test_open_port_count_matches_what_the_runtime_advertises(extra, refused):
+    from podgrove.network import open_publications
+    assert len(open_publications(open_model())) == 128
+    if refused:
+        with pytest.raises(PodgroveError, match='129 published TCP ports exceed the 128'):
+            validate_model({'pod_to_pod': 'open'}, open_model(extra))
+    else:
+        assert validate_model({'pod_to_pod': 'open'}, open_model(extra)) == []
+
+
+def test_open_port_count_expands_published_ranges():
+    from podgrove.network import open_publications
+    model = {'services': {'web': {'ports': [{'target': 8000, 'published': '30000-30002'}]}}}
+    assert [published for _, _, published in open_publications(model)] == [30000, 30001, 30002]
+
+
+def legacy_validate_args(tmp_path, monkeypatch):
+    from podgrove import state
+
+    class FakeCompose:
+        def __init__(self, config):
+            pass
+
+    project = tmp_path / 'project'
+    project.mkdir()
+    (project / 'compose.yaml').write_text('services: {}\n')
+    monkeypatch.setenv('PODGROVE_STATE_HOME', str(tmp_path / 'state'))
+    monkeypatch.chdir(project)
+    monkeypatch.setattr(cli, 'Compose', FakeCompose)
+    path = state.state_path(project.resolve(), 'test-context')
+    return path, cli.parser().parse_args(['validate', '--context', 'test-context', '--namespace', 'podgrove-testing'])
+
+
+def test_validate_names_a_corrupt_state_record_and_the_fix(tmp_path, monkeypatch):
+    path, args = legacy_validate_args(tmp_path, monkeypatch)
+    path.write_text('{not json')
+    path.chmod(0o600)
+    with pytest.raises(PodgroveError) as error:
+        cli.execute(args)
+    message = str(error.value)
+    assert str(path) in message and 'move the file aside and rerun validate' in message and '\n' not in message
+
+
+def test_validate_names_an_unreadable_state_directory_and_the_fix(tmp_path, monkeypatch):
+    import os
+    if os.geteuid() == 0:
+        pytest.skip('root ignores directory permissions')
+    path, args = legacy_validate_args(tmp_path, monkeypatch)
+    path.parent.chmod(0o000)
+    try:
+        with pytest.raises(PodgroveError) as error:
+            cli.execute(args)
+    finally:
+        path.parent.chmod(0o700)
+    message = str(error.value)
+    assert str(path.parent) in message and 'PODGROVE_STATE_HOME' in message and '\n' not in message

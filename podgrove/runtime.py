@@ -19,7 +19,7 @@ from .compose import Compose
 from .config import load_config
 from .docker_tunnel import DockerTunnel, EngineReplacedError
 from .errors import PodgroveError
-from .forward import PortMappingError, Tunnel, free_port, port_plan, verify_port_mappings
+from .forward import ForwardOwnershipError, PortMappingError, Tunnel, free_port, port_plan, verify_port_mappings
 from .kube import HeartbeatUnavailable, Kube
 from .process import docker_environment, run
 from .reaper import reason
@@ -484,6 +484,7 @@ def serve(path: Path) -> int:
     app_tunnel = None
     api_tunnel = None
     connectivity = None
+    pod_network = None
     services_ready = True
 
     def persist():
@@ -503,6 +504,9 @@ def serve(path: Path) -> int:
                 data["sync_status"] = sync_worker.status()
             if connectivity is not None:
                 data["connectivity_status"] = connectivity.snapshot()
+            if pod_network is not None:
+                data["pod_network_status"] = pod_network.snapshot()
+                data["peer_endpoints"] = data["pod_network_status"]["endpoints"]
             session_health()
             state.write(path, data)
 
@@ -514,6 +518,7 @@ def serve(path: Path) -> int:
                     or data.get("health_status", {}).get("state") == "unavailable"
                     or data.get("heartbeat_status", {}).get("state") == "unavailable"
                     or data.get("connectivity_status", {}).get("state") not in (None, "ready", "disabled")
+                    or data.get("pod_network_status", {}).get("state") == "unavailable"
                     or data.get("docker_status", {}).get("verification", {}).get("state") in ("unavailable", "expired"))
         data["status"] = "degraded" if degraded else "ready" if services_ready else "unhealthy"
 
@@ -534,6 +539,13 @@ def serve(path: Path) -> int:
                 return
             session_health()
             persist()
+
+    def pod_network_changed(current):
+        with activity_lock:
+            data["pod_network_status"] = current
+            data["peer_endpoints"] = current["endpoints"]
+            if not stopping and not tearing_down:
+                persist()
 
     def handle_control():
         nonlocal stopping, last_touch
@@ -568,6 +580,8 @@ def serve(path: Path) -> int:
                                 response["forward_status"] = data["forward_status"]
                             if sync_worker is not None:
                                 response["sync_status"] = sync_worker.status()
+                            elif "sync_status" in data:  # ready is published just before the sync worker exists
+                                response["sync_status"] = dict(data["sync_status"])
                             if "health_status" in data:
                                 response["health_status"] = dict(data["health_status"])
                             if "heartbeat_status" in data:
@@ -576,6 +590,8 @@ def serve(path: Path) -> int:
                                 response["docker_status"] = api_tunnel.snapshot()
                             if connectivity is not None:
                                 response["connectivity_status"] = connectivity.snapshot()
+                            if pod_network is not None:
+                                response["pod_network_status"] = pod_network.snapshot()
                     client.sendall(json.dumps(response).encode())
                 except (OSError, ValueError):
                     pass
@@ -600,6 +616,8 @@ def serve(path: Path) -> int:
         compose = Compose(config)
         model = compose.model()
         compose.validate(model)
+        from .network import validate_model as validate_network_model
+        validate_network_model(config.network, model)
         compose.recover_existing = True
         recovery = (StartupRecovery(kube, data["identity"], data["startup_anchor"], data["timeout"] * 3 + 120,
                                     cancel_event=startup_cancel)
@@ -669,6 +687,9 @@ def serve(path: Path) -> int:
                 partial = error if isinstance(error, StartupIncomplete) else None
                 if partial is not None:
                     sync, elapsed, rows = partial.sync, partial.elapsed, partial.rows
+                    data["startup_status"] = {"state": "failed", "attempts": startup_attempts, "error": str(error)}
+                    data["error"] = str(error)
+                    persist()
                 changed = recovery is not None and recovery.wait() != selected_uid
                 if changed and startup_attempts < 2:
                     startup_attempts += 1
@@ -688,6 +709,7 @@ def serve(path: Path) -> int:
                         sync = None
                     data["startup_status"] = {"state": "retrying", "attempts": startup_attempts,
                                               "error": "Owned engine Pod replaced during startup; remirroring before retry"}
+                    data.pop("error", None)
                     persist()
                     _startup_phase("retrying startup on the verified replacement engine Pod")
                     continue
@@ -702,6 +724,16 @@ def serve(path: Path) -> int:
         # The sync event cancels these reads before the worker is joined.
         captured_identity = getattr(api_tunnel, "identity_snapshot", lambda: {})()
         expected_sync_uids = captured_identity.get("expected") if isinstance(captured_identity, dict) else None
+        if config.network.get("pod_to_pod", "disabled") != "disabled":
+            from .pod_network import PodNetwork
+            from .repository import worktree_name
+            pod_network = PodNetwork(kube, data["identity"], worktree_name(Path(data["root"])),
+                                     config.network, model, expected_uids=expected_sync_uids,
+                                     on_change=pod_network_changed)
+            pod_network.start(rows, deadline=startup_deadline, cancel_event=startup_cancel)
+        else:
+            data["pod_network_status"] = {"state": "disabled", "mode": "disabled", "endpoints": []}
+            data["peer_endpoints"] = []
         sync.reconnect_guard = lambda cancelled, **kwargs: verify_sync_engine(
             kube, data["identity"], expected_sync_uids, cancelled, **kwargs)
         ports = (partial_port_plan(compose, model, rows, data["identity"]) if startup_failure else
@@ -712,9 +744,24 @@ def serve(path: Path) -> int:
             _startup_phase("opening application port forwards")
             app_tunnel = Tunnel(kube, data["identity"], [(p["local"], p["published"]) for p in ports])
             app_tunnel.on_change = forward_changed
-            tunnels.append(app_tunnel.start())
-            for port in ports:
-                port["status"] = "ready"
+            try:
+                tunnels.append(app_tunnel.start())
+            except (PodgroveError, OSError) as error:
+                app_tunnel.on_change = None
+                app_tunnel.close()
+                app_tunnel = None
+                if startup_failure is None or isinstance(error, (ForwardOwnershipError, EngineReplacedError)):
+                    raise
+                _startup_remaining(startup_deadline, startup_cancel)
+                api_tunnel.refresh_identity()
+                _startup_remaining(startup_deadline, startup_cancel)
+                data["forward_status"] = {"state": "disconnected", "error": str(error), "attempts": 0,
+                                          "changed_at": time.time(), "checked_at": time.time()}
+                for port in ports:
+                    port["status"] = "disconnected"
+            else:
+                for port in ports:
+                    port["status"] = "ready"
         else:
             data["forward_status"] = {"state": "disabled", "error": None, "attempts": 0,
                                       "changed_at": time.time(), "checked_at": time.time()}
@@ -805,6 +852,8 @@ def serve(path: Path) -> int:
                     try:
                         rows = service_status(compose, env)
                     except TransientDockerReadError as exc:
+                        if pod_network is not None:
+                            pod_network.update_rows([])
                         # A failed observation does not invalidate the engine or
                         # an acknowledged sync. Keep existing services/forwards
                         # usable and identify the retained rows as stale.
@@ -814,6 +863,8 @@ def serve(path: Path) -> int:
                         data["problems"] = [str(exc)]
                     else:
                         data["services"] = rows
+                        if pod_network is not None:
+                            pod_network.update_rows(rows)
                         if app_tunnel is not None:
                             try:
                                 verify_port_mappings(ports, rows, model.get("name"))
@@ -864,6 +915,9 @@ def serve(path: Path) -> int:
             except Exception as cause:
                 identity_failure = str(cause)
         detail = failure_detail(exc, tunnels)
+        primary = data.get("startup_status", {}).get("error") if data.get("startup_status", {}).get("state") == "failed" else None
+        if primary and primary not in detail:
+            detail = f"{primary}; {detail}"
         if identity_failure and identity_failure not in detail:
             detail += "; " + identity_failure
         data.update({"status": "error", "error": detail})
@@ -900,6 +954,11 @@ def serve(path: Path) -> int:
                 sync.close()
             except Exception as exc:
                 cleanup_failure("Sync cleanup", exc)
+        if pod_network is not None:
+            try:
+                pod_network.close()
+            except Exception as exc:
+                cleanup_failure("Pod networking cleanup", exc)
         if connectivity is not None:
             try:
                 connectivity.close()

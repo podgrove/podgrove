@@ -31,6 +31,8 @@ The PVC stores Docker data, named volumes and mirrored files. Engine Pod replace
 
 Separate engines, resource limits and network policies separate ordinary worktree activity. The Docker engine is privileged and shares its node’s kernel, so this is not a security boundary for hostile workloads.
 
+Pod-to-Pod traffic is disabled by default. Choose `network.pod_to_pod: selected` for explicit server/client rules, or `open` for all ports between Podgrove-managed Pods in the same namespace (plus any listed in `network.namespaces`). Selected links require matching declarations in selected mode at both endpoints. [Networking examples](connectivity.md).
+
 `podgrove down` removes the worktree’s engine and PVC, including its stored data. It retains the namespace and administrator-installed setup.
 
 For ownership checks, transport protocols and recovery limits, read [Architecture and implementation](architecture.md). To set up your first environment, see [Getting started](getting-started.md).

@@ -111,7 +111,7 @@ def test_changed_network_settings_refresh_recorded_configuration_with_same_compo
     assert current["network"]["blocked_cidrs"] == ["44.55.0.0/16", "45.56.0.0/16"]
     assert current["namespace"] == old["namespace"]
     stop.assert_called_once_with(old, "stop")
-    kube.reconcile_network_policy.assert_called_once()
+    kube.reconcile_network_policy.assert_not_called()
     assert kube.create_environment.call_count == 2
     kube.destroy.assert_not_called()
 
@@ -729,3 +729,51 @@ def test_all_logs_streams_uncapped_to_inherited_stdout_and_preserves_exit_status
     else:
         tunnel.start.assert_called_once()
         tunnel.close.assert_called_once()
+
+
+@pytest.mark.parametrize("command", ["validate", "up"])
+def test_unknown_network_service_refused_offline(project, monkeypatch, command):
+    (project / "podgrove.yml").write_text("network:\n  pod_to_pod: selected\n  expose:\n    - service: missing\n      from: [{namespace: peers}]\n")
+    monkeypatch.setattr(Compose, "model", lambda *_: {"services": {"app": {"image": "busybox:1.37"}}})
+    kube = Mock()
+    monkeypatch.setattr(cli, "Kube", kube)
+    args = cli.parser().parse_args([command, "--context", "offline", "--namespace", "approved", "--project-directory", str(project)])
+    with pytest.raises(PodgroveError, match="not active"):
+        cli.execute(args)
+    kube.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", ["disabled", "open", "selected"])
+def test_network_dry_run_needs_no_cluster(project, monkeypatch, capsys, mode):
+    (project / "podgrove.yml").write_text(f"network:\n  pod_to_pod: {mode}\n")
+    monkeypatch.setattr(Compose, "model", lambda *_: {"services": {"app": {"image": "busybox:1.37"}}})
+    kube = Mock()
+    monkeypatch.setattr(cli, "Kube", kube)
+    assert cli.up(up_args(project, "--dry-run"), project) == 0
+    rendered = json.loads(capsys.readouterr().out)
+    policy = next(item for item in rendered["resources"] if item["kind"] == "NetworkPolicy")
+    assert bool(policy["spec"]["ingress"]) is (mode == "open")
+    kube.assert_not_called()
+
+
+def test_status_prints_exact_peer_url_and_pending_reason(capsys):
+    from podgrove.pod_network import addresses
+    endpoints = addresses("approved", "abcdef123456", [{"service": "api", "target": 8080, "published": 80}])
+    data = {"identity": "abcdef123456", "namespace": "approved", "status": "ready", "peer_endpoints": endpoints,
+            "pod_network_status": {"state": "waiting", "pending": ["peers/web-*: no ready selected peer"]}}
+    cli.print_state(data)
+    output = capsys.readouterr().out
+    assert "http://pg-abcdef123456-0.pg-abcdef123456.approved.svc.cluster.local:80" in output
+    assert "Peer access waiting: peers/web-*: no ready selected peer" in output
+    cli.print_state(data, True)
+    assert json.loads(capsys.readouterr().out)["peer_endpoints"] == endpoints
+
+
+@pytest.mark.parametrize("network_state,status", [("ready", "ready"), ("waiting", "ready"), ("unavailable", "degraded")])
+def test_observed_peer_status_and_endpoints_are_current(network_state, status):
+    from podgrove.session_status import observed
+    endpoint = {"service": "api", "port": 80, "url": "http://engine:80"}
+    result = observed({"status": "ready", "ports": [], "peer_endpoints": []}, connected=True,
+                      ping={"ok": True, "pod_network_status": {"state": network_state, "endpoints": [endpoint]}})
+    assert result["status"] == status
+    assert result["peer_endpoints"] == [endpoint]

@@ -42,6 +42,7 @@
     "docs/how-it-works.md",
     "docs/known-limits.md",
     "docs/operations.md",
+    "docs/pod-network-acceptance.md",
     "docs/releasing.md",
     "docs/verification.md",
     "docs/web.md",
@@ -74,6 +75,7 @@
     "podgrove/kube.py",
     "podgrove/network.py",
     "podgrove/placement.py",
+    "podgrove/pod_network.py",
     "podgrove/process.py",
     "podgrove/reaper.py",
     "podgrove/repository.py",
@@ -103,6 +105,7 @@
     "schema/podgrove-v1.schema.json",
     "scripts/check_connectivity.py",
     "scripts/check_exec_stream.py",
+    "scripts/check_pod_network.py",
     "scripts/check_startup_recovery.py",
     "scripts/e2e.py",
     "scripts/homebrew_formula.py",
@@ -168,6 +171,7 @@
     "tests/test_activity.py",
     "tests/test_bootstrap.py",
     "tests/test_check_connectivity.py",
+    "tests/test_check_pod_network.py",
     "tests/test_check_startup_recovery.py",
     "tests/test_cli.py",
     "tests/test_cli_portability.py",
@@ -202,6 +206,7 @@
     "tests/test_network_isolation.py",
     "tests/test_network_reconciliation.py",
     "tests/test_placement.py",
+    "tests/test_pod_network.py",
     "tests/test_portable_worktrees.py",
     "tests/test_public_export.py",
     "tests/test_public_manifest.py",
@@ -234,6 +239,7 @@
     "tests/test_web_settings.py",
     "tests/test_web_streaming.py",
     "tests/test_worktree_identity.py",
+    "tests/test_worktree_network_labels.py",
     "uv.lock"
   ]
 }

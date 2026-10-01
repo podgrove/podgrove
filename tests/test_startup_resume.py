@@ -1,4 +1,5 @@
 """Partial startup retains diagnostics; explicit re-up remirrors before restart."""
+import json
 from pathlib import Path
 import shutil
 import subprocess
@@ -147,6 +148,139 @@ def test_partial_startup_keeps_control_sync_and_docker_for_diagnosis(tmp_path, m
         assert results == [0]
         sync.close.assert_called_once()
         api.close.assert_called_once()
+    finally:
+        if worker.is_alive():
+            runtime.control(data, "stop")
+            worker.join(5)
+        socket_path.unlink(missing_ok=True)
+        assert not worker.is_alive()
+
+
+@pytest.mark.parametrize("failure", ["ordinary", "ownership", "identity", "cancel", "deadline", "healthy"])
+def test_initial_forward_failure_retains_only_verified_partial_startup(tmp_path, monkeypatch, capsys, failure):
+    from podgrove import cli, exec_transport
+    from podgrove.forward import ForwardOwnershipError, Tunnel
+    from test_forward_recovery import IDENT, LocalKube, wait_until
+
+    monkeypatch.setenv("PODGROVE_STATE_HOME", str(tmp_path / "state"))
+    ident = state.identity(tmp_path)
+    path = state.state_path(tmp_path, "test-context")
+    socket_path = Path("/tmp") / f"pg-partial-forward-{time.time_ns()}.sock"
+    data = {"identity": ident, "root": str(tmp_path), "context": "test-context", "namespace": "test-namespace",
+            "timeout": 5, "status": "starting", "token": "inert", "socket": str(socket_path), "ttl_seconds": 3600,
+            "compose_project": "fixture", "compose_services": ["healthy", "failed"]}
+    state.write(path, data)
+    config = Config(tmp_path, [])
+    compose = Compose(config)
+    model = {"name": "fixture", "services": {"healthy": {"ports": [{"target": 80, "published": 8080}]}, "failed": {}}}
+    rows = [{"Service": "healthy", "Project": "fixture", "State": "running", "Health": "healthy",
+             "Publishers": [{"TargetPort": 80, "PublishedPort": 8080, "Protocol": "tcp", "URL": "0.0.0.0"}]},
+            {"Service": "failed", "Project": "fixture", "State": "exited", "ExitCode": 7}]
+    if failure == "healthy":
+        rows[1].update(State="running", ExitCode=0)
+    monkeypatch.setattr(compose, "model", lambda: model)
+    for module in (runtime, cli):
+        monkeypatch.setattr(module, "Compose", lambda *_: compose)
+        monkeypatch.setattr(module, "load_config", lambda *_: config)
+        monkeypatch.setattr(module, "Kube", Mock())
+    monkeypatch.setattr(runtime.signal, "signal", lambda *_: None)
+    sync = Mock()
+    sync.sync_once.return_value = 0
+    primary = "Compose startup failed: required source file is missing"
+    launch = Mock(return_value=(sync, .1, rows), side_effect=None if failure == "healthy" else
+                  runtime.StartupIncomplete(primary, sync, .1, rows))
+    monkeypatch.setattr(runtime, "launch_stack", launch)
+    monkeypatch.setattr(runtime, "run", Mock())
+    monkeypatch.setattr(runtime, "service_status", lambda *_, **_kw: rows)
+    offset = [0]
+    monkeypatch.setattr(runtime, "time", SimpleNamespace(time=time.time, sleep=time.sleep,
+                                                        monotonic=lambda: time.monotonic() + offset[0]))
+    api = Mock()
+    api.start.return_value = api
+    api.snapshot.return_value = {"verification": {"state": "verified"}}
+    api.identity_snapshot.return_value = {"expected": {"statefulset_uid": "original-controller", "pod_uid": "original-pod"}}
+    monkeypatch.setattr(runtime, "DockerTunnel", Mock(return_value=api))
+    forwards = []
+
+    def forward(_kube, _ident, ports):
+        tunnel = Tunnel(LocalKube(tmp_path / "forward-control", modes=("fail",)), IDENT, ports)
+        start = tunnel.start
+
+        def failing_start():
+            if failure != "healthy":
+                saved = state.read(path)
+                assert saved["startup_status"]["error"] == saved["error"] == primary
+            if failure == "ownership":
+                raise ForwardOwnershipError("Application engine ownership changed")
+            try:
+                return start(timeout=2)
+            except PodgroveError:
+                if failure == "identity":
+                    api.refresh_identity.side_effect = PodgroveError("Pinned engine verification failed")
+                elif failure == "cancel":
+                    assert runtime.control(data, "stop")["ok"]
+                elif failure == "deadline":
+                    offset[0] = 1000
+                raise
+
+        tunnel.start = failing_start
+        tunnel.close = Mock(wraps=tunnel.close)
+        forwards.append(tunnel)
+        return tunnel
+
+    monkeypatch.setattr(runtime, "Tunnel", forward)
+    results = []
+    worker = threading.Thread(target=lambda: results.append(runtime.serve(path)), daemon=True)
+    worker.start()
+    try:
+        wait_until(lambda: state.read(path)["status"] != "starting")
+        observed = state.read(path)
+        if failure == "ordinary":
+            assert observed["status"] == "degraded"
+            assert observed["startup_status"]["state"] == "failed"
+            assert observed["startup_status"]["error"] == observed["error"] == primary
+            assert observed["forward_status"]["state"] == "disconnected"
+            assert "simulated forwarding failure" in observed["forward_status"]["error"]
+            assert len(observed["ports"]) == 1 and observed["ports"][0]["status"] == "disconnected"
+            assert runtime.control(data, "ping")["forward_status"]["state"] == "disconnected"
+            wait_until(lambda: sync.sync_once.called)
+            api.close.assert_not_called()
+            sync.close.assert_not_called()
+            assert api.refresh_identity.call_count == 2
+
+            def project_paths(args, _root=None):
+                args._config_root = tmp_path
+                return tmp_path
+
+            monkeypatch.setattr(cli, "_project_paths", project_paths)
+            flags = ["--project-directory", str(tmp_path), "--context", data["context"], "--namespace", data["namespace"]]
+            capsys.readouterr()
+            assert cli.execute(cli.parser().parse_args(["status", *flags, "--json"])) == 1
+            report = json.loads(capsys.readouterr().out)
+            assert report["error"] == primary and report["forward_status"]["state"] == "disconnected"
+            execution = Mock(return_value=7)
+            monkeypatch.setattr(exec_transport, "run_exec", execution)
+            assert cli.execute(cli.parser().parse_args(["exec", *flags, "healthy", "--", "true"])) == 7
+            assert execution.call_count == 1 and execution.call_args.args[1:5] == (ident, "fixture", "healthy", ["true"])
+            assert runtime.control(data, "stop")["ok"]
+        else:
+            assert observed["status"] == "error"
+            if failure != "healthy":
+                assert observed["startup_status"]["error"] == primary
+                assert observed["error"].startswith(primary)
+            expected = {"ownership": "ownership changed", "identity": "Pinned engine verification failed",
+                        "cancel": "startup cancelled", "deadline": "deadline expired",
+                        "healthy": "simulated forwarding failure"}[failure]
+            assert expected in observed["error"]
+        worker.join(5)
+        assert results == [0 if failure == "ordinary" else 1]
+        assert launch.call_count == 1
+        api.close.assert_called_once()
+        sync.close.assert_called_once()
+        assert len(forwards) == 1
+        forwards[0].close.assert_called_once()
+        assert forwards[0].process is None or forwards[0].process.poll() is not None
+        assert forwards[0].log is None and not socket_path.exists()
     finally:
         if worker.is_alive():
             runtime.control(data, "stop")

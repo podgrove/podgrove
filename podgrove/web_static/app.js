@@ -260,7 +260,8 @@
       ["Node placement", settings.node_mode], ["Idle TTL", duration(settings.ttl_seconds)],
       ["Additional placement", Object.keys(settings.placement || {}).length ? JSON.stringify(settings.placement) : "None configured"],
       ["Reverse forwarding", settings.reverse?.length ? settings.reverse.map(rule => `host.docker.internal:${rule.remote_port} → ${rule.local_host}:${rule.local_port}`).join("; ") : "None configured"],
-      ["Environment links", settings.connect?.length ? settings.connect.map(rule => `${rule.name}.podgrove:${rule.port} → ${rule.environment}/${rule.service}`).join("; ") : "None configured"],
+      ["Pod-to-Pod network", settings.network?.pod_to_pod || "disabled"],
+      ["Legacy environment links", Array.isArray(settings.connect) && settings.connect.length ? `${settings.connect.length} legacy entr${settings.connect.length === 1 ? "y" : "ies"}; up refuses them, migrate to network.pod_to_pod` : "None configured"],
       ...(settings.node_mode === "tainted" && settings.tainted_nodes ? [
         ["Node selector", Object.entries(settings.tainted_nodes.selector || {}).map(([key, value]) => `${key}=${value}`).join(", ")],
         ["Taint tolerated", `${settings.tainted_nodes.taint?.key}=${settings.tainted_nodes.taint?.value || ""} · ${settings.tainted_nodes.taint?.effect}`],

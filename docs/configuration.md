@@ -54,9 +54,12 @@ The sample assumes those files, profiles, services, and published ports exist in
 | `storage.size` | `20Gi` | Positive Kubernetes storage quantity for the engine PVC. `up --storage` overrides it for that invocation; existing PVCs are never resized. |
 | `placement` | `{}` | Optional Kubernetes `nodeSelector`, node affinity and tolerations for an existing pool; see node placement below. |
 | `reverse` | `[]` | Local loopback TCP ports exposed inside the engine; see [connectivity examples](connectivity.md). |
-| `connect` | `[]` | Exact same-namespace environment/service/port links; see [connectivity examples](connectivity.md). |
+| `connect` | Removed | Nonempty legacy top-level links are refused; use the [Pod-to-Pod migration guide](connectivity.md#migrate-legacy-environment-links). |
 | `node_mode` | `shared` | `shared` uses eligible existing Linux nodes; `tainted` supplies a configured pool selector/toleration without reading nodes. |
 | `network.blocked_cidrs` | `[]`, in addition to built-in exclusions | Up to 128 distinct IPv4/IPv6 CIDR network addresses. Adds infrastructure exclusions to the engine's public IPv4 HTTP(S) rule; DNS remains a separate scoped exception. IPv6 public egress is not enabled. |
+| `network.pod_to_pod` | `disabled` | `disabled`, `open`, or `selected`; controls managed engine peers independently of public egress. |
+| `network.expose` | Absent | Selected mode only: services and the namespaces/worktree globs allowed to reach their fixed published TCP ports. |
+| `network.connect` | Absent | Selected mode only: destination namespace, worktree glob and published TCP ports. |
 | `tainted_nodes.selector` | `{podgrove.dev/dedicated: "true"}` | Nonempty map of node label names to string values; a supplied map replaces the default. |
 | `tainted_nodes.taint.key` | `dedicated` | Taint key placed in the Pod toleration; the administrator verifies taints on the selected nodes. |
 | `tainted_nodes.taint.value` | `podgrove` | Expected taint value; an explicit empty string is accepted. |
@@ -97,7 +100,48 @@ Every mode retains the existing namespace and bootstrap on `down` or reaping, in
 
 ## Network settings
 
-Generated bootstrap includes a retained deny NetworkPolicy selecting only Pods labelled `app.kubernetes.io/managed-by: podgrove`; unrelated and unlabelled CI Pods are unselected; each engine receives its own narrowly selected DNS/public-web allow policy. Administrators must review the actual Pod, Service, node, API and protected ingress addresses, particularly non-private ranges, and supply extra exclusions through `network.blocked_cidrs`. CIDRs must use network addresses without host bits, contain an explicit prefix, and have no scope identifier. IPv6 forms are normalized; duplicate normalized values and unknown settings are refused before external operations.
+Generated bootstrap includes a retained deny NetworkPolicy selecting only Pods labelled `app.kubernetes.io/managed-by: podgrove`; unrelated and unlabelled CI Pods are unselected. Each worktree owns its own policy. Its `network.pod_to_pod` mode controls peer ingress and egress:
+
+| Mode | Pod-to-Pod allowance |
+| --- | --- |
+| `disabled` (default) | No peer allowance. Localhost forwarding and traffic within the same Docker engine remain available. |
+| `open` | Any port to or from Pods labelled `app.kubernetes.io/managed-by: podgrove` in the engine's own namespace, plus any exact namespaces listed in `network.namespaces`. It never matches every namespace and does not remove the public-egress exclusions. |
+| `selected` | Only declared `expose` and `connect` permissions, with agreement at both endpoints. |
+
+Open peers can communicate with other open peers. Selected links require both endpoints to use selected mode and have matching declarations; open/selected combinations do not receive a selected grant. A disabled endpoint receives no peer allowance. Each supervisor changes only its own policy, never a peer's ingress policy. Declare `network.expose` and `network.connect` only in selected mode, and `network.namespaces` only in open mode. `network.namespaces` takes exact non-`kube-*` namespace names. A cross-namespace open link needs each side to list the other's namespace. Open matches a label, not an engine identity: any Pod that labels itself `app.kubernetes.io/managed-by: podgrove` in a listed namespace joins, including a non-engine Pod in a namespace without a Podgrove bootstrap. List only namespaces Podgrove manages. In worktree `namespace_mode` every worktree has its own derived namespace, so open connects nothing until each peer's derived namespace is listed; `status` reports it. Unknown keys and incompatible mode combinations are errors, including during offline `validate` and `up --dry-run --json`.
+
+For a server worktree named `apis-checkout`:
+
+```yaml
+network:
+  pod_to_pod: selected
+  expose:
+    - service: api-gateway
+      from:
+        - namespace: your-development-namespace
+          worktree: "web-*"
+```
+
+For the client worktree named `web-checkout`:
+
+```yaml
+network:
+  pod_to_pod: selected
+  connect:
+    - namespace: your-development-namespace
+      worktree: "apis-*"
+      ports: [18080]
+```
+
+The example server's Compose service must publish a fixed wildcard TCP port, such as `"0.0.0.0:18080:8080"`. Client `ports` contains the **published engine port** (`18080`), not the container port (`8080`) or laptop forwarding port. All publications of an exposed service must be fixed wildcard TCP ports; absent services, unpublished services, loopback-only bindings, target-only/zero/ranged publications, duplicate target publications and multiple replicas are refused. This restriction applies to selected exposure; ordinary Compose localhost forwarding still supports dynamic ports. Docker API ports 2375 and 2376 cannot be selected.
+
+Namespace values are exact DNS names. Worktree patterns are case-sensitive globs over the reported stable worktree name, derived from the checkout basename; they are not branch names or absolute paths. Names requiring normalization are reported by `status`, so use the reported value. An omitted `expose.from[].worktree` permits all managed worktrees in that exact namespace; `network.connect[].worktree` is required. Lists are bounded to 32 expose/connect rules, 32 sources per exposure and 128 distinct ports per connection. Across the configuration, at most 6 distinct peer namespaces and 128 exposed published ports are allowed, so each refresh fits its reconciliation budget; discovery accepts at most 128 peers. Worktree patterns are at most 128 characters and cannot contain path separators or control characters.
+
+Offline checks validate your configuration and Compose declarations, not another worktree's configuration, permissions or live traffic. Runtime discovery uses bounded Pod and ConfigMap inventories in explicitly configured namespaces. The kubeconfig identity needs namespaced `get`/`list` access to both resources there. It does not read Namespace objects or mutate peer namespaces. Unavailable discovery is reported and does not authorize a broader peer set. A single invalid, foreign or terminating peer is skipped and listed as pending; other links keep their grants. The rendered peer declaration must fit in 32 KiB; `validate` and `up --dry-run` refuse a larger one. Reported endpoint DNS names currently assume the cluster DNS suffix `cluster.local`; custom suffixes are not discovered or configured. See [connection examples, DNS and migration](connectivity.md).
+
+### Public egress exclusions
+
+Cluster DNS and filtered public IPv4 HTTP(S) retain their separate rules in every mode. Administrators must review actual Pod, Service, node, API and protected ingress addresses, particularly non-private ranges, and supply extra exclusions through `network.blocked_cidrs`. CIDRs must use network addresses without host bits, contain an explicit prefix, and have no scope identifier. IPv6 forms are normalized; duplicate normalized values and unknown settings are refused before external operations.
 
 ```yaml
 network:
@@ -105,7 +149,7 @@ network:
     - 203.0.113.0/24 # Replace this documentation range with actual infrastructure CIDRs.
 ```
 
-Built-in private/special IPv4 exclusions always remain. Adjacent/overlapping IPv4 ranges are consolidated in the generated policy. Setting `0.0.0.0/0` removes public-web egress entirely, retaining only the explicit DNS allowance. IPv6 CIDRs can be recorded, but do not create an IPv6 public-egress rule. Bootstrap itself is deny-only and grants no competing broad allowance; these additional values are used by the worktree policy rendered by `up --dry-run` and installed by `up`.
+Built-in private/special IPv4 exclusions always remain in the public-web rule. Adjacent/overlapping IPv4 ranges are consolidated in that rule. Setting `0.0.0.0/0` removes public-web egress entirely; explicit DNS and any declared Pod-to-Pod allowances remain independent. IPv6 CIDRs can be recorded, but do not create an IPv6 public-egress rule. Bootstrap itself is deny-only and grants no competing broad allowance; these additional values are used by the worktree policy rendered by `up --dry-run` and installed by `up`.
 
 Run `up` after changing exclusions. It also reconciles a missing or modified owned policy before returning an already-running environment. Provisioning-marker validation, policy ownership and optimistic concurrency prevent adopting or overwriting a replacement object. Policies added by other actors remain an administrator concern: standard NetworkPolicy allows combine, and Service/NAT/node exceptions vary by platform. See [network isolation and its limits](operations.md#worktree-network-isolation) and the [administrator guide](../deploy/README.md).
 
@@ -117,7 +161,7 @@ Without `--config`, the nearest `podgrove.yml` is found upward from the selected
 
 `compose.project_directory` chooses the Compose path-resolution base **within** the configuration boundary. It does not change identity or enlarge the sync boundary. `compose.files` and `compose.env_file` are resolved from the configuration directory; paths inside Compose are resolved by Compose against its selected project directory.
 
-Commit one `podgrove.yml` at the repository root with relative Compose paths. Every linked worktree can use identical bytes: engine/PVC names, namespace suffixes and loopback ports are derived at runtime. Do not insert this worktree's own identity, branch name or absolute checkout path into the committed YAML. Optional `connect` declarations explicitly identify a different target environment; keep developer-specific links in a local configuration when that target is not shared by the team. The [complete portable example](../examples/portable/README.md) and its [real linked-worktree regression](../tests/test_portable_worktrees.py) cover both namespace modes. Cluster target fields are team configuration; replace the example values with approved settings before deployment.
+Commit one `podgrove.yml` at the repository root with relative Compose paths. Every linked worktree can use identical bytes: engine/PVC names, namespace suffixes and loopback ports are derived at runtime. Do not insert this worktree's own identity, branch name or absolute checkout path into the committed YAML. Optional `network.connect` declarations select peer namespaces and worktree-name patterns; keep developer-specific rules in a local configuration when they are not shared by the team. The [complete portable example](../examples/portable/README.md) and its [real linked-worktree regression](../tests/test_portable_worktrees.py) cover both namespace modes. Cluster target fields are team configuration; replace the example values with approved settings before deployment.
 
 Older releases could create an environment for a Git subdirectory. If one of those records exists, the new resolver refuses to adopt, merge or duplicate it and identifies its recorded version and directory. Resolve that old environment with its original version before using the new identity. Existing environments already rooted at the checkout top level retain their identity.
 

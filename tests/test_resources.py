@@ -286,7 +286,15 @@ def test_incompatible_running_allocation_is_refused_before_any_mutation(project,
     controller = next(row for row in original if row["kind"] == "StatefulSet")
     pvc = next(row for row in original if row["kind"] == "PersistentVolumeClaim")
     kube = Kube("fixture-context", "fixture-namespace")
-    kube.get = Mock(side_effect=lambda kind, name: deepcopy(controller if kind == "StatefulSet" else pvc))
+    def get(kind, name=None, *, selector=None, ignore_missing=True):
+        if kind == "networkpolicies":
+            assert name is None and selector == "app.kubernetes.io/managed-by=podgrove,podgrove.dev/component=connection"
+            assert ignore_missing is False
+            return {"items": []}
+        assert selector is None and name == "pg-" + ident and ignore_missing is True
+        assert kind.lower() in ("statefulset", "persistentvolumeclaim")
+        return deepcopy(controller if kind.lower() == "statefulset" else pvc)
+    kube.get = Mock(side_effect=get)
     kube.reconcile_network_policy = Mock(side_effect=AssertionError("No network write before compatible sizing"))
     kube.preflight = Mock(side_effect=AssertionError("No preflight required to refuse a changed allocation"))
     monkeypatch.setattr(cli, "Kube", Mock(return_value=kube))
