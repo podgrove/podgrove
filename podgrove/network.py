@@ -82,7 +82,30 @@ def mode_mismatch(value) -> str | None:
     for key, wanted in (("expose", "selected"), ("connect", "selected"), ("namespaces", "open")):
         if key in value and mode != wanted:
             return f"network.{key}: requires pod_to_pod: {wanted} (configured mode is {mode})"
+    for namespace in value.get("namespaces") if isinstance(value.get("namespaces"), list) else []:
+        if isinstance(namespace, str) and namespace.startswith("kube-"):
+            return f"network.namespaces: {namespace!r} must be an exact non-system Kubernetes namespace name"
     return None
+
+
+def open_publications(model) -> list[tuple]:
+    """Every TCP 0.0.0.0 publication open mode advertises at runtime; a target-only port gets a published port then."""
+    services = model.get("services", {}) if isinstance(model, dict) else {}
+    result = []
+    for name, service in sorted(services.items() if isinstance(services, dict) else []):
+        for port in (service.get("ports") or []) if isinstance(service, dict) else []:
+            if (not isinstance(port, dict) or port.get("protocol", "tcp") != "tcp"
+                    or port.get("host_ip", "0.0.0.0") not in ("0.0.0.0", "")):
+                continue
+            target, published = port.get("target"), str(port.get("published", "") or "")
+            span = re.fullmatch(r"([0-9]+)-([0-9]+)", published)
+            if span:
+                result.extend((name, target, number) for number in range(int(span[1]), int(span[2]) + 1))
+            elif published.isdigit() and int(published):
+                result.append((name, target, int(published)))
+            else:
+                result.append((name, target, None))
+    return result
 
 
 def network_settings(value: dict | None = None) -> dict:
@@ -179,17 +202,15 @@ def validate_model(network: dict | None, model: dict) -> list[dict]:
     settings = network_settings(network)
     services = model.get("services", {}) if isinstance(model, dict) else {}
     if settings.get("pod_to_pod") == "open":
-        published_ports = set()
         for name, service in sorted(services.items() if isinstance(services, dict) else []):
             for port in (service.get("ports") or []) if isinstance(service, dict) else []:
                 published = port.get("published") if isinstance(port, dict) else None
                 if str(published) in ("2375", "2376"):
                     raise PodgroveError(f"network.pod_to_pod open: service {name} publishes Docker API port {published}; "
                                         "open peers would reach it, so publish it on another port")
-                if published not in (None, "", 0):
-                    published_ports.add((name, port.get("target"), str(published)))
-        if len(published_ports) > 128:
-            raise PodgroveError(f"network.pod_to_pod open: {len(published_ports)} published TCP ports exceed the 128 "
+        count = len(open_publications(model))
+        if count > 128:
+            raise PodgroveError(f"network.pod_to_pod open: {count} published TCP ports exceed the 128 "
                                 "an engine can advertise; publish fewer ports")
         return []
     if settings.get("pod_to_pod") != "selected":

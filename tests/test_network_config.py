@@ -336,3 +336,85 @@ def test_validate_refuses_recorded_legacy_grants_offline(tmp_path, monkeypatch):
     args = cli.parser().parse_args(['validate', '--context', 'test-context', '--namespace', 'podgrove-testing'])
     with pytest.raises(PodgroveError, match='Existing legacy connect grants'):
         cli.execute(args)
+
+
+@pytest.mark.parametrize('namespace', ['kube-system', 'kube-public'])
+def test_system_namespace_gets_the_friendly_one_line_message(tmp_path, namespace):
+    value = {'pod_to_pod': 'open', 'namespaces': ['team-b', namespace]}
+    message = f"network.namespaces: '{namespace}' must be an exact non-system Kubernetes namespace name"
+    with pytest.raises(PodgroveError) as direct:
+        network_settings(value)
+    (tmp_path / 'compose.yaml').write_text('services: {}\n')
+    (tmp_path / 'podgrove.yml').write_text(yaml.safe_dump({'network': value}))
+    with pytest.raises(PodgroveError) as loaded:
+        load_config(tmp_path)
+    assert str(direct.value) == str(loaded.value) == message
+
+
+def open_model(*extra):
+    return {'services': {'many': {'ports': [{'target': 8000 + index, 'published': str(20000 + index)}
+                                            for index in range(128)] + list(extra)}}}
+
+
+@pytest.mark.parametrize('extra,refused', [
+    ({'target': 9000, 'published': '30000', 'protocol': 'udp'}, False),
+    ({'target': 9000, 'published': '30000', 'host_ip': '127.0.0.1'}, False),
+    ({'target': 9000}, True),
+    ({'target': 9000, 'published': '30000'}, True),
+])
+def test_open_port_count_matches_what_the_runtime_advertises(extra, refused):
+    from podgrove.network import open_publications
+    assert len(open_publications(open_model())) == 128
+    if refused:
+        with pytest.raises(PodgroveError, match='129 published TCP ports exceed the 128'):
+            validate_model({'pod_to_pod': 'open'}, open_model(extra))
+    else:
+        assert validate_model({'pod_to_pod': 'open'}, open_model(extra)) == []
+
+
+def test_open_port_count_expands_published_ranges():
+    from podgrove.network import open_publications
+    model = {'services': {'web': {'ports': [{'target': 8000, 'published': '30000-30002'}]}}}
+    assert [published for _, _, published in open_publications(model)] == [30000, 30001, 30002]
+
+
+def legacy_validate_args(tmp_path, monkeypatch):
+    from podgrove import state
+
+    class FakeCompose:
+        def __init__(self, config):
+            pass
+
+    project = tmp_path / 'project'
+    project.mkdir()
+    (project / 'compose.yaml').write_text('services: {}\n')
+    monkeypatch.setenv('PODGROVE_STATE_HOME', str(tmp_path / 'state'))
+    monkeypatch.chdir(project)
+    monkeypatch.setattr(cli, 'Compose', FakeCompose)
+    path = state.state_path(project.resolve(), 'test-context')
+    return path, cli.parser().parse_args(['validate', '--context', 'test-context', '--namespace', 'podgrove-testing'])
+
+
+def test_validate_names_a_corrupt_state_record_and_the_fix(tmp_path, monkeypatch):
+    path, args = legacy_validate_args(tmp_path, monkeypatch)
+    path.write_text('{not json')
+    path.chmod(0o600)
+    with pytest.raises(PodgroveError) as error:
+        cli.execute(args)
+    message = str(error.value)
+    assert str(path) in message and 'move the file aside and rerun validate' in message and '\n' not in message
+
+
+def test_validate_names_an_unreadable_state_directory_and_the_fix(tmp_path, monkeypatch):
+    import os
+    if os.geteuid() == 0:
+        pytest.skip('root ignores directory permissions')
+    path, args = legacy_validate_args(tmp_path, monkeypatch)
+    path.parent.chmod(0o000)
+    try:
+        with pytest.raises(PodgroveError) as error:
+            cli.execute(args)
+    finally:
+        path.parent.chmod(0o700)
+    message = str(error.value)
+    assert str(path.parent) in message and 'PODGROVE_STATE_HOME' in message and '\n' not in message

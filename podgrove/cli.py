@@ -217,6 +217,23 @@ def _refuse_legacy_grants(record: dict) -> None:
         raise PodgroveError("Existing legacy connect grants require scoped down with the previous Podgrove version before migration to network; save data first because down deletes it")
 
 
+def _refuse_recorded_legacy_grants(path: Path) -> None:
+    """Read-only legacy check for validate; unreadable state names its path and the fix."""
+    try:
+        present = path.exists()
+    except OSError as exc:
+        raise PodgroveError(f"Cannot read the Podgrove state directory {path.parent}: {exc.strerror or exc}. "
+                            "Restore its permissions (chmod 700) or set PODGROVE_STATE_HOME to a readable directory") from exc
+    if not present:
+        return
+    try:
+        record = state.read(path)
+    except PodgroveError as exc:
+        raise PodgroveError(f"Cannot read recorded environment state {path}: {exc}. If no environment is running "
+                            "for this worktree, move the file aside and rerun validate") from exc
+    _refuse_legacy_grants(record)
+
+
 def up(args, root: Path) -> int:
     from .runtime import control, is_running, spawn
     root = _project_paths(args, root)
@@ -407,9 +424,8 @@ def execute(args) -> int:
         _set_target(args, load_cluster(args._config_root, args.config), required=False)
         config = load_config(args._config_root, args.config, args.files)
         refuse_legacy_connect(config)
-        recorded = state.state_path(root, args.context, create=False) if args.context else None
-        if recorded is not None and recorded.exists():
-            _refuse_legacy_grants(state.read(recorded))
+        if args.context:
+            _refuse_recorded_legacy_grants(state.state_path(root, args.context, create=False))
         compose = Compose(config)
         model = compose.model()
         compose.validate(model)

@@ -11,7 +11,7 @@ from urllib.parse import urlencode
 
 from .errors import PodgroveError
 from .kube import Kube
-from .network import network_settings, policy_spec, validate_model
+from .network import network_settings, open_publications, policy_spec, validate_model
 from .repository import WORKTREE_NAME
 
 MANAGED = "app.kubernetes.io/managed-by"
@@ -40,13 +40,8 @@ def offline_ports(settings, model):
     if settings.get("pod_to_pod", "disabled") == "selected":
         return validate_model(settings, model)
     validate_model(settings, model)
-    services = model.get("services", {}) if isinstance(model, dict) else {}
-    ports = []
-    for name, service in sorted(services.items() if isinstance(services, dict) else []):
-        for port in (service.get("ports") or []) if isinstance(service, dict) else []:
-            if isinstance(port, dict) and str(port.get("published", "")).isdigit() and type(port.get("target")) is int:
-                ports.append({"service": name, "target": port["target"], "published": int(port["published"])})
-    return ports
+    return [{"service": name, "target": target if type(target) is int else 65535, "published": published or 65535}
+            for name, target, published in open_publications(model)]
 
 
 def check_declaration(network, model, name):
@@ -381,18 +376,18 @@ class PodNetwork:
         """Fenced by our controller, the environment labels and each object's UID/resourceVersion, not the Pod."""
         try:
             self._own_controller()
-        except (PodgroveError, ValueError, KeyError, TypeError, AttributeError, OSError) as error:
-            raise PodgroveError(f"withdrawal refused: {error}") from error
+        except Exception as error:
+            raise PodgroveError(f"withdrawal refused: {_reason(error)}") from error
         errors = []
         if self.settings.get("pod_to_pod") == "selected":
             try:
                 self._apply()
-            except (PodgroveError, ValueError, KeyError, TypeError, AttributeError, OSError) as error:
-                errors.append(f"policy withdrawal failed: {error}")
+            except Exception as error:  # every step is attempted whatever an earlier one raised
+                errors.append(f"policy withdrawal failed: {_reason(error)}")
         try:
             self._publish(declaration(self.settings, self.name, [], None), self._own_lease())
-        except (PodgroveError, ValueError, KeyError, TypeError, AttributeError, OSError) as error:
-            errors.append(f"advertisement withdrawal failed: {error}")
+        except Exception as error:
+            errors.append(f"advertisement withdrawal failed: {_reason(error)}")
         if errors:
             raise PodgroveError("; ".join(errors))
 

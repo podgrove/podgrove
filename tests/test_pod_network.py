@@ -783,3 +783,17 @@ def test_runtime_open_mode_refuses_more_than_128_ports_with_its_own_reason():
                              for index in range(129)]
     with pytest.raises(PodgroveError, match='more than 128 published TCP ports'):
         network.observed_ports(network_settings({'pod_to_pod': 'open'}), application_model(), rows)
+
+
+def test_withdrawal_attempts_every_step_after_an_unexpected_policy_error(manager):
+    instance, kube = manager
+    assert instance.refresh([])['state'] == 'ready'
+    def broken(*args, **kwargs):
+        raise RuntimeError('policy client defect')
+    instance._apply = broken
+    kube.inventory[(SOURCE_NS, 'pods', f'pg-{SOURCE}-0')]['metadata']['uid'] = 'replacement'
+    result = instance.refresh()
+    assert result['state'] == 'unavailable'
+    assert 'policy withdrawal failed: RuntimeError: policy client defect' in result['error']
+    saved = json.loads(kube.inventory[(SOURCE_NS, 'configmaps', f'pg-{SOURCE}')]['data'][network.DECLARATION])
+    assert saved['pod_uid'] is None and saved['ports'] == []
