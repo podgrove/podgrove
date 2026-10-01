@@ -63,7 +63,7 @@ jobs:
       version: ${{ steps.resolve.outputs.version }}
       artifact_run_id: ${{ steps.resolve.outputs.artifact_run_id }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -90,7 +90,7 @@ jobs:
     if: ${{ github.event_name != 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve.outputs.sha }}
           persist-credentials: false
@@ -127,7 +127,7 @@ jobs:
       actions: read
     environment: release
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve.outputs.sha }}
           persist-credentials: false
@@ -159,7 +159,7 @@ jobs:
           path: release-dist/
           run-id: ${{ needs.resolve.outputs.artifact_run_id }}
           github-token: ${{ github.token }}
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ vars.HOMEBREW_TAP_REPOSITORY }}
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
