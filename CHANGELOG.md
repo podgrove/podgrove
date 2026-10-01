@@ -2,6 +2,20 @@
 
 User-visible changes are recorded here. Release Please manages versioned entries after the first public release.
 
+## [0.4.0](https://github.com/podgrove/podgrove/compare/v0.3.0...v0.4.0) (2026-10-01)
+
+
+### Features
+
+* configurable pod-to-pod networking (disabled/open/selected) ([1175ccc](https://github.com/podgrove/podgrove/commit/1175cccf43d2140a03bdc5af3fb0ee5eabdbe118))
+
+
+### Documentation
+
+* clarify the source sync boundary ([e317cf0](https://github.com/podgrove/podgrove/commit/e317cf0194668ffec40107ee8ff04d8aed4d6c75))
+* publish the Podgrove website ([3105e35](https://github.com/podgrove/podgrove/commit/3105e35ec00622e9f4c67ad715a69ef5242e71c2))
+* simplify the architecture overview ([e2890b0](https://github.com/podgrove/podgrove/commit/e2890b077c47f2fa3e69e8a9ef7b5f581437e39c))
+
 ## 0.3.0 (2026-09-28)
 
 - Protect each engine with supported autoscaler annotations and a namespaced PodDisruptionBudget; add optional node selectors, node affinity and tolerations for existing pools.
