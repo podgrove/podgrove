@@ -2,6 +2,13 @@
 
 User-visible changes are recorded here. Release Please manages versioned entries after the first public release.
 
+## [0.4.1](https://github.com/podgrove/podgrove/compare/v0.4.0...v0.4.1) (2026-10-01)
+
+
+### Bug Fixes
+
+* **release:** resolve draft releases and bump uv.lock; v0.4.0 was tagged but never published ([#9](https://github.com/podgrove/podgrove/issues/9)) ([e32ba9e](https://github.com/podgrove/podgrove/commit/e32ba9ef55b2fb892a76f9bd89b4fb541df0535d))
+
 ## [0.4.0](https://github.com/podgrove/podgrove/compare/v0.3.0...v0.4.0) (2026-10-01)
 
 
