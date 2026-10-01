@@ -23,6 +23,7 @@ PRIVATE_AND_SPECIAL_IPV4 = (
 
 MANAGED = "app.kubernetes.io/managed-by"
 ENVIRONMENT = "podgrove.dev/environment"
+MAX_NAMESPACES = 8
 NAMESPACE_SCHEMA = {"type": "string", "minLength": 1, "maxLength": 63,
                     "pattern": r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"}
 WORKTREE_SCHEMA = {"type": "string", "minLength": 1, "maxLength": 128,
@@ -39,7 +40,9 @@ NETWORK_SCHEMA = {
             "description": "Additional infrastructure CIDRs excluded from public web egress; built-in exclusions always remain.",
         },
         "pod_to_pod": {"type": "string", "enum": ["disabled", "open", "selected"], "default": "disabled",
-                       "description": "Disabled isolates engines; open permits all ports between Podgrove engines in any namespace; selected requires declared ingress and egress."},
+                       "description": "Disabled isolates engines; open permits all ports between Podgrove engines in this namespace and any listed in network.namespaces; selected requires declared ingress and egress."},
+        "namespaces": {"type": "array", "maxItems": MAX_NAMESPACES, "uniqueItems": True, "items": NAMESPACE_SCHEMA,
+                       "description": "Open mode only: additional exact namespaces whose Podgrove engines may connect; the engine's own namespace is always included."},
         "expose": {
             "type": "array", "maxItems": 32, "uniqueItems": True,
             "items": {"type": "object", "additionalProperties": False, "required": ["service", "from"],
@@ -62,13 +65,31 @@ NETWORK_SCHEMA = {
         },
     },
     "allOf": [{"if": {"required": ["pod_to_pod"], "properties": {"pod_to_pod": {"const": "selected"}}},
-               "else": {"not": {"anyOf": [{"required": ["expose"]}, {"required": ["connect"]}]}}}],
+               "else": {"not": {"anyOf": [{"required": ["expose"]}, {"required": ["connect"]}]}}},
+              {"if": {"required": ["pod_to_pod"], "properties": {"pod_to_pod": {"const": "open"}}},
+               "else": {"not": {"required": ["namespaces"]}}}],
 }
+
+
+def mode_mismatch(value) -> str | None:
+    """Name a key that the configured pod_to_pod mode does not accept, as one readable line."""
+    if not isinstance(value, dict):
+        return None
+    mode = value.get("pod_to_pod", "disabled")
+    if not isinstance(mode, str) or mode not in ("disabled", "open", "selected"):
+        return None
+    for key, wanted in (("expose", "selected"), ("connect", "selected"), ("namespaces", "open")):
+        if key in value and mode != wanted:
+            return f"network.{key}: requires pod_to_pod: {wanted} (configured mode is {mode})"
+    return None
 
 
 def network_settings(value: dict | None = None) -> dict:
     """Normalize network intent while keeping the disabled legacy default stable."""
     value = {} if value is None else value
+    mismatch = mode_mismatch(value)
+    if mismatch:
+        raise PodgroveError(mismatch)
     errors = list(jsonschema.Draft202012Validator(NETWORK_SCHEMA).iter_errors(value))
     if errors:
         error = errors[0]
@@ -93,6 +114,11 @@ def network_settings(value: dict | None = None) -> dict:
     mode = value.get("pod_to_pod", "disabled")
     if mode != "disabled":
         settings["pod_to_pod"] = mode
+    if mode == "open" and value.get("namespaces"):
+        settings["namespaces"] = sorted(value["namespaces"])
+        for namespace in settings["namespaces"]:
+            if not re.fullmatch(NAMESPACE_SCHEMA["pattern"], namespace) or namespace.startswith("kube-"):
+                raise PodgroveError(f"network.namespaces: {namespace!r} must be an exact non-system Kubernetes namespace name")
     if mode == "selected":
         settings["expose"] = copy.deepcopy(value.get("expose", []))
         settings["connect"] = copy.deepcopy(value.get("connect", []))
@@ -111,8 +137,8 @@ def network_settings(value: dict | None = None) -> dict:
                 raise PodgroveError("network.connect.ports: expected integer published TCP ports")
         namespaces = {peer["namespace"] for rule in settings["expose"] for peer in rule["from"]}
         namespaces.update(peer["namespace"] for peer in settings["connect"])
-        if len(namespaces) > 32:
-            raise PodgroveError("network: at most 32 distinct peer namespaces can be declared")
+        if len(namespaces) > MAX_NAMESPACES:
+            raise PodgroveError(f"network: at most {MAX_NAMESPACES} distinct peer namespaces can be declared")
     return settings
 
 
@@ -134,9 +160,12 @@ def policy_spec(ident: str, network: dict | None = None, *, ingress: list[dict] 
     incoming = []
     mode = settings.get("pod_to_pod", "disabled")
     if mode == "open":
-        peer = {"namespaceSelector": {}, "podSelector": {"matchLabels": {MANAGED: "podgrove"}}}
-        incoming.append({"from": [copy.deepcopy(peer)]})
-        outgoing.append({"to": [peer]})
+        # A peer without namespaceSelector matches only this policy's own namespace.
+        managed = {"podSelector": {"matchLabels": {MANAGED: "podgrove"}}}
+        peers = [managed, *({"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": namespace}}, **managed}
+                            for namespace in settings.get("namespaces", []))]
+        incoming.append({"from": copy.deepcopy(peers)})
+        outgoing.append({"to": copy.deepcopy(peers)})
     elif mode == "selected":
         incoming.extend(copy.deepcopy(ingress or []))
         outgoing.extend(copy.deepcopy(egress or []))
@@ -147,9 +176,17 @@ def policy_spec(ident: str, network: dict | None = None, *, ingress: list[dict] 
 def validate_model(network: dict | None, model: dict) -> list[dict]:
     """Validate local exposures offline and return deterministic published ports."""
     settings = network_settings(network)
+    services = model.get("services", {}) if isinstance(model, dict) else {}
+    if settings.get("pod_to_pod") == "open":
+        for name, service in sorted(services.items() if isinstance(services, dict) else []):
+            for port in (service.get("ports") or []) if isinstance(service, dict) else []:
+                published = port.get("published") if isinstance(port, dict) else None
+                if str(published) in ("2375", "2376"):
+                    raise PodgroveError(f"network.pod_to_pod open: service {name} publishes Docker API port {published}; "
+                                        "open peers would reach it, so publish it on another port")
+        return []
     if settings.get("pod_to_pod") != "selected":
         return []
-    services = model.get("services", {}) if isinstance(model, dict) else {}
     if not isinstance(services, dict):
         raise PodgroveError("network.expose: expected normalized Compose services")
     result = []

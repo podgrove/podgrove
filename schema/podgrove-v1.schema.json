@@ -139,43 +139,8 @@
       }
     },
     "connect": {
-      "type": "array",
-      "maxItems": 32,
       "deprecated": true,
-      "description": "Legacy nonempty declarations are refused; migrate to network.connect and target network.expose with pod_to_pod: selected.",
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "name",
-          "environment",
-          "service",
-          "port"
-        ],
-        "properties": {
-          "name": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 63,
-            "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
-          },
-          "environment": {
-            "type": "string",
-            "pattern": "^[a-f0-9]{12}$"
-          },
-          "service": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 128,
-            "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.-]*$"
-          },
-          "port": {
-            "type": "integer",
-            "minimum": 1,
-            "maximum": 65535
-          }
-        }
-      }
+      "description": "Legacy top-level connect. up and validate refuse any nonempty value with migration guidance; down and status still read the file. Use network.connect with pod_to_pod: selected."
     },
     "sync": {
       "type": "object",
@@ -659,7 +624,19 @@
             "selected"
           ],
           "default": "disabled",
-          "description": "Disabled isolates engines; open permits all ports between Podgrove engines in any namespace; selected requires declared ingress and egress."
+          "description": "Disabled isolates engines; open permits all ports between Podgrove engines in this namespace and any listed in network.namespaces; selected requires declared ingress and egress."
+        },
+        "namespaces": {
+          "type": "array",
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 63,
+            "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+          },
+          "description": "Open mode only: additional exact namespaces whose Podgrove engines may connect; the engine's own namespace is always included."
         },
         "expose": {
           "type": "array",
@@ -782,6 +759,25 @@
                     "connect"
                   ]
                 }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "pod_to_pod"
+            ],
+            "properties": {
+              "pod_to_pod": {
+                "const": "open"
+              }
+            }
+          },
+          "else": {
+            "not": {
+              "required": [
+                "namespaces"
               ]
             }
           }

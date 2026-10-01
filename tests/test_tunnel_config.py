@@ -1,9 +1,11 @@
 import copy
+import re
+from types import SimpleNamespace
 
 import pytest
 import yaml
 
-from podgrove.config import Config, load_config, load_target, normalize_connect, normalize_reverse
+from podgrove.config import Config, load_config, load_target, normalize_connect, normalize_reverse, refuse_legacy_connect
 from podgrove.errors import PodgroveError
 
 
@@ -45,28 +47,49 @@ def connection(**kwargs):
     return {"name": "database", "environment": "abcdef123456", "service": "mongo-secondary_1", "port": 27017, **kwargs}
 
 
+def refused(value):
+    with pytest.raises(PodgroveError, match="no longer supported") as error:
+        refuse_legacy_connect(SimpleNamespace(connect=normalize_connect(value)))
+    return str(error.value)
+
+
 def test_legacy_connect_requires_mutual_consent_migration():
-    with pytest.raises(PodgroveError, match='network.pod_to_pod: selected.*network.connect.*network.expose'):
-        normalize_connect([connection()])
+    assert re.search('network.pod_to_pod: selected.*network.connect.*network.expose', refused([connection()]))
 
 
-@pytest.mark.parametrize("changes", [
-    {"name": "UPPER"}, {"name": "outside.example"}, {"name": "-bad"}, {"name": "x" * 64},
-    {"name": "localhost"}, {"name": "host"}, {"name": "docker"}, {"name": "host-docker-internal"},
-    {"environment": "ABCDEF123456"}, {"environment": "abcdef12345"}, {"namespace": "other"}, {"context": "other"},
-    {"service": "unsafe/name"}, {"service": "-option"}, {"service": "x" * 129},
-    {"port": 2375}, {"port": 2376}, {"port": True}, {"port": 65536},
+@pytest.mark.parametrize("value", [
+    [connection(name="UPPER")], [connection(port=2375)], [connection(environment="nope")], [{"bogus": 1}],
+    [connection(name=f"db-{index}") for index in range(33)], {"name": "database"}, "database", 7,
 ])
-def test_connect_rejects_invalid_or_cross_scope_configuration(changes):
-    with pytest.raises(PodgroveError, match="connect"):
-        normalize_connect([connection(**changes)])
+def test_malformed_legacy_connect_still_shows_the_migration_message(value):
+    refused(value)
 
 
 def test_nonempty_legacy_connections_are_refused_even_when_multiple():
+    refused([connection(), connection(service="other")])
+
+
+def write_legacy_project(tmp_path, connect):
+    (tmp_path / "compose.yaml").write_text("services: {}\n")
+    (tmp_path / "podgrove.yml").write_text(yaml.safe_dump({"connect": connect}))
+
+
+@pytest.mark.parametrize("connect", [[connection()], [{"bogus": 1}]])
+def test_down_and_status_still_load_a_file_with_legacy_connect(tmp_path, connect):
+    write_legacy_project(tmp_path, connect)
+    assert load_config(tmp_path).connect == connect
+    assert load_target(tmp_path)
+
+
+@pytest.mark.parametrize("command", ["validate", "up"])
+def test_validate_and_up_refuse_legacy_connect_before_any_cluster_or_compose_call(tmp_path, monkeypatch, command):
+    from podgrove import cli
+    write_legacy_project(tmp_path, [{"bogus": 1}])
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "Compose", lambda *args, **kwargs: pytest.fail("Compose must not run"))
+    args = cli.parser().parse_args([command, "--context", "test-context", "--namespace", "podgrove-testing"])
     with pytest.raises(PodgroveError, match="no longer supported"):
-        normalize_connect([connection(), connection(service="other")])
-    with pytest.raises(PodgroveError, match="connect"):
-        normalize_connect([connection(name=f"db-{i}") for i in range(33)])
+        cli.execute(args)
 
 
 def test_loaded_config_preserves_reverse_and_empty_legacy_connect(tmp_path):
@@ -77,14 +100,12 @@ def test_loaded_config_preserves_reverse_and_empty_legacy_connect(tmp_path):
     assert config.connect == []
 
 
-@pytest.mark.parametrize('loader', [load_config, load_target])
-def test_legacy_connect_is_refused_before_loading_compose_files(tmp_path, loader):
+def test_target_read_for_down_accepts_legacy_connect_without_compose_files(tmp_path):
     (tmp_path / 'podgrove.yml').write_text(yaml.safe_dump({'connect': [connection()]}))
-    with pytest.raises(PodgroveError, match='no longer supported.*network.expose'):
-        loader(tmp_path)
+    assert load_target(tmp_path)
 
 
-@pytest.mark.parametrize("setting", [{"reverse": [{"local_port": 80}]}, {"connect": [connection(name="host")]}])
+@pytest.mark.parametrize("setting", [{"reverse": [{"local_port": 80}]}])
 def test_target_only_reads_validate_route_semantics_without_compose(tmp_path, setting):
     (tmp_path / "podgrove.yml").write_text(yaml.safe_dump(setting))
     with pytest.raises(PodgroveError):

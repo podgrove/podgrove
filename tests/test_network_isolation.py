@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import ipaddress
+import json
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -15,7 +16,8 @@ import pytest
 
 from podgrove.bootstrap import render_bootstrap
 from podgrove.kube import ENVIRONMENT, MANAGED, Kube, manifests, resolve_namespace
-from podgrove.network import policy_spec, validate_model
+from podgrove.errors import PodgroveError
+from podgrove.network import network_settings, policy_spec, validate_model
 from podgrove.pod_network import declaration, selected_rules
 from podgrove.repository import worktree_name
 
@@ -313,20 +315,43 @@ def test_actual_cleanup_retains_bootstrap_policy_and_namespace_but_removes_owned
                    for item in remaining)
 
 
-@pytest.mark.parametrize("namespace", ["team-network", "other-team"])
+def open_policy(peer, namespaces=None):
+    intent = {"pod_to_pod": "open", **({"namespaces": namespaces} if namespaces else {})}
+    return {"kind": "NetworkPolicy", "metadata": {"namespace": peer["namespace"]},
+            "spec": policy_spec(peer["labels"][ENVIRONMENT], intent)}
+
+
 @pytest.mark.parametrize("protocol", ["TCP", "UDP", "SCTP"])
 @pytest.mark.parametrize("port", [80, 8080, 65535])
-def test_open_allows_any_port_only_between_managed_pods(namespace, protocol, port):
+def test_open_allows_any_port_between_managed_pods_in_admitted_namespaces_only(protocol, port):
     source = endpoint("team-network", "10.20.1.2", {MANAGED: "podgrove", ENVIRONMENT: IDENT})
-    target = endpoint(namespace, "10.20.1.3", {MANAGED: "podgrove", ENVIRONMENT: OTHER_IDENT})
-    policies = [{"kind": "NetworkPolicy", "metadata": {"namespace": peer["namespace"]},
-                 "spec": policy_spec(peer["labels"][ENVIRONMENT], {"pod_to_pod": "open"})}
-                for peer in (source, target)]
-    assert connection_allowed(policies, source, target, port, protocol)
+    same = endpoint("team-network", "10.20.1.3", {MANAGED: "podgrove", ENVIRONMENT: OTHER_IDENT})
+    other = endpoint("other-team", "10.20.1.5", {MANAGED: "podgrove", ENVIRONMENT: OTHER_IDENT})
+    assert connection_allowed([open_policy(source), open_policy(same)], source, same, port, protocol)
+    assert not connection_allowed([open_policy(source), open_policy(other)], source, other, port, protocol)
+    listed = [open_policy(source, ["other-team"]), open_policy(other, ["team-network"])]
+    assert connection_allowed(listed, source, other, port, protocol)
     for labels in ({}, {MANAGED: "another-app"}):
-        foreign = endpoint(namespace, "10.20.1.4", labels)
-        assert not direction_allowed(policies, source, foreign, "Egress", port, protocol)
-        assert not direction_allowed(policies, source, foreign, "Ingress", port, protocol)
+        foreign = endpoint("team-network", "10.20.1.4", labels)
+        assert not direction_allowed(listed, source, foreign, "Egress", port, protocol)
+        assert not direction_allowed(listed, source, foreign, "Ingress", port, protocol)
+
+
+@pytest.mark.parametrize("namespaces", [None, ["other-team"]])
+@pytest.mark.parametrize("namespace", ["kube-system", "ci-runners"])
+def test_open_never_admits_a_self_labelled_pod_from_an_unlisted_namespace(namespaces, namespace):
+    source = endpoint("team-network", "10.20.1.2", {MANAGED: "podgrove", ENVIRONMENT: IDENT})
+    impostor = endpoint(namespace, "10.20.9.9", {MANAGED: "podgrove", ENVIRONMENT: OTHER_IDENT})
+    policy = open_policy(source, namespaces)
+    for direction in ("Ingress", "Egress"):
+        assert not direction_allowed([policy], source, impostor, direction, 8080)
+    assert '"namespaceSelector": {}' not in json.dumps(policy["spec"])
+
+
+@pytest.mark.parametrize("namespaces", [["kube-system"], ["Bad"], ["x" * 64]])
+def test_open_namespace_list_is_exact_and_excludes_system_namespaces(namespaces):
+    with pytest.raises(PodgroveError):
+        network_settings({"pod_to_pod": "open", "namespaces": namespaces})
 
 
 @pytest.mark.parametrize("source_mode,target_mode", [("open", "disabled"), ("disabled", "open"),
@@ -391,6 +416,8 @@ def test_rendered_network_mode_matrix_preserves_isolation_and_build_access(names
     for index, (ident, root, namespace) in enumerate(zip(ids, roots, namespaces)):
         peer_index = 1 - index
         intent = {'pod_to_pod': pod_to_pod}
+        if pod_to_pod == 'open' and namespaces[peer_index] != namespace:
+            intent['namespaces'] = [namespaces[peer_index]]
         if pod_to_pod == 'selected':
             target = {'namespace': namespaces[peer_index], 'worktree': roots[peer_index].name.split('-')[0] + '-*'}
             intent.update(expose=[{'service': 'api', 'from': [target]}], connect=[{**target, 'ports': [80]}])
@@ -418,7 +445,7 @@ def test_rendered_network_mode_matrix_preserves_isolation_and_build_access(names
         assert connection_allowed(policies, source, target, 8080) is (pod_to_pod == 'open')
         assert connection_allowed(policies, source, target, 80, 'UDP') is (pod_to_pod == 'open')
         wrong_namespace = endpoint('undeclared-team', target['address'], target['labels'])
-        assert direction_allowed(policies, source, wrong_namespace, 'Egress', 80) is (pod_to_pod == 'open')
+        assert not direction_allowed(policies, source, wrong_namespace, 'Egress', 80)
         foreign = endpoint(target['namespace'], target['address'], {**target['labels'], MANAGED: 'other-app'})
         for direction in ('Ingress', 'Egress'):
             assert not direction_allowed(policies, source, foreign, direction, 80)

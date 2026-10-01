@@ -4,7 +4,6 @@ import json
 from types import SimpleNamespace
 import threading
 import time
-from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -210,8 +209,8 @@ def objects(namespace, ident, name, settings, ports):
     meta = {'namespace': namespace, 'name': f'pg-{ident}-0', 'uid': f'{ident}-pod', 'resourceVersion': '1',
             'labels': labels, 'ownerReferences': [{'kind': 'StatefulSet', 'name': f'pg-{ident}',
                                                  'uid': f'{ident}-controller', 'controller': True}]}
-    pod = {'metadata': meta, 'status': {'conditions': [{'type': 'Ready', 'status': 'True'}]}}
-    lease = {'metadata': {'namespace': namespace, 'name': f'pg-{ident}', 'uid': f'{ident}-lease',
+    pod = {'kind': 'Pod', 'metadata': meta, 'status': {'conditions': [{'type': 'Ready', 'status': 'True'}]}}
+    lease = {'kind': 'ConfigMap', 'metadata': {'namespace': namespace, 'name': f'pg-{ident}', 'uid': f'{ident}-lease',
                           'resourceVersion': '1', 'labels': deepcopy(labels)},
              'data': {network.DECLARATION: json.dumps(profile(settings, name, ports, meta['uid']))}}
     return pod, lease
@@ -227,6 +226,9 @@ class MemoryKube:
             pod, lease = objects(*args)
             self.inventory[(args[0], 'pods', pod['metadata']['name'])] = pod
             self.inventory[(args[0], 'configmaps', lease['metadata']['name'])] = lease
+        self.inventory[(SOURCE_NS, 'statefulsets', f'pg-{SOURCE}')] = {'metadata': {
+            'namespace': SOURCE_NS, 'name': f'pg-{SOURCE}', 'uid': f'{SOURCE}-controller', 'resourceVersion': '1',
+            'labels': {network.MANAGED: 'podgrove', network.ENVIRONMENT: SOURCE}}}
         self.calls, self.policies = [], []
         self.inventory[(SOURCE_NS, 'configmaps', PROVISIONING_MARKER)] = provisioning_marker(SOURCE_NS, 'shared')
         self.list_override = None
@@ -234,24 +236,20 @@ class MemoryKube:
         self.allowed_namespaces = {TARGET_NS}
 
     def get(self, kind, name):
-        plural = {'pod': 'pods', 'configmap': 'configmaps', 'NetworkPolicy': 'networkpolicies'}[kind]
+        plural = {'pod': 'pods', 'configmap': 'configmaps', 'statefulset': 'statefulsets',
+                  'NetworkPolicy': 'networkpolicies'}[kind]
         return deepcopy(self.inventory.get((self.namespace, plural, name), {}))
 
     def call(self, *args, **kwargs):
         self.calls.append((args, kwargs))
-        if args[:2] == ('get', '--raw'):
-            url = urlsplit(args[2])
-            fields = url.path.split('/')
-            assert fields[:4] == ['', 'api', 'v1', 'namespaces'] and len(fields) == 6
-            namespace, kind = fields[4:]
-            assert namespace in self.allowed_namespaces and kind in ('pods', 'configmaps')
-            query = parse_qs(url.query)
-            assert query['labelSelector'] == [f'{network.MANAGED}=podgrove']
-            assert query['limit'] == [str(network.MAX_PEERS)]
+        if args[:2] == ('get', 'pods,configmaps'):
+            namespace = kwargs['namespace']
+            assert args[2:] == ('-l', f'{network.MANAGED}=podgrove', '-o', 'json')
+            assert namespace in self.allowed_namespaces
             if self.forbidden:
                 raise PodgroveError('Forbidden: peer namespace read access is not granted')
-            result = self.list_override or {'metadata': {}, 'items': [deepcopy(value)
-                for (ns, resource, _), value in self.inventory.items() if ns == namespace and resource == kind]}
+            result = self.list_override or {'kind': 'List', 'items': [deepcopy(value)
+                for (ns, resource, _), value in self.inventory.items() if ns == namespace and resource in ('pods', 'configmaps')]}
         elif args[0] == 'get':
             assert args[3:] == ('-o', 'json', '--ignore-not-found')
             result = self.get(args[1], args[2])
@@ -361,8 +359,8 @@ def test_peer_namespace_rbac_denial_revokes_instead_of_guessing_or_widening(mana
 
 
 @pytest.mark.parametrize('response', [
-    {'metadata': {'continue': 'more'}, 'items': []},
-    {'metadata': {}, 'items': [{}] * 129}, {'metadata': {}, 'items': {}},
+    {'kind': 'List'}, {'kind': 'List', 'items': {}}, {'kind': 'List', 'items': [{'kind': 'Secret'}]},
+    {'kind': 'List', 'items': [{'kind': 'Pod', 'metadata': {}}] * 129},
 ])
 def test_incomplete_or_unbounded_peer_list_never_creates_a_partial_grant(manager, response):
     instance, kube = manager
@@ -371,28 +369,115 @@ def test_incomplete_or_unbounded_peer_list_never_creates_a_partial_grant(manager
     assert kube.policies[-1]['spec'] == policy_spec(SOURCE)
 
 
-@pytest.mark.parametrize('resource,field,value', [
-    ('pods', 'metadata', []), ('pods', 'status', []),
-    ('configmaps', 'data', []), ('configmaps', 'metadata', []),
+def add_second_target(kube):
+    pod, lease = objects(TARGET_NS, THIRD, 'apis-second', TARGET_SETTINGS, PORTS)
+    kube.inventory[(TARGET_NS, 'pods', pod['metadata']['name'])] = pod
+    kube.inventory[(TARGET_NS, 'configmaps', lease['metadata']['name'])] = lease
+
+
+def granted(kube):
+    selectors = [rule['to'][0].get('podSelector', {}).get('matchLabels', {}) for rule in kube.policies[-1]['spec']['egress']]
+    return {labels[network.ENVIRONMENT] for labels in selectors if network.ENVIRONMENT in labels}
+
+
+@pytest.mark.parametrize('resource,field', [
+    ('pods', 'metadata'), ('pods', 'status'), ('configmaps', 'data'), ('configmaps', 'metadata'),
+    ('pods', 'terminating'), ('configmaps', 'terminating'), ('configmaps', 'foreign-environment'),
+    ('configmaps', 'declaration'),
 ])
-def test_malformed_peer_objects_fail_closed_without_escaping_monitor(manager, resource, field, value):
+def test_one_defective_peer_is_skipped_and_reported_while_other_links_survive(manager, resource, field):
     instance, kube = manager
-    assert instance.refresh([])['state'] == 'ready'
+    add_second_target(kube)
+    assert instance.refresh([])['state'] == 'ready' and granted(kube) == {TARGET, THIRD}
     name = f'pg-{TARGET}-0' if resource == 'pods' else f'pg-{TARGET}'
-    kube.inventory[(TARGET_NS, resource, name)][field] = value
-    assert instance.refresh()['state'] == 'unavailable'
+    item = kube.inventory[(TARGET_NS, resource, name)]
+    if field == 'terminating':
+        item['metadata']['deletionTimestamp'] = '2026-10-01T00:00:00Z'
+    elif field == 'foreign-environment':
+        item['metadata']['labels'][network.ENVIRONMENT] = THIRD
+    elif field == 'declaration':
+        item['data'][network.DECLARATION] = '{"version": 2}'
+    else:
+        item[field] = []
+    result = instance.refresh()
+    assert result['state'] == 'waiting' and granted(kube) == {THIRD}
+    assert any(note.startswith(TARGET_NS) and 'ignored' in note for note in result['pending'])
+
+
+def test_malformed_unrelated_managed_configmap_in_referenced_namespace_never_revokes(manager):
+    instance, kube = manager
+    kube.inventory[(TARGET_NS, 'configmaps', 'cache')] = {
+        'kind': 'ConfigMap', 'metadata': {'namespace': TARGET_NS, 'name': 'cache', 'labels': {network.MANAGED: 'podgrove'}},
+        'data': {network.DECLARATION: 'not-json'}}
+    result = instance.refresh([])
+    assert result['state'] == 'waiting' and granted(kube) == {TARGET}
+    assert any(note.startswith(f'{TARGET_NS}/cache: peer ignored') for note in result['pending'])
+
+
+def test_skipped_peer_keeps_the_session_ready_so_up_exits_zero(manager):
+    from podgrove.session_status import observed
+    instance, kube = manager
+    kube.inventory[(TARGET_NS, 'pods', f'pg-{TARGET}-0')]['metadata']['deletionTimestamp'] = '2026-10-01T00:00:00Z'
+    add_second_target(kube)
+    status = instance.refresh([])
+    assert status['state'] == 'waiting' and granted(kube) == {THIRD}
+    session = observed({'status': 'ready'}, ping={'ok': True, 'status': 'ready', 'pod_network_status': status})
+    assert session['status'] == 'ready'
+
+
+def test_own_pod_replacement_withdraws_stale_grants_fenced_by_controller_and_policy(manager):
+    instance, kube = manager
+    assert instance.refresh([])['state'] == 'ready' and granted(kube) == {TARGET}
+    kube.inventory[(SOURCE_NS, 'pods', f'pg-{SOURCE}-0')]['metadata']['uid'] = 'replacement'
+    result = instance.refresh()
+    assert result['state'] == 'unavailable' and 'engine identity changed' in result['error']
     assert kube.policies[-1]['spec'] == policy_spec(SOURCE)
+    replace = [kwargs for args, kwargs in kube.calls if args[0] == 'replace'][-1]
+    assert json.loads(replace['input'])['metadata']['uid'] == 'policy-uid'
+    saved = json.loads(kube.inventory[(SOURCE_NS, 'configmaps', f'pg-{SOURCE}')]['data'][network.DECLARATION])
+    assert saved['pod_uid'] is None and saved['ports'] == []
 
 
-@pytest.mark.parametrize('resource', ['pods', 'configmaps'])
-def test_own_uid_replacement_is_reported_without_republishing_declaration(manager, resource):
+def test_own_lease_replacement_is_reported_without_republishing_declaration(manager):
     instance, kube = manager
     assert instance.refresh([])['state'] == 'ready'
     before = len([args for args, _ in kube.calls if args[0] == 'patch'])
-    name = f'pg-{SOURCE}-0' if resource == 'pods' else f'pg-{SOURCE}'
-    kube.inventory[(SOURCE_NS, resource, name)]['metadata']['uid'] = 'replacement'
+    kube.inventory[(SOURCE_NS, 'configmaps', f'pg-{SOURCE}')]['metadata']['uid'] = 'replacement'
     assert instance.refresh()['state'] == 'unavailable'
     assert len([args for args, _ in kube.calls if args[0] == 'patch']) == before
+
+
+def test_withdrawal_never_rewrites_a_policy_owned_by_another_environment(manager):
+    instance, kube = manager
+    assert instance.refresh([])['state'] == 'ready'
+    kube.inventory[(SOURCE_NS, 'networkpolicies', f'pg-{SOURCE}')]['metadata'].setdefault('labels', {})[network.ENVIRONMENT] = THIRD
+    kube.inventory[(SOURCE_NS, 'pods', f'pg-{SOURCE}-0')]['metadata']['uid'] = 'replacement'
+    before = deepcopy(kube.policies)
+    assert instance.refresh()['state'] == 'unavailable'
+    assert kube.policies == before
+
+
+@pytest.mark.parametrize('count', [1, 2, 8])
+def test_refresh_call_count_is_bounded_by_namespace_count(manager, count):
+    instance, kube = manager
+    namespaces = [TARGET_NS] + [f'peer-{index}' for index in range(1, count)]
+    instance.settings = network_settings({'pod_to_pod': 'selected', 'connect': [
+        {'namespace': namespace, 'worktree': 'apis-*', 'ports': [80]} for namespace in namespaces]})
+    kube.allowed_namespaces.update(namespaces)
+    instance.refresh([])
+    kube.calls.clear()
+    instance.refresh()
+    assert len([args for args, _ in kube.calls if args[:2] == ('get', 'pods,configmaps')]) == count
+    assert len(kube.calls) <= count + 7
+
+
+def test_validated_namespace_maximum_fits_the_reconcile_budget():
+    from podgrove.network import MAX_NAMESPACES
+    assert MAX_NAMESPACES + 7 <= network.RECONCILE_TIMEOUT - network.CLEANUP_TIMEOUT
+    too_many = {'pod_to_pod': 'selected', 'connect': [
+        {'namespace': f'peer-{index}', 'worktree': '*', 'ports': [80]} for index in range(MAX_NAMESPACES + 1)]}
+    with pytest.raises(PodgroveError, match=f'at most {MAX_NAMESPACES} distinct peer namespaces'):
+        network_settings(too_many)
 
 
 def test_snapshot_is_private_and_close_withdraws_only_this_engine_grants(manager):
@@ -458,7 +543,7 @@ def test_cancellation_stops_blocked_discovery_and_revokes_with_fresh_cleanup_eve
     original = kube.call
     errors = []
     def gated(*args, **kwargs):
-        if args[:2] == ('get', '--raw'):
+        if args[:2] == ('get', 'pods,configmaps'):
             blocked.set()
             if not kwargs['cancel_event'].wait(2):
                 raise AssertionError('Discovery did not receive the cancellation event')
@@ -490,7 +575,8 @@ def test_close_refuses_revocation_after_own_controller_identity_changes(manager)
     assert instance.refresh([])['state'] == 'ready'
     before = deepcopy(kube.policies)
     kube.inventory[(SOURCE_NS, 'pods', f'pg-{SOURCE}-0')]['metadata']['ownerReferences'][0]['uid'] = 'foreign-controller'
-    with pytest.raises(PodgroveError, match='engine identity changed'):
+    kube.inventory[(SOURCE_NS, 'statefulsets', f'pg-{SOURCE}')]['metadata']['uid'] = 'foreign-controller'
+    with pytest.raises(PodgroveError, match='controller changed'):
         instance.close()
     assert kube.policies == before
 
@@ -562,3 +648,29 @@ def test_finished_startup_deadline_and_cancel_event_do_not_expire_live_monitor(m
     finally:
         instance.close()
     assert not instance.worker.is_alive()
+
+
+def test_server_ingress_requires_every_requested_port_to_be_exposed():
+    source_settings = deepcopy(SOURCE_SETTINGS)
+    source_settings['connect'][0]['ports'] = [80, 443]
+    incoming, _, _ = network.selected_rules(TARGET_NS, TARGET, profile(TARGET_SETTINGS, TARGET_NAME, PORTS), [
+        peer(source_settings, namespace=SOURCE_NS, ident=SOURCE, name=SOURCE_NAME, ports=[]),
+    ])
+    assert incoming == []
+
+
+def test_server_ingress_requires_the_client_to_target_this_worktree():
+    source_settings = deepcopy(SOURCE_SETTINGS)
+    source_settings['connect'][0]['worktree'] = 'other-*'
+    incoming, _, _ = network.selected_rules(TARGET_NS, TARGET, profile(TARGET_SETTINGS, TARGET_NAME, PORTS), [
+        peer(source_settings, namespace=SOURCE_NS, ident=SOURCE, name=SOURCE_NAME, ports=[]),
+    ])
+    assert incoming == []
+
+
+def test_peer_pod_with_a_foreign_environment_label_never_receives_a_grant(manager):
+    instance, kube = manager
+    kube.inventory[(TARGET_NS, 'pods', f'pg-{TARGET}-0')]['metadata']['labels'][network.ENVIRONMENT] = THIRD
+    result = instance.refresh([])
+    assert TARGET not in granted(kube)
+    assert any('ignored' in note for note in result['pending'])

@@ -31,7 +31,7 @@ network:
 
 `disabled` is the default: Podgrove adds no peer-traffic allowance. Compose services within the same engine and laptop port-forwards keep working. The independent DNS and public-web rules described below remain in effect.
 
-Set `open` to allow any port to or from Pods labelled as Podgrove-managed in any namespace. Both endpoints must permit a connection; an open source cannot override a disabled destination. Open does not grant access to arbitrary unlabelled Pods, expose a public load balancer, or remove filtered public-egress exclusions.
+Set `open` to allow any port to or from Pods labelled as Podgrove-managed in the engine's own namespace. List additional exact namespaces in `network.namespaces`; the other side must list yours too. Open never matches every namespace, so a Pod that labels itself in an unlisted namespace gets nothing. Both endpoints must permit a connection; an open source cannot override a disabled destination. Open does not grant access to arbitrary unlabelled Pods, expose a public load balancer, or remove filtered public-egress exclusions.
 
 Use `selected` for explicit server/client rules. Both endpoints must use selected mode and declare matching permissions, each enforced by that environment's own policy. An open/selected pair does not receive a selected grant; use open at both ends or matching selected rules at both ends. A client never writes a server's ingress allowance.
 

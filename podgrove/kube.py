@@ -248,12 +248,12 @@ class Kube:
         self.namespace = namespace_name(namespace)
         self.namespace_mode = resolve_namespace_mode(namespace, namespace_mode)
 
-    def command(self, *args: str) -> list[str]:
-        return ["kubectl", "--context", self.context, "--namespace", self.namespace,
+    def command(self, *args: str, namespace: str | None = None) -> list[str]:
+        return ["kubectl", "--context", self.context, "--namespace", namespace_name(namespace or self.namespace),
                 f"--request-timeout={REQUEST_TIMEOUT}s", *args]
 
-    def call(self, *args: str, **kwargs):
-        return run(self.command(*args), **kwargs)
+    def call(self, *args: str, namespace: str | None = None, **kwargs):
+        return run(self.command(*args, namespace=namespace), **kwargs)
 
     def get(self, kind: str, name: str | None = None, *, selector: str | None = None,
             ignore_missing: bool = True) -> dict:

@@ -16,9 +16,9 @@ from pathlib import Path
 from . import __version__, state
 from .compose import Compose
 from .connect import validate_connectivity
-from .network import validate_model as validate_network_model
+from .pod_network import check_declaration
 from .repository import worktree_name
-from .config import default_tainted_nodes, load_cluster, load_config, storage_class_name
+from .config import default_tainted_nodes, load_cluster, load_config, refuse_legacy_connect, storage_class_name
 from .errors import PodgroveError
 from .fingerprint import FORMAT as FINGERPRINT_FORMAT, launch_fingerprint
 from .forward import validate_port_plan
@@ -219,11 +219,12 @@ def up(args, root: Path) -> int:
     _set_target(args, load_cluster(config_root, args.config), required=not args.dry_run)
     _check_legacy_identity(root, args.context)
     config = load_config(config_root, args.config, args.files)
+    refuse_legacy_connect(config)
     node_mode = args.node_mode or config.node_mode
     compose = Compose(config)
     model = compose.model()
     compose.validate(model)
-    validate_network_model(config.network, model)
+    check_declaration(config.network, model, worktree_name(root))
     fingerprint = launch_fingerprint(model, config)
     ident = state.identity(root)
     validate_connectivity(config, model, ident)
@@ -401,10 +402,11 @@ def execute(args) -> int:
     if args.command == "validate":
         _set_target(args, load_cluster(args._config_root, args.config), required=False)
         config = load_config(args._config_root, args.config, args.files)
+        refuse_legacy_connect(config)
         compose = Compose(config)
         model = compose.model()
         compose.validate(model)
-        validate_network_model(config.network, model)
+        check_declaration(config.network, model, worktree_name(root))
         validate_connectivity(config, model, state.identity(root))
         validate_port_plan(compose.published_ports(model), config.forward, state.identity(root))
         print(json.dumps({"valid": True, "services": sorted(model["services"]), "sync_paths": [str(p) for p in compose.sync_paths(model)]}, indent=2))

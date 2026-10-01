@@ -92,9 +92,9 @@ Both require `cluster.namespace`. Node placement is independent: shared nodes ar
 
 ## Connect worktrees
 
-`network.pod_to_pod` controls traffic between Podgrove engines: `disabled` is the default, `open` allows any port to or from Podgrove-managed Pods in any namespace, and `selected` allows declared peers and published TCP ports. Both ends must allow a connection; selected links require selected mode and matching declarations at both ends. DNS and filtered public HTTP(S) egress retain their separate rules.
+`network.pod_to_pod` controls traffic between Podgrove engines: `disabled` is the default, `open` allows any port to or from Podgrove-managed Pods in the engine's own namespace and any namespaces listed in `network.namespaces`, and `selected` allows declared peers and published TCP ports. Both ends must allow a connection; selected links require selected mode and matching declarations at both ends. DNS and filtered public HTTP(S) egress retain their separate rules.
 
-Use `network.expose` on the server and `network.connect` on the client for selected access. Exact namespaces and worktree-name globs select peers; `status --json` reports their engine DNS names. [Server/client examples and migration from the old top-level `connect`](docs/connectivity.md). Existing namespaces need administrator-approved discovery access; Podgrove never lists or creates Namespace objects.
+Use `network.expose` on the server and `network.connect` on the client for selected access. Exact namespaces and worktree-name globs select peers. `status --json` reports this worktree's own `peer_endpoints`, the DNS addresses other engines use to reach it; read them in the server worktree. [Server/client examples and migration from the old top-level `connect`](docs/connectivity.md). Existing namespaces need administrator-approved discovery access; Podgrove never lists or creates Namespace objects.
 
 ## Everyday use
 

@@ -32,7 +32,8 @@ Before denying traffic, prove both published listeners answer from another open 
 
 | Scenario | Expected result for fresh TCP connections |
 | --- | --- |
-| Both peers open | Published listeners work in the same-namespace and cross-namespace phases, by Pod IP and DNS. |
+| Both peers open | Published listeners work by Pod IP and DNS in the same namespace, and across namespaces only when each side lists the other's namespace in `network.namespaces`. |
+| Open source without the target namespace listed | Denied in the cross-namespace phase; open never matches every namespace. |
 | Disabled source, open target | Source egress is denied; localhost forwarding and same-engine Compose traffic still work. |
 | Open source, disabled target | Target ingress is denied. |
 | Selected source and target, matching namespace/worktree/port | Declared port works by reported DNS and Pod IP. |
@@ -44,6 +45,7 @@ Before denying traffic, prove both published listeners answer from another open 
 | Omitted target `from.worktree` or explicit wildcard | All managed peers in that named namespace can match, while source-side permission remains necessary. |
 | Open → selected → disabled | Old broad access closes for new connections within a bounded observation window. |
 | Rule removed or peer discovery becomes unavailable | Status reports the result and no stale/broader selected grant is accepted as success. |
+| One invalid, foreign or terminating peer | That peer is skipped and listed as pending; every other link keeps its grant. |
 
 Negative probes must time out against a listener proven reachable in the positive baseline; a refused connection is not proof of policy enforcement. Do not retry a mutating application request. Poll bounded read-only probes to allow asynchronous CNI policy propagation and retain every intermediate outcome. Existing TCP connections are not evidence of revocation because their treatment is implementation-defined.
 
@@ -51,7 +53,7 @@ Negative probes must time out against a listener proven reachable in the positiv
 
 Without Kubernetes or a Docker daemon, run `validate` and `up --dry-run --json` against missing services, disabled-profile services, Compose `expose` without publication, loopback-only binds, UDP, target-only/zero/ranged publication, duplicated target publication, scaled exposed services and reserved Docker API ports. Check unknown keys at every nesting level, invalid modes, expose/connect outside selected mode, namespace globs, malformed worktree patterns, duplicate/out-of-range ports and legacy top-level links. Ordinary dynamic localhost forwarding must continue to validate when it is not selected exposure.
 
-Controlled runtime regressions separately cover stale/malformed/foreign peer metadata, changed UIDs, unauthorized namespace reads, failed inventory and legacy source-owned grants. Do not manufacture these faults against an unrelated live workload.
+Controlled runtime regressions separately cover a self-labelled Pod in an unlisted namespace, an oversized declaration, a replaced own Pod, stale/malformed/foreign peer metadata, changed UIDs, unauthorized namespace reads, failed inventory and legacy source-owned grants. Do not manufacture these faults against an unrelated live workload.
 
 ## Completion and cleanup
 

@@ -51,6 +51,8 @@ def network_config(mode: str, *, peer_namespace: str | None = None, target: bool
     if mode not in ("disabled", "open", "selected"):
         raise AcceptanceError("Unexpected fixture mode")
     value = {"pod_to_pod": mode}
+    if mode == "open" and peer_namespace:
+        value["namespaces"] = [peer_namespace]
     if mode == "selected" and peer_namespace:
         if target:
             peer = {"namespace": peer_namespace}
@@ -340,16 +342,25 @@ class Runner:
         for address in ("ip", "dns"):
             self.probe(name + "-" + address, source, endpoint[address], port, allowed=allowed)
 
+    @staticmethod
+    def opened(role, other):
+        return network_config("open", peer_namespace=other["namespace"] if other["namespace"] != role["namespace"] else None)
+
     def phase(self, name, source, target):
-        self.mode(source, network_config("open"))
+        self.mode(source, self.opened(source, target))
+        target["config"]["network"] = self.opened(target, source)
+        base.write_json(target["root"] / "podgrove.yml", target["config"])
         _, objects = self.start(target)
         endpoint = self.endpoint(source, target, objects)
         self.result["checks"][name + "-endpoint"] = endpoint
         self.pair(name + "-open-app", source, endpoint, allowed=True)
         self.pair(name + "-open-private", source, endpoint, allowed=True, port=18081)
+        if source["namespace"] != target["namespace"]:
+            self.mode(source, network_config("open"))
+            self.pair(name + "-open-unlisted-namespace", source, endpoint, allowed=False)
         self.mode(source, network_config("disabled"))
         self.pair(name + "-disabled-egress", source, endpoint, allowed=False)
-        self.mode(source, network_config("open"))
+        self.mode(source, self.opened(source, target))
         self.mode(target, network_config("disabled"))
         self.pair(name + "-disabled-ingress", source, endpoint, allowed=False)
         selected_out = network_config("selected", peer_namespace=target["namespace"], worktree="apis-*")
@@ -368,10 +379,10 @@ class Runner:
                 or reported.path not in ("", "/") or reported.query or reported.fragment):
             raise AcceptanceError("Selected service status must report its genuine engine DNS endpoint")
         self.pair(name + "-selected-mutual", source, endpoint, allowed=True)
-        self.mode(source, network_config("open"))
+        self.mode(source, self.opened(source, target))
         self.pair(name + "-open-source-selected-target", source, endpoint, allowed=False)
         self.mode(source, selected_out)
-        self.mode(target, network_config("open"))
+        self.mode(target, self.opened(target, source))
         self.pair(name + "-selected-source-open-target", source, endpoint, allowed=False)
         self.mode(target, selected_in)
         self.pair(name + "-mutual-restored", source, endpoint, allowed=True)
@@ -398,8 +409,8 @@ class Runner:
         self.pair(name + "-connection-restricts-private-port", source, endpoint, allowed=False, port=18081)
         self.mode(source, network_config("disabled"))
         self.pair(name + "-revoke-selected", source, endpoint, allowed=False)
-        self.mode(target, network_config("open"))
-        self.mode(source, network_config("open"))
+        self.mode(target, self.opened(target, source))
+        self.mode(source, self.opened(source, target))
         self.pair(name + "-reopen-app", source, endpoint, allowed=True)
         self.pair(name + "-reopen-private", source, endpoint, allowed=True, port=18081)
 

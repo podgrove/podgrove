@@ -7,7 +7,6 @@ import json
 import re
 import threading
 import time
-from urllib.parse import urlencode
 
 from .errors import PodgroveError
 from .kube import Kube
@@ -22,11 +21,43 @@ INTERVAL = 5
 RECONCILE_TIMEOUT = 30
 CLEANUP_TIMEOUT = 10
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_DECLARATION_BYTES = 32768
+SIZING_UID = "0" * 36
 
 
 def declaration(settings, name, ports, pod_uid=None):
     return {"version": 1, "worktree": name, "network": network_settings(settings),
             "ports": ports, "pod_uid": pod_uid}
+
+
+def declaration_text(profile):
+    return json.dumps(profile, sort_keys=True, separators=(",", ":"))
+
+
+def offline_ports(settings, model):
+    """Ports a declaration can advertise, known before any engine exists."""
+    if settings.get("pod_to_pod", "disabled") == "selected":
+        return validate_model(settings, model)
+    validate_model(settings, model)
+    services = model.get("services", {}) if isinstance(model, dict) else {}
+    ports = []
+    for name, service in sorted(services.items() if isinstance(services, dict) else []):
+        for port in (service.get("ports") or []) if isinstance(service, dict) else []:
+            if isinstance(port, dict) and str(port.get("published", "")).isdigit() and type(port.get("target")) is int:
+                ports.append({"service": name, "target": port["target"], "published": int(port["published"])})
+    return ports
+
+
+def check_declaration(network, model, name):
+    """Refuse offline a configuration whose peer declaration would exceed the lease limit."""
+    settings = network_settings(network)
+    ports = offline_ports(settings, model)
+    if settings.get("pod_to_pod", "disabled") == "disabled":
+        return
+    size = len(declaration_text(declaration(settings, name, ports, SIZING_UID)).encode("utf-8"))
+    if size > MAX_DECLARATION_BYTES:
+        raise PodgroveError(f"network: this worktree's peer declaration renders to {size} bytes; the limit is "
+                            f"{MAX_DECLARATION_BYTES} bytes (32 KiB). Reduce network.expose, network.connect or published ports")
 
 
 def addresses(namespace, ident, ports):
@@ -54,7 +85,8 @@ def observed_ports(settings, model, rows):
                 raise PodgroveError("Pod networking published port observation is malformed")
             if port.get("Protocol") == "tcp" and port.get("URL") == "0.0.0.0":
                 target, published = port.get("TargetPort"), port.get("PublishedPort")
-                if type(target) is int and type(published) is int and 1 <= target <= 65535 and 1 <= published <= 65535:
+                if (type(target) is int and type(published) is int and 1 <= target <= 65535 and 1 <= published <= 65535
+                        and published not in (2375, 2376)):
                     observed.add((row["Service"], target, published))
     if settings.get("pod_to_pod", "disabled") == "selected":
         for item in declared:
@@ -148,7 +180,7 @@ def _owners(meta):
 
 
 def _checked_declaration(value):
-    if not isinstance(value, str) or len(value.encode("utf-8")) > 32768:
+    if not isinstance(value, str) or len(value.encode("utf-8")) > MAX_DECLARATION_BYTES:
         raise PodgroveError("Peer network declaration is missing or exceeds 32 KiB")
     try:
         profile = json.loads(value)
@@ -209,11 +241,13 @@ class PodNetwork:
         self.lease_uid = None
         self.current = {"state": "starting", "mode": self.settings.get("pod_to_pod", "disabled"), "endpoints": []}
 
-    def _call(self, *args, **kwargs):
+    def _call(self, *args, namespace=None, **kwargs):
         remaining = self.deadline - time.monotonic() if self.deadline is not None else 15
         if self.cancel_event.is_set() or remaining <= 0:
             raise PodgroveError("Pod networking reconciliation cancelled or its deadline expired")
         timeout = min(15, remaining, kwargs.pop("timeout", 15))
+        if namespace is not None:
+            kwargs["namespace"] = namespace
         result = self.kube.call(*args, timeout=timeout, cancel_event=self.cancel_event, **kwargs)
         if len(result.stdout.encode("utf-8")) > MAX_RESPONSE_BYTES:
             raise PodgroveError("Pod networking API response exceeds 8 MiB")
@@ -225,26 +259,29 @@ class PodNetwork:
         result = self._call("get", kind, name, "-o", "json", "--ignore-not-found")
         return json.loads(result.stdout) if result.stdout.strip() else {}
 
-    def _list(self, namespace, kind):
-        query = urlencode({"labelSelector": f"{MANAGED}=podgrove", "limit": MAX_PEERS})
-        response = self._call("get", "--raw", f"/api/v1/namespaces/{namespace}/{kind}?{query}")
+    def _list(self, namespace):
+        """One labelled list call returns both the Pods and the leases of a namespace."""
+        response = self._call("get", "pods,configmaps", "-l", f"{MANAGED}=podgrove", "-o", "json", namespace=namespace)
         value = json.loads(response.stdout)
-        if not isinstance(value, dict) or not isinstance(value.get("metadata", {}), dict):
-            raise PodgroveError("Pod networking discovery response is malformed")
-        items = value.get("items")
-        if not isinstance(items, list) or len(items) > MAX_PEERS or value.get("metadata", {}).get("continue"):
+        if not isinstance(value, dict) or not isinstance(value.get("items"), list):
+            raise PodgroveError(f"Pod networking discovery response for {namespace} is malformed")
+        kinds = {"Pod": [], "ConfigMap": []}
+        for item in value["items"]:
+            kind = item.get("kind") if isinstance(item, dict) else None
+            if kind not in kinds:
+                raise PodgroveError(f"Pod networking discovery in {namespace} returned an unexpected object")
+            kinds[kind].append(item)
+        if any(len(items) > MAX_PEERS for items in kinds.values()):
             raise PodgroveError(f"Pod networking discovery in {namespace} exceeds {MAX_PEERS} objects")
-        return items
+        return kinds["Pod"], kinds["ConfigMap"]
 
-    def _own(self):
-        pod = self._get("pod", f"pg-{self.ident}-0")
-        meta = _owned(pod, self.kube.namespace, self.ident, f"pg-{self.ident}-0")
-        owners = _owners(meta)
-        if (meta["uid"] != self.expected_uids["pod_uid"] or meta["labels"].get(WORKTREE_NAME) != self.name
-                or not any(owner.get("kind") == "StatefulSet" and owner.get("controller") is True
-                           and owner.get("name") == f"pg-{self.ident}"
-                           and owner.get("uid") == self.expected_uids["statefulset_uid"] for owner in owners)):
-            raise PodgroveError("Pod networking engine identity changed")
+    def _own_controller(self):
+        controller = self._get("statefulset", f"pg-{self.ident}")
+        meta = _owned(controller, self.kube.namespace, self.ident, f"pg-{self.ident}")
+        if meta["uid"] != self.expected_uids["statefulset_uid"]:
+            raise PodgroveError("Pod networking engine controller changed")
+
+    def _own_lease(self):
         lease = self._get("configmap", f"pg-{self.ident}")
         meta = _owned(lease, self.kube.namespace, self.ident, f"pg-{self.ident}")
         if self.lease_uid is not None and meta["uid"] != self.lease_uid:
@@ -254,9 +291,18 @@ class PodNetwork:
             raise PodgroveError("Pod networking lease data is malformed")
         return lease
 
-    def _publish(self, profile):
-        lease = self._own()
-        text = json.dumps(profile, sort_keys=True, separators=(",", ":"))
+    def _own_pod(self):
+        pod = self._get("pod", f"pg-{self.ident}-0")
+        meta = _owned(pod, self.kube.namespace, self.ident, f"pg-{self.ident}-0")
+        owners = _owners(meta)
+        if (meta["uid"] != self.expected_uids["pod_uid"] or meta["labels"].get(WORKTREE_NAME) != self.name
+                or not any(owner.get("kind") == "StatefulSet" and owner.get("controller") is True
+                           and owner.get("name") == f"pg-{self.ident}"
+                           and owner.get("uid") == self.expected_uids["statefulset_uid"] for owner in owners)):
+            raise PodgroveError("Pod networking engine identity changed")
+
+    def _publish(self, profile, lease):
+        text = declaration_text(profile)
         _checked_declaration(text)
         if lease.get("data", {}).get(DECLARATION) == text:
             return
@@ -266,54 +312,65 @@ class PodNetwork:
                  {"op": "add", "path": f"/data/{DECLARATION}", "value": text}]
         self._call("patch", "configmap", meta["name"], "--type=json", "-p", json.dumps(patch))
 
+    def _peer(self, namespace, lease, pods):
+        """Resolve one advertised peer; any defect skips only that peer."""
+        metadata = _metadata(lease)
+        data = lease.get("data", {})
+        if not isinstance(data, dict) or not isinstance(metadata.get("labels", {}), dict):
+            raise PodgroveError("lease data or labels are malformed")
+        value = data.get(DECLARATION)
+        if value is None:
+            return None
+        ident = metadata.get("labels", {}).get(ENVIRONMENT)
+        if not isinstance(ident, str) or not re.fullmatch(r"[a-f0-9]{12}", ident):
+            raise PodgroveError("invalid environment identity")
+        _owned(lease, namespace, ident, f"pg-{ident}")
+        profile = _checked_declaration(value)
+        pod = pods.get(f"pg-{ident}-0")
+        if not pod or not profile["pod_uid"]:
+            return None
+        meta = _owned(pod, namespace, ident, f"pg-{ident}-0")
+        owners = _owners(meta)
+        status = pod.get("status", {})
+        if not isinstance(status, dict) or not isinstance(status.get("conditions", []), list):
+            raise PodgroveError("Pod status is malformed")
+        conditions = status.get("conditions", [])
+        if any(not isinstance(condition, dict) for condition in conditions):
+            raise PodgroveError("Pod readiness is malformed")
+        if (meta["uid"] != profile["pod_uid"] or meta["labels"].get(WORKTREE_NAME) != profile["worktree"]
+                or not any(owner.get("kind") == "StatefulSet" and owner.get("name") == f"pg-{ident}"
+                           and owner.get("controller") is True and _identifier(owner.get("uid")) for owner in owners)
+                or not any(item.get("type") == "Ready" and item.get("status") == "True" for item in conditions)):
+            return None
+        return {"namespace": namespace, "identity": ident, "declaration": profile}
+
     def _peers(self):
         namespaces = {rule["namespace"] for rule in self.settings["connect"]}
         namespaces.update(source["namespace"] for rule in self.settings["expose"] for source in rule["from"])
-        peers = []
+        peers, skipped = [], []
         for namespace in sorted(namespaces):
+            pod_items, leases = self._list(namespace)
             pods = {}
-            for pod in self._list(namespace, "pods"):
-                name = _metadata(pod).get("name")
-                if not isinstance(name, str) or name in pods:
-                    raise PodgroveError("Pod networking discovery contains invalid or duplicate Pod names")
-                pods[name] = pod
-            for lease in self._list(namespace, "configmaps"):
-                metadata = _metadata(lease)
-                data = lease.get("data", {})
-                if not isinstance(data, dict) or not isinstance(metadata.get("labels", {}), dict):
-                    raise PodgroveError("Peer network lease data or labels are malformed")
-                value = data.get(DECLARATION)
-                if value is None:
+            for pod in pod_items:
+                name = pod.get("metadata", {}).get("name") if isinstance(pod.get("metadata"), dict) else None
+                if not isinstance(name, str):
+                    skipped.append(f"{namespace}: ignored a managed Pod with malformed metadata")
                     continue
-                ident = metadata.get("labels", {}).get(ENVIRONMENT)
-                if not isinstance(ident, str) or not re.fullmatch(r"[a-f0-9]{12}", ident):
-                    raise PodgroveError("Peer network declaration has an invalid environment identity")
-                _owned(lease, namespace, ident, f"pg-{ident}")
-                profile = _checked_declaration(value)
-                pod = pods.get(f"pg-{ident}-0")
-                if not pod or not profile["pod_uid"]:
+                pods[name] = None if name in pods else pod
+            for lease in leases:
+                label = lease.get("metadata", {}).get("name") if isinstance(lease.get("metadata"), dict) else None
+                try:
+                    found = self._peer(namespace, lease, pods)
+                except (PodgroveError, ValueError, KeyError, TypeError, AttributeError) as error:
+                    skipped.append(f"{namespace}/{label if isinstance(label, str) else '?'}: peer ignored: {error}")
                     continue
-                meta = _owned(pod, namespace, ident, f"pg-{ident}-0")
-                owners = _owners(meta)
-                status = pod.get("status", {})
-                if not isinstance(status, dict) or not isinstance(status.get("conditions", []), list):
-                    raise PodgroveError("Peer network Pod status is malformed")
-                conditions = status.get("conditions", [])
-                if any(not isinstance(condition, dict) for condition in conditions):
-                    raise PodgroveError("Peer network Pod readiness is malformed")
-                if (meta["uid"] != profile["pod_uid"] or meta["labels"].get(WORKTREE_NAME) != profile["worktree"]
-                        or not any(owner.get("kind") == "StatefulSet" and owner.get("name") == f"pg-{ident}"
-                                   and owner.get("controller") is True and _identifier(owner.get("uid")) for owner in owners)
-                        or not any(item.get("type") == "Ready" and item.get("status") == "True"
-                                   for item in conditions)):
-                    continue
-                peers.append({"namespace": namespace, "identity": ident, "declaration": profile})
-                if len(peers) > MAX_PEERS:
-                    raise PodgroveError(f"Pod networking discovery exceeds {MAX_PEERS} total peers")
-        return peers
+                if found:
+                    peers.append(found)
+                    if len(peers) > MAX_PEERS:
+                        raise PodgroveError(f"Pod networking discovery exceeds {MAX_PEERS} total peers")
+        return peers, skipped
 
     def _apply(self, ingress=None, egress=None):
-        self._own()
         resource = {"apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
                     "metadata": {"name": f"pg-{self.ident}", "namespace": self.kube.namespace,
                                  "labels": {MANAGED: "podgrove", ENVIRONMENT: self.ident}},
@@ -321,6 +378,11 @@ class PodNetwork:
         _BoundedKube(self).reconcile_network_policy([resource], self.ident)
 
     def _withdraw(self):
+        """Fenced by our controller, the environment labels and each object's UID/resourceVersion, not the Pod."""
+        try:
+            self._own_controller()
+        except (PodgroveError, ValueError, KeyError, TypeError, AttributeError, OSError) as error:
+            raise PodgroveError(f"withdrawal refused: {error}") from error
         errors = []
         if self.settings.get("pod_to_pod") == "selected":
             try:
@@ -328,7 +390,7 @@ class PodNetwork:
             except (PodgroveError, ValueError, KeyError, TypeError, AttributeError, OSError) as error:
                 errors.append(f"policy withdrawal failed: {error}")
         try:
-            self._publish(declaration(self.settings, self.name, [], None))
+            self._publish(declaration(self.settings, self.name, [], None), self._own_lease())
         except (PodgroveError, ValueError, KeyError, TypeError, AttributeError, OSError) as error:
             errors.append(f"advertisement withdrawal failed: {error}")
         if errors:
@@ -360,10 +422,14 @@ class PodNetwork:
                 rows = copy.deepcopy(self.rows)
             ports = observed_ports(self.settings, self.model, rows)
             profile = declaration(self.settings, self.name, ports, self.expected_uids["pod_uid"])
-            self._publish(profile)
+            self._own_pod()
+            self._publish(profile, self._own_lease())
             pending = []
             if self.settings.get("pod_to_pod") == "selected":
-                ingress, egress, pending = selected_rules(self.kube.namespace, self.ident, profile, self._peers())
+                peers, skipped = self._peers()
+                ingress, egress, pending = selected_rules(self.kube.namespace, self.ident, profile, peers)
+                pending = sorted({*pending, *skipped})
+                self._own_pod()
                 self._apply(ingress, egress)
             current = {"state": "waiting" if pending else "ready", "mode": self.settings.get("pod_to_pod", "disabled"),
                        "endpoints": addresses(self.kube.namespace, self.ident, ports), "pending": pending}

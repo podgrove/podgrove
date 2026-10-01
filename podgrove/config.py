@@ -12,7 +12,7 @@ import jsonschema
 import yaml
 
 from .errors import PodgroveError
-from .network import NETWORK_SCHEMA, network_settings
+from .network import NETWORK_SCHEMA, mode_mismatch, network_settings
 from .placement import PLACEMENT_SCHEMA, placement_spec, validate_placement
 from .sync_filter import validate_patterns
 from .resources import QUANTITY_SCHEMA, RESOURCE_SCHEMA, quantity_text, resource_budget
@@ -94,18 +94,8 @@ CONFIG_SCHEMA: dict[str, Any] = {
                       }},
         },
         "connect": {
-            "type": "array", "maxItems": 32, "deprecated": True,
-            "description": "Legacy nonempty declarations are refused; migrate to network.connect and target network.expose with pod_to_pod: selected.",
-            "items": {"type": "object", "additionalProperties": False,
-                      "required": ["name", "environment", "service", "port"],
-                      "properties": {
-                          "name": {"type": "string", "minLength": 1, "maxLength": 63,
-                                   "pattern": r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"},
-                          "environment": {"type": "string", "pattern": r"^[a-f0-9]{12}$"},
-                          "service": {"type": "string", "minLength": 1, "maxLength": 128,
-                                      "pattern": r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$"},
-                          "port": {"type": "integer", "minimum": 1, "maximum": 65535},
-                      }},
+            "deprecated": True,
+            "description": "Legacy top-level connect. up and validate refuse any nonempty value with migration guidance; down and status still read the file. Use network.connect with pod_to_pod: selected.",
         },
         "sync": {
             "type": "object", "additionalProperties": False,
@@ -185,15 +175,20 @@ def normalize_reverse(value: list | None) -> list[dict]:
     return result
 
 
-def normalize_connect(value: list | None) -> list[dict]:
-    """Retain empty legacy state while refusing unilateral connection grants."""
-    entries = [] if value is None else value
-    errors = list(jsonschema.Draft202012Validator(CONFIG_SCHEMA["properties"]["connect"]).iter_errors(entries))
-    if errors:
-        raise PodgroveError(f"connect: {errors[0].message}")
-    if entries:
-        raise PodgroveError("Top-level connect is no longer supported: use network.pod_to_pod: selected and network.connect, with network.expose in the target worktree")
-    return []
+LEGACY_CONNECT = ("Top-level connect is no longer supported: use network.pod_to_pod: selected and network.connect, "
+                  "with network.expose in the target worktree")
+
+
+def normalize_connect(value) -> list:
+    """Carry any legacy value unparsed so down and status still load; up and validate refuse it."""
+    if value is None or value == []:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+def refuse_legacy_connect(config) -> None:
+    if config.connect:
+        raise PodgroveError(LEGACY_CONNECT)
 
 
 def storage_class_name(value: str) -> str:
@@ -270,6 +265,9 @@ def _configuration_data(root: Path, config_path: Path | None) -> tuple[Path, dic
             raise PodgroveError(f"Cannot read {selected}: {exc}") from exc
         if data is None:
             data = {}
+    mismatch = mode_mismatch(data.get("network")) if isinstance(data, dict) else None
+    if mismatch:
+        raise PodgroveError(mismatch)
     errors = sorted(jsonschema.Draft202012Validator(CONFIG_SCHEMA).iter_errors(data), key=lambda e: str(e.path))
     if errors:
         error = errors[0]

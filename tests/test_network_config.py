@@ -10,7 +10,8 @@ from podgrove import cli
 from podgrove.compose import Compose
 from podgrove.config import load_cluster, load_config
 from podgrove.errors import PodgroveError
-from podgrove.network import network_settings, validate_model
+from podgrove.network import MAX_NAMESPACES, network_settings, validate_model
+from podgrove import pod_network
 
 
 @pytest.fixture
@@ -203,9 +204,94 @@ def test_exposure_port_inventory_is_bounded(selected_network):
 
 def test_peer_namespace_bound_applies_across_connect_and_expose():
     configured = {'pod_to_pod': 'selected', 'expose': [
-        {'service': 'api', 'from': [{'namespace': f'team-{index}'} for index in range(32)]},
+        {'service': 'api', 'from': [{'namespace': f'team-{index}'} for index in range(MAX_NAMESPACES)]},
     ]}
-    assert len(network_settings(configured)['expose'][0]['from']) == 32
+    assert len(network_settings(configured)['expose'][0]['from']) == MAX_NAMESPACES
     configured['connect'] = [{'namespace': 'one-more', 'worktree': '*', 'ports': [80]}]
-    with pytest.raises(PodgroveError, match='at most 32 distinct peer namespaces'):
+    with pytest.raises(PodgroveError, match=f'at most {MAX_NAMESPACES} distinct peer namespaces'):
         network_settings(configured)
+
+
+@pytest.mark.parametrize('value,message', [
+    ({'pod_to_pod': 'open', 'expose': [{'service': 'api', 'from': [{'namespace': 'team'}]}]},
+     'network.expose: requires pod_to_pod: selected (configured mode is open)'),
+    ({'connect': [{'namespace': 'team', 'worktree': '*', 'ports': [80]}]},
+     'network.connect: requires pod_to_pod: selected (configured mode is disabled)'),
+    ({'pod_to_pod': 'selected', 'namespaces': ['team']}, 'network.namespaces: requires pod_to_pod: open (configured mode is selected)'),
+])
+def test_mode_mismatch_is_one_readable_line(tmp_path, value, message):
+    with pytest.raises(PodgroveError) as direct:
+        network_settings(value)
+    (tmp_path / 'compose.yaml').write_text('services: {}\n')
+    (tmp_path / 'podgrove.yml').write_text(yaml.safe_dump({'network': value}))
+    with pytest.raises(PodgroveError) as loaded:
+        load_config(tmp_path)
+    assert str(direct.value) == str(loaded.value) == message
+
+
+@pytest.mark.parametrize('published', ['2375', 2376])
+def test_open_mode_refuses_a_docker_api_publication_offline(published):
+    model = {'services': {'dind': {'ports': [{'target': 2375, 'published': published}]}}}
+    with pytest.raises(PodgroveError, match='Docker API port'):
+        validate_model({'pod_to_pod': 'open'}, model)
+
+
+def large_selected(count):
+    return {'pod_to_pod': 'selected', 'expose': [
+        {'service': f'service-{index}', 'from': [{'namespace': 'team', 'worktree': f'{"w" * 100}-{source}'}
+                                                for source in range(32)]} for index in range(count)]}
+
+
+def large_model(count):
+    return {'services': {f'service-{index}': {'ports': [{'target': 8080, 'published': str(10000 + index)}]}
+                         for index in range(count)}}
+
+
+def test_schema_valid_config_with_an_oversized_declaration_is_refused_offline():
+    settings = large_selected(32)
+    assert network_settings(settings)
+    with pytest.raises(PodgroveError, match=r'renders to \d+ bytes; the limit is 32768 bytes \(32 KiB\)'):
+        pod_network.check_declaration(settings, large_model(32), 'web-main')
+
+
+def test_declaration_limit_boundary(monkeypatch):
+    settings, model = large_selected(2), large_model(2)
+    profile = pod_network.declaration(network_settings(settings), 'web-main',
+                                      validate_model(settings, model), pod_network.SIZING_UID)
+    size = len(pod_network.declaration_text(profile).encode())
+    monkeypatch.setattr(pod_network, 'MAX_DECLARATION_BYTES', size)
+    pod_network.check_declaration(settings, model, 'web-main')
+    monkeypatch.setattr(pod_network, 'MAX_DECLARATION_BYTES', size - 1)
+    with pytest.raises(PodgroveError, match=f'renders to {size} bytes; the limit is {size - 1} bytes'):
+        pod_network.check_declaration(settings, model, 'web-main')
+
+
+def test_runtime_declaration_check_uses_the_same_limit(monkeypatch):
+    profile = pod_network.declaration(network_settings({'pod_to_pod': 'open'}), 'web-main', [], 'uid')
+    text = pod_network.declaration_text(profile)
+    monkeypatch.setattr(pod_network, 'MAX_DECLARATION_BYTES', len(text.encode()) - 1)
+    with pytest.raises(PodgroveError, match='exceeds 32 KiB'):
+        pod_network._checked_declaration(text)
+
+
+@pytest.mark.parametrize('command', [['validate'], ['up', '--dry-run']])
+def test_validate_and_dry_run_refuse_an_oversized_declaration(tmp_path, monkeypatch, command):
+    from podgrove import cli
+
+    class FakeCompose:
+        def __init__(self, config):
+            pass
+
+        def model(self):
+            return large_model(32)
+
+        def validate(self, model):
+            pass
+
+    (tmp_path / 'compose.yaml').write_text('services: {}\n')
+    (tmp_path / 'podgrove.yml').write_text(yaml.safe_dump({'network': large_selected(32)}))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, 'Compose', FakeCompose)
+    args = cli.parser().parse_args([*command, '--context', 'test-context', '--namespace', 'podgrove-testing'])
+    with pytest.raises(PodgroveError, match='the limit is 32768 bytes'):
+        cli.execute(args)
