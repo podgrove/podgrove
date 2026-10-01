@@ -2,6 +2,13 @@
 
 User-visible changes are recorded here. Release Please manages versioned entries after the first public release.
 
+## [0.4.2](https://github.com/podgrove/podgrove/compare/v0.4.1...v0.4.2) (2026-10-01)
+
+
+### Bug Fixes
+
+* make command cancellation idempotent ([#11](https://github.com/podgrove/podgrove/issues/11)) ([32848f8](https://github.com/podgrove/podgrove/commit/32848f8522d93183a5bdb0d6f4efbd116cb7246f))
+
 ## [0.4.1](https://github.com/podgrove/podgrove/compare/v0.4.0...v0.4.1) (2026-10-01)
 
 
