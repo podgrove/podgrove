@@ -252,6 +252,16 @@ def supervised_session(tmp_path, monkeypatch, request):
                                                           "action": "sync", "target": "/app/source.txt"}]}}}}
     (tmp_path / "source.txt").write_text("source content\n")
     config = Config(root=config_root, files=[], ttl_seconds=3600)
+    peer_manager = peer_factory = None
+    if settings.get("pod_network"):
+        from podgrove import pod_network
+        config.network = {"pod_to_pod": "selected", "expose": [], "connect": []}
+        peer_manager = Mock()
+        peer_manager.snapshot.return_value = {"state": settings["pod_network"], "mode": "selected",
+                                              "endpoints": [{"service": "api", "port": 80, "url": "http://engine:80"}]}
+        peer_manager.close.side_effect = lambda: events.append("pod-network-close")
+        peer_factory = Mock(return_value=peer_manager)
+        monkeypatch.setattr(pod_network, "PodNetwork", peer_factory)
     compose = Mock(config=config)
     compose.model.return_value = model
     compose.published_ports.return_value = []
@@ -315,13 +325,14 @@ def supervised_session(tmp_path, monkeypatch, request):
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         current = state_module.read(path)
-        if current["status"] in ("ready", "error"):
+        if current["status"] in ("ready", "degraded", "error"):
             break
         time.sleep(0.01)
-    assert current["status"] == "ready", current
+    assert current["status"] == ("degraded" if settings.get("pod_network") == "unavailable" else "ready"), current
     session = SimpleNamespace(data=current, path=path, events=events, thread=thread,
                               results=results, fail_tunnel=fail_tunnel, fail_watch=fail_watch, kube=kube,
-                              sync=sync, kube_factory=kube_factory, config_loader=config_loader)
+                              sync=sync, kube_factory=kube_factory, config_loader=config_loader,
+                              peer_manager=peer_manager, peer_factory=peer_factory)
     try:
         yield session
     finally:
@@ -660,3 +671,20 @@ def test_remote_build_output_hides_only_docker_desktop_navigation_line():
         "#4 compiled successfully\n"
         "View build details: https://build.example.test/job/123\n"
         "error: cannot open docker-desktop://dashboard/build/default/default/abc\n")
+
+
+@pytest.mark.parametrize("supervised_session", [{"pod_network": "ready"}, {"pod_network": "waiting"}, {"pod_network": "unavailable"}], indirect=True)
+def test_supervisor_keeps_peer_observation_control_and_cleanup_connected(supervised_session):
+    session = supervised_session
+    session.peer_factory.assert_called_once()
+    session.peer_manager.start.assert_called_once()
+    assert session.peer_manager.start.call_args.args[0][0]["State"] == "running"
+    ping = runtime.control(session.data, "ping")
+    assert ping["ok"] is True
+    assert ping["pod_network_status"] == session.peer_manager.snapshot.return_value
+    assert session.data["peer_endpoints"] == ping["pod_network_status"]["endpoints"]
+    assert ping["status"] == ("degraded" if ping["pod_network_status"]["state"] == "unavailable" else "ready")
+    assert runtime.control(session.data, "stop")["ok"]
+    session.thread.join(timeout=5)
+    session.peer_manager.close.assert_called_once()
+    assert session.events.index("pod-network-close") < session.events.index("tunnel-close")

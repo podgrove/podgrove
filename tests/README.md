@@ -48,12 +48,6 @@ It observes an exited service and an unhealthy service, creates the missing file
 Use a matching source checkout for the scripts and an absolute `PODGROVE_BIN` installed from a verified wheel in a separate versioned environment. Supply an approved existing namespace, namespace-scoped credentials through `KUBECONFIG`, an explicit storage class, and the current reviewed bootstrap/RBAC bundle with engine-protection permissions. Each output path must be new beneath an existing parent. See [live prerequisites and proof limits](../docs/verification.md#connectivity-and-startup-recovery).
 
 ```sh
-python3 scripts/check_connectivity.py \
-  --podgrove-bin "$PODGROVE_BIN" \
-  --context your-development-context --namespace your-development-namespace \
-  --storage-class your-approved-storage-class \
-  --output /path/to/new-private-connectivity-evidence --execute
-
 python3 scripts/check_startup_recovery.py \
   --podgrove-bin "$PODGROVE_BIN" \
   --context your-development-context --namespace your-development-namespace \
@@ -61,9 +55,9 @@ python3 scripts/check_startup_recovery.py \
   --output /path/to/new-private-startup-evidence --execute
 ```
 
-Connectivity uses **three simultaneous fresh engines** to test reverse-loopback HTTP, a declared link, and denied undeclared/third-engine traffic on the real CNI. Startup uses **three serial fresh engines** to test ordinary and forced refresh after a missing file arrives, diagnostic access to running services, individual annotation/PDB detection and repair, and one observed mid-build Pod replacement under the original controller/PVC identities. Each engine claims 2 GiB; the startup script cleans up one before starting the next. Protection mutation tests do not prove that an autoscaler will honor those safeguards.
+The retained `check_connectivity.py` script is a historical legacy-link acceptance lane: its top-level `connect` declarations are refused by current releases, so do not run it against the current binary. Reverse-forward transport and protocol regressions remain valid in `tests/test_reverse.py`. Use the [Pod-to-Pod acceptance plan](../docs/pod-network-acceptance.md) for the new modes; its reviewed harness uses at most two engines simultaneously and can explicitly restrict testing to one namespace. Startup uses **three serial fresh engines** to test ordinary and forced refresh after a missing file arrives, diagnostic access to running services, individual annotation/PDB detection and repair, and one observed mid-build Pod replacement under the original controller/PVC identities. Each engine claims 2 GiB; the startup script cleans up one before starting the next. Protection mutation tests do not prove that an autoscaler will honor those safeguards.
 
-Both require explicit `--execute`, use private temporary worktrees/state, and attempt only their scoped `down`. Passing cleanup includes exact-name and labelled-resource absence, local state removal and captured-supervisor absence. Namespace/bootstrap resources remain; backing-volume deletion is not checked. A cleanup error preserves diagnostic evidence and fails the run. Read `result.json` and command logs before accepting a pass; neither script mutates Nodes or uses a broad reaper.
+The startup script requires explicit `--execute`, uses private temporary worktrees/state, and attempts only its scoped `down`. The Pod-to-Pod harness additionally stops all external commands after authentication failure and records cleanup as unconfirmed. Passing cleanup includes exact-name and labelled-resource absence, local state removal and captured-supervisor absence. Namespace/bootstrap resources remain; backing-volume deletion is not checked. A cleanup error preserves diagnostic evidence and fails the run. Read `result.json` and command logs before accepting a pass; these scripts never mutate Nodes or use a broad reaper.
 
 
 ## Live exec export acceptance

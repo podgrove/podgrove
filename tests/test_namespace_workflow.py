@@ -101,8 +101,17 @@ class MemoryCluster:
             assert args[1].lower() in ALIASES, "No cluster-scoped or unreviewed resource reads"
             kind = ALIASES[args[1].lower()]
             name = args[2]
-            assert not name.startswith("-")  # This workflow never needs resource discovery.
             resource, group = RESOURCES[kind]
+            if name == "-l":
+                selector = {MANAGED: "podgrove", "podgrove.dev/component": "connection"}
+                assert kind == "NetworkPolicy" and args[2:] == (
+                    "-l", f"{MANAGED}=podgrove,podgrove.dev/component=connection", "-o", "json")
+                assert self.allowed(kube.namespace, "list", resource, group), "Missing generated LIST grant: NetworkPolicy"
+                items = [body for (current_kind, namespace, _), body in self.objects.items()
+                         if current_kind == kind and namespace == kube.namespace
+                         and all(body["metadata"].get("labels", {}).get(key) == value for key, value in selector.items())]
+                return result(json.dumps({"apiVersion": "v1", "kind": "List", "items": items}))
+            assert not name.startswith("-")
             assert self.allowed(kube.namespace, "get", resource, group, name), f"Missing generated GET grant: {kind}/{name}"
             body = self.objects.get((kind, kube.namespace, name))
             return result(json.dumps(body) if body else "")

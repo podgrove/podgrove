@@ -12,7 +12,7 @@ import jsonschema
 import yaml
 
 from .errors import PodgroveError
-from .network import network_settings
+from .network import NETWORK_SCHEMA, network_settings
 from .placement import PLACEMENT_SCHEMA, placement_spec, validate_placement
 from .sync_filter import validate_patterns
 from .resources import QUANTITY_SCHEMA, RESOURCE_SCHEMA, quantity_text, resource_budget
@@ -94,7 +94,8 @@ CONFIG_SCHEMA: dict[str, Any] = {
                       }},
         },
         "connect": {
-            "type": "array", "maxItems": 32,
+            "type": "array", "maxItems": 32, "deprecated": True,
+            "description": "Legacy nonempty declarations are refused; migrate to network.connect and target network.expose with pod_to_pod: selected.",
             "items": {"type": "object", "additionalProperties": False,
                       "required": ["name", "environment", "service", "port"],
                       "properties": {
@@ -119,16 +120,7 @@ CONFIG_SCHEMA: dict[str, Any] = {
                     "properties": {"size": {**QUANTITY_SCHEMA, "default": "20Gi"}}},
         "node_mode": {"type": "string", "enum": ["shared", "tainted"], "default": "shared"},
         "placement": PLACEMENT_SCHEMA,
-        "network": {
-            "type": "object", "additionalProperties": False,
-            "properties": {
-                "blocked_cidrs": {
-                    "type": "array", "maxItems": 128, "uniqueItems": True,
-                    "items": {"type": "string", "minLength": 3, "maxLength": 49},
-                    "description": "Additional infrastructure CIDRs excluded from public web egress; built-in exclusions always remain.",
-                },
-            },
-        },
+        "network": NETWORK_SCHEMA,
         "tainted_nodes": {
             "type": "object", "additionalProperties": False,
             "properties": {
@@ -194,23 +186,14 @@ def normalize_reverse(value: list | None) -> list[dict]:
 
 
 def normalize_connect(value: list | None) -> list[dict]:
+    """Retain empty legacy state while refusing unilateral connection grants."""
     entries = [] if value is None else value
     errors = list(jsonschema.Draft202012Validator(CONFIG_SCHEMA["properties"]["connect"]).iter_errors(entries))
     if errors:
         raise PodgroveError(f"connect: {errors[0].message}")
-    result, names = [], set()
-    reserved = {"localhost", "host", "docker", "podgrove", "host-docker-internal", "gateway-docker-internal"}
-    for entry in entries:
-        name = entry["name"]
-        if name in reserved:
-            raise PodgroveError("connect.name: reserved host or Docker alias")
-        if name in names:
-            raise PodgroveError("connect.name: duplicate connection alias")
-        if entry["port"] in (2375, 2376):
-            raise PodgroveError("connect.port: Docker API ports 2375 and 2376 are reserved")
-        names.add(name)
-        result.append(dict(entry))
-    return result
+    if entries:
+        raise PodgroveError("Top-level connect is no longer supported: use network.pod_to_pod: selected and network.connect, with network.expose in the target worktree")
+    return []
 
 
 def storage_class_name(value: str) -> str:

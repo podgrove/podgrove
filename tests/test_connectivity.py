@@ -196,7 +196,7 @@ def test_connect_without_target_project_anchor_refuses_before_tunnel_open(monkey
     tunnel.start.assert_not_called()
 
 
-def manager(tmp_path, monkeypatch, *, reverse_rules=True, connect_rules=True):
+def manager(tmp_path, monkeypatch, *, reverse_rules=True, connect_rules=False):
     config = Config(tmp_path, [tmp_path / "compose.yml"], connect=[RULE] if connect_rules else [],
                     reverse=[{"local_port": 8080, "remote_port": 8080, "local_host": "127.0.0.1"}] if reverse_rules else [])
     model = {"services": {"web": {"image": "busybox:1.37", "extra_hosts": {"unrelated": "192.0.2.8"}},
@@ -207,7 +207,6 @@ def manager(tmp_path, monkeypatch, *, reverse_rules=True, connect_rules=True):
     links.snapshot.return_value = {"state": "ready"}
     backward = Mock()
     backward.snapshot.return_value = {"state": "ready"}
-    monkeypatch.setattr(connectivity, "EnvironmentLinks", lambda *_: links)
     monkeypatch.setattr(reverse, "ReverseForward", lambda *_: backward)
     coordinator = connectivity.Connectivity(Kube("offline", "approved"), SOURCE, compose, model, ("controller", "pod"))
     return coordinator, compose, model, links, backward
@@ -221,12 +220,12 @@ def test_connectivity_overlay_is_private_preserves_inputs_and_closes_both_compon
     assert overlay is not None and overlay.stat().st_mode & 0o777 == 0o600
     assert compose.overlay_files == [overlay]
     assert json.loads(overlay.read_text()) == {"services": {name: {"extra_hosts": {
-        "database.podgrove": "10.0.0.8", "host.docker.internal": "host-gateway"}} for name in model["services"]}}
+        "host.docker.internal": "host-gateway"}} for name in model["services"]}}
     assert model == before
     assert compose.command("up")[-3:] == ["--file", str(overlay), "up"]
     assert coordinator.snapshot()["state"] == "ready"
     coordinator.close()
-    links.close.assert_called_once()
+    links.close.assert_not_called()
     backward.close.assert_called_once()
     assert compose.overlay_files == [] and not overlay.exists()
 
@@ -236,7 +235,7 @@ def test_partial_connectivity_start_failure_reaps_started_components(tmp_path, m
     backward.start.side_effect = PodgroveError("listener occupied")
     with pytest.raises(PodgroveError, match="listener occupied"):
         coordinator.start()
-    links.close.assert_called_once()
+    links.close.assert_not_called()
     backward.close.assert_called_once()
     assert coordinator.overlay is None and compose.overlay_files == []
 
@@ -248,7 +247,7 @@ def test_connectivity_close_still_removes_overlay_after_component_failure(tmp_pa
     backward.close.side_effect = PodgroveError("close failed")
     with pytest.raises(PodgroveError, match="close failed"):
         coordinator.close()
-    links.close.assert_called_once()
+    links.close.assert_not_called()
     assert not overlay.exists() and compose.overlay_files == []
 
 
@@ -270,7 +269,7 @@ def test_real_compose_merge_keeps_unrelated_extra_hosts_and_managed_routes(tmp_p
         hosts = merged["services"]["web"]["extra_hosts"]
         if isinstance(hosts, list):
             hosts = dict(re.split(r"[=:]", entry, maxsplit=1) for entry in hosts)
-        for alias, value in {"unrelated": "192.0.2.8", "database.podgrove": "10.0.0.8", "host.docker.internal": "host-gateway"}.items():
+        for alias, value in {"unrelated": "192.0.2.8", "host.docker.internal": "host-gateway"}.items():
             assert hosts[alias] in (value, [value])
     finally:
         coordinator.close()
@@ -316,14 +315,13 @@ def test_connectivity_startup_budget_cancels_pending_link_before_later_phases(tm
     from podgrove.config import Config
     from podgrove.compose import Compose
     from podgrove.connectivity import Connectivity
-    from podgrove import connectivity
     stopped = threading.Event()
     cancel = threading.Event()
     link = Mock(aliases={})
     link.start.side_effect = lambda: stopped.wait(2)
     link.cancel.side_effect = stopped.set
-    monkeypatch.setattr(connectivity, "EnvironmentLinks", Mock(return_value=link))
-    config = Config(tmp_path, [], connect=[{"name": "api", "environment": "b" * 12, "service": "gateway", "port": 8080}])
+    monkeypatch.setattr(reverse, "ReverseForward", Mock(return_value=link))
+    config = Config(tmp_path, [], reverse=[{"local_host": "127.0.0.1", "local_port": 8080, "remote_port": 8080}])
     compose = Compose(config)
     value = Connectivity(Mock(), "a" * 12, compose, {"services": {"web": {}}}, {})
     timer = threading.Timer(.05, cancel.set) if cause == "cancel" else None
@@ -347,10 +345,9 @@ def test_successful_setup_disarms_its_deadline_without_stopping_live_links(tmp_p
     from podgrove.config import Config
     from podgrove.compose import Compose
     from podgrove.connectivity import Connectivity
-    from podgrove import connectivity
     link = Mock(aliases={"api.podgrove": "10.1.2.3"})
-    monkeypatch.setattr(connectivity, "EnvironmentLinks", Mock(return_value=link))
-    config = Config(tmp_path, [], connect=[{"name": "api", "environment": "b" * 12, "service": "gateway", "port": 8080}])
+    monkeypatch.setattr(reverse, "ReverseForward", Mock(return_value=link))
+    config = Config(tmp_path, [], reverse=[{"local_host": "127.0.0.1", "local_port": 8080, "remote_port": 8080}])
     compose = Compose(config)
     value = Connectivity(Mock(), "a" * 12, compose, {"services": {"web": {}}}, {})
     try:
@@ -360,3 +357,12 @@ def test_successful_setup_disarms_its_deadline_without_stopping_live_links(tmp_p
         assert len(compose.overlay_files) == 1
     finally:
         value.close()
+
+
+def test_legacy_connectivity_cannot_create_target_ingress(tmp_path, monkeypatch):
+    coordinator, compose, _, links, backward = manager(tmp_path, monkeypatch, connect_rules=True)
+    with pytest.raises(PodgroveError, match="Legacy connect grants are refused"):
+        coordinator.start()
+    links.start.assert_not_called()
+    backward.start.assert_not_called()
+    assert compose.overlay_files == []

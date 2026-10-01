@@ -6,6 +6,7 @@ hooks, objects and indexes are never opened, and no metadata is modified.
 from __future__ import annotations
 
 import os
+import hashlib
 from pathlib import Path
 import re
 import stat
@@ -14,6 +15,18 @@ from collections.abc import Mapping
 from .errors import PodgroveError
 
 _MAX_METADATA = 4096
+
+
+WORKTREE_NAME = "podgrove.dev/worktree-name"
+
+
+def worktree_name(root: Path) -> str:
+    """A stable readable label based on the checkout directory, never its branch."""
+    name = root.name
+    if re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?", name):
+        return name
+    prefix = re.sub(r"[^A-Za-z0-9_.-]", "-", name).strip("-_.")[:48].rstrip("-_.") or "worktree"
+    return prefix + "-" + hashlib.sha256(name.encode()).hexdigest()[:12]
 
 
 def _read(path: Path) -> str | None:

@@ -16,7 +16,7 @@ from .network import policy_spec
 from .bootstrap import PROVISIONING_MARKER
 from .process import run
 from .placement import placement_spec
-from .repository import repository_labels
+from .repository import WORKTREE_NAME, repository_labels, worktree_name
 from .resources import engine_resources, initializer_resources, quantity_text, same_resources
 
 MANAGED = "app.kubernetes.io/managed-by"
@@ -222,6 +222,10 @@ def manifests(namespace: str, ident: str, root: Path, size: str, ttl: int,
     lease = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": meta(),
              "data": {"root": str(root), "last_activity": str(time.time()), "ttl_seconds": str(ttl),
                       "mr_url": mr_url, "namespace_mode": namespace_mode}}
+    if network and network.get("pod_to_pod", "disabled") != "disabled":
+        from .pod_network import DECLARATION, declaration
+        lease["data"][DECLARATION] = json.dumps(declaration(network, worktree_name(root), [], None),
+                                               sort_keys=True, separators=(",", ":"))
     selector = {MANAGED: "podgrove", ENVIRONMENT: ident}
     # The Service supplies stable StatefulSet identity only. No Docker API port
     # is exposed: the daemon remains bound to the Pod's loopback interface.
@@ -230,7 +234,8 @@ def manifests(namespace: str, ident: str, root: Path, size: str, ttl: int,
     controller = {"apiVersion": "apps/v1", "kind": "StatefulSet", "metadata": meta(),
                   "spec": {"replicas": 1, "serviceName": name, "selector": {"matchLabels": selector.copy()},
                            "updateStrategy": {"type": "OnDelete"},
-                           "template": {"metadata": {"labels": labels.copy(), "annotations": ENGINE_ANNOTATIONS.copy()}, "spec": pod["spec"]}}}
+                           "template": {"metadata": {"labels": {**labels, WORKTREE_NAME: worktree_name(root)},
+                                                     "annotations": ENGINE_ANNOTATIONS.copy()}, "spec": pod["spec"]}}}
     protection = {"apiVersion": "policy/v1", "kind": "PodDisruptionBudget", "metadata": meta(),
                   "spec": {"maxUnavailable": 0, "selector": {"matchLabels": selector.copy()}}}
     return [policy, {"apiVersion": "v1", "kind": "PersistentVolumeClaim", "metadata": meta(), "spec": pvc_spec},
@@ -250,15 +255,57 @@ class Kube:
     def call(self, *args: str, **kwargs):
         return run(self.command(*args), **kwargs)
 
-    def get(self, kind: str, name: str | None = None, *, selector: str | None = None) -> dict:
+    def get(self, kind: str, name: str | None = None, *, selector: str | None = None,
+            ignore_missing: bool = True) -> dict:
         args = ["get", kind]
         if name:
             args.append(name)
         if selector:
             args += ["-l", selector]
-        args += ["-o", "json", "--ignore-not-found"]
+        args += ["-o", "json"]
+        if ignore_missing:
+            args.append("--ignore-not-found")
         result = self.call(*args)
         return json.loads(result.stdout) if result.stdout.strip() else {}
+
+    def refuse_legacy_connections(self, ident: str) -> None:
+        """Refuse additive legacy grants without adopting or deleting any policy."""
+        if not isinstance(ident, str) or not re.fullmatch(r"[a-f0-9]{12}", ident):
+            raise PodgroveError("Invalid environment identity for legacy connection checks")
+        component = "podgrove.dev/component"
+        try:
+            value = self.get("networkpolicies", selector=f"{MANAGED}=podgrove,{component}=connection", ignore_missing=False)
+        except json.JSONDecodeError as error:
+            raise PodgroveError("Cannot verify the namespace's legacy connection policies; no changes were made") from error
+        if not isinstance(value, dict) or not isinstance(value.get("items"), list):
+            raise PodgroveError("Cannot verify the namespace's legacy connection policies; no changes were made")
+        for policy in value["items"]:
+            if not isinstance(policy, dict):
+                raise PodgroveError("Legacy connection policy inventory is malformed; no changes were made")
+            metadata, spec = policy.get("metadata"), policy.get("spec")
+            if not isinstance(metadata, dict) or not isinstance(spec, dict):
+                raise PodgroveError("Legacy connection policy inventory is malformed; no changes were made")
+            labels, selector = metadata.get("labels"), spec.get("podSelector")
+            if (metadata.get("namespace") != self.namespace or not isinstance(labels, dict)
+                    or labels.get(MANAGED) != "podgrove" or labels.get(component) != "connection"
+                    or not isinstance(selector, dict) or not isinstance(selector.get("matchLabels", {}), dict)):
+                raise PodgroveError("Legacy connection policy inventory is foreign or malformed; no changes were made")
+            targets = selector.get("matchLabels", {})
+            if (set(selector) != {"matchLabels"} or set(targets) != {MANAGED, ENVIRONMENT}
+                    or targets.get(MANAGED) != "podgrove" or not isinstance(targets.get(ENVIRONMENT), str)
+                    or not re.fullmatch(r"[a-f0-9]{12}", targets[ENVIRONMENT])):
+                raise PodgroveError(
+                    "Legacy connection policy selector is broad or unsupported; cannot prove it excludes this engine. "
+                    "Review the policy with its owner and retire the source using the recorded older Podgrove "
+                    "version's scoped down before migration (down deletes its PVC data). No changes were made."
+                )
+            if labels.get(ENVIRONMENT) == ident or targets[ENVIRONMENT] == ident:
+                raise PodgroveError(
+                    "Legacy connection policies still affect this environment. Coordinate with the link owners, "
+                    "save required PVC data, and use the recorded older Podgrove version's scoped down to retire "
+                    "the source environment before migrating to network.pod_to_pod (down deletes its PVC data). "
+                    "No legacy policy was adopted or deleted."
+                )
 
     def preflight(self, node_mode: str = "shared", tainted_nodes: dict | None = None) -> None:
         if node_mode not in ("shared", "tainted"):
@@ -424,10 +471,8 @@ class Kube:
             expected_annotations = expected_spec.get("template", {}).get("metadata", {}).get("annotations", {})
             for key in ENGINE_ANNOTATIONS:
                 expected_annotations.pop(key, None)
-            # Repo/branch labels are creation-time advice, not engine settings.
-            # A local checkout change must not force destructive recreation or
-            # roll the existing controller merely to refresh these two labels.
-            for key in ("podgrove.dev/repo", "podgrove.dev/branch"):
+            # Advisory and independently reconciled labels do not change engine compatibility.
+            for key in ("podgrove.dev/repo", "podgrove.dev/branch", WORKTREE_NAME):
                 expected_spec.get("template", {}).get("metadata", {}).get("labels", {}).pop(key, None)
             if not matches(expected_spec, existing.get("spec", {})):
                 raise PodgroveError(
@@ -492,6 +537,9 @@ class Kube:
         annotations = desired.get("spec", {}).get("template", {}).get("metadata", {}).get("annotations", {})
         if any(annotations.get(key) != value for key, value in ENGINE_ANNOTATIONS.items()):
             raise PodgroveError("Engine template is missing required eviction protection annotations")
+        label = desired.get("spec", {}).get("template", {}).get("metadata", {}).get("labels", {}).get(WORKTREE_NAME)
+        if not isinstance(label, str) or not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?", label):
+            raise PodgroveError("Engine template has an invalid stable worktree-name label")
         existing = self.get("StatefulSet", f"pg-{ident}")
         pod, current_budget = {}, {}
         if existing:
@@ -517,14 +565,17 @@ class Kube:
                                       or not isinstance(metadata.get("resourceVersion"), str) or not metadata["resourceVersion"]))):
             raise PodgroveError("Engine protection target is foreign, incomplete, changed, or being deleted")
 
-    def _patch_engine_annotations(self, kind: str, resource: dict) -> None:
+    def _patch_engine_annotations(self, kind: str, resource: dict, *, name: str) -> None:
         metadata = resource["metadata"]
         location = "/spec/template/metadata/annotations" if kind == "statefulset" else "/metadata/annotations"
         target = resource["spec"]["template"]["metadata"] if kind == "statefulset" else metadata
         existing = target.get("annotations", {})
         if not isinstance(existing, dict):
             raise PodgroveError("Engine protection annotations are malformed")
-        if all(existing.get(key) == value for key, value in ENGINE_ANNOTATIONS.items()):
+        labels = target.get("labels", {})
+        if not isinstance(labels, dict):
+            raise PodgroveError("Engine worktree labels are malformed")
+        if all(existing.get(key) == value for key, value in ENGINE_ANNOTATIONS.items()) and labels.get(WORKTREE_NAME) == name:
             return
         patch = [{"op": "test", "path": "/metadata/uid", "value": metadata["uid"]},
                  {"op": "test", "path": "/metadata/resourceVersion", "value": metadata["resourceVersion"]}]
@@ -535,6 +586,12 @@ class Kube:
                 if existing.get(key) != value:
                     escaped = key.replace("~", "~0").replace("/", "~1")
                     patch.append({"op": "add", "path": f"{location}/{escaped}", "value": value})
+        if labels.get(WORKTREE_NAME) != name:
+            location = "/spec/template/metadata/labels" if kind == "statefulset" else "/metadata/labels"
+            if "labels" not in target:
+                patch.append({"op": "add", "path": location, "value": {WORKTREE_NAME: name}})
+            else:
+                patch.append({"op": "add", "path": f"{location}/{WORKTREE_NAME.replace('/', '~1')}", "value": name})
         self.call("patch", kind, metadata["name"], "--type=json", "-p", json.dumps(patch))
 
     def reconcile_engine_protection(self, resources: list[dict], ident: str) -> None:
@@ -548,9 +605,10 @@ class Kube:
             updated = copy.deepcopy(desired)
             updated["metadata"].update(uid=current["metadata"]["uid"], resourceVersion=current["metadata"]["resourceVersion"])
             self.call("replace", "-f", "-", input=json.dumps(updated))
-        self._patch_engine_annotations("statefulset", controller)
+        name = next(item for item in resources if item["kind"] == "StatefulSet")["spec"]["template"]["metadata"]["labels"][WORKTREE_NAME]
+        self._patch_engine_annotations("statefulset", controller, name=name)
         if pod:
-            self._patch_engine_annotations("pod", pod)
+            self._patch_engine_annotations("pod", pod, name=name)
 
     def check_engine_protection(self, resources: list[dict], ident: str) -> None:
         """Detect absent safeguards on existing engines without performing writes."""

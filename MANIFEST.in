@@ -40,6 +40,7 @@ include docs/getting-started.md
 include docs/how-it-works.md
 include docs/known-limits.md
 include docs/operations.md
+include docs/pod-network-acceptance.md
 include docs/releasing.md
 include docs/verification.md
 include docs/web.md
@@ -72,6 +73,7 @@ include podgrove/forward.py
 include podgrove/kube.py
 include podgrove/network.py
 include podgrove/placement.py
+include podgrove/pod_network.py
 include podgrove/process.py
 include podgrove/reaper.py
 include podgrove/repository.py
@@ -101,6 +103,7 @@ include release-please-config.json
 include schema/podgrove-v1.schema.json
 include scripts/check_connectivity.py
 include scripts/check_exec_stream.py
+include scripts/check_pod_network.py
 include scripts/check_startup_recovery.py
 include scripts/e2e.py
 include scripts/homebrew_formula.py
@@ -166,6 +169,7 @@ include tests/integration/test_startup_recovery_docker.py
 include tests/test_activity.py
 include tests/test_bootstrap.py
 include tests/test_check_connectivity.py
+include tests/test_check_pod_network.py
 include tests/test_check_startup_recovery.py
 include tests/test_cli.py
 include tests/test_cli_portability.py
@@ -200,6 +204,7 @@ include tests/test_network_config.py
 include tests/test_network_isolation.py
 include tests/test_network_reconciliation.py
 include tests/test_placement.py
+include tests/test_pod_network.py
 include tests/test_portable_worktrees.py
 include tests/test_public_export.py
 include tests/test_public_manifest.py
@@ -232,4 +237,5 @@ include tests/test_web_browser.py
 include tests/test_web_settings.py
 include tests/test_web_streaming.py
 include tests/test_worktree_identity.py
+include tests/test_worktree_network_labels.py
 include uv.lock

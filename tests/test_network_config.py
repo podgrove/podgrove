@@ -10,7 +10,7 @@ from podgrove import cli
 from podgrove.compose import Compose
 from podgrove.config import load_cluster, load_config
 from podgrove.errors import PodgroveError
-from podgrove.network import network_settings
+from podgrove.network import network_settings, validate_model
 
 
 @pytest.fixture
@@ -81,3 +81,131 @@ def test_invalid_network_is_refused_before_bootstrap_output_or_external_tools(pr
     with pytest.raises(PodgroveError, match='network.blocked_cidrs'):
         cli.execute(args)
     assert not Path(output).exists()
+
+
+INVALID_MODE_SETTINGS = [
+    {'pod_to_pod': None}, {'pod_to_pod': True}, {'pod_to_pod': 'all'},
+    {'expose': []}, {'connect': []}, {'pod_to_pod': 'disabled', 'expose': []},
+    {'pod_to_pod': 'open', 'connect': []},
+    {'pod_to_pod': 'selected', 'expose': [{'service': 'api'}]},
+    {'pod_to_pod': 'selected', 'expose': [{'service': 'api', 'from': []}]},
+    {'pod_to_pod': 'selected', 'expose': [{'service': 'api', 'from': [{}]}]},
+    {'pod_to_pod': 'selected', 'expose': [{'service': 'api', 'from': [{'namespace': '*'}]}]},
+    {'pod_to_pod': 'selected', 'connect': [{'namespace': 'team', 'ports': [80]}]},
+    {'pod_to_pod': 'selected', 'connect': [{'namespace': 'team', 'worktree': '*', 'ports': []}]},
+    {'pod_to_pod': 'selected', 'connect': [{'namespace': 'team', 'worktree': '*', 'ports': [80, 80]}]},
+    {'pod_to_pod': 'selected', 'connect': [{'namespace': 'team', 'worktree': '*', 'ports': [80], 'context': 'other'}]},
+]
+INVALID_MODE_SETTINGS += [
+    {'pod_to_pod': 'selected', 'connect': [{'namespace': 'team', 'worktree': '*', 'ports': [port]}]}
+    for port in (0, 65536, 2375, 2376, True, '80', 80.0)
+]
+INVALID_MODE_SETTINGS += [
+    {'pod_to_pod': 'selected', 'connect': [{'namespace': 'team', 'worktree': pattern, 'ports': [80]}]}
+    for pattern in ('', ' ', '.', '..', 'api/*', 'api\\*', 'api\n*', 'api\n', '*' * 129)
+]
+INVALID_MODE_SETTINGS.append({'pod_to_pod': 'selected', 'connect': [
+    {'namespace': 'team\n', 'worktree': '*', 'ports': [80]},
+]})
+
+
+@pytest.mark.parametrize('loader', [load_cluster, load_config])
+@pytest.mark.parametrize('network', INVALID_MODE_SETTINGS)
+def test_network_modes_reject_invalid_intent_before_compose_or_cluster(project, loader, network):
+    (project / 'podgrove.yml').write_text(yaml.safe_dump({'network': network}))
+    with pytest.raises(PodgroveError, match='network'):
+        loader(project)
+
+
+@pytest.mark.parametrize('mode', [None, 'disabled'])
+def test_disabled_mode_preserves_the_persisted_legacy_network_shape(mode):
+    configured = {} if mode is None else {'pod_to_pod': mode}
+    assert network_settings(configured) == {'blocked_cidrs': []}
+
+
+def test_selected_rules_are_normalized_without_mutating_or_sharing_user_data():
+    configured = {'pod_to_pod': 'selected', 'expose': [{'service': 'api', 'from': [{'namespace': 'team'}]}],
+                  'connect': [{'namespace': 'other-team', 'worktree': 'apis-[ab]?', 'ports': [8080]}]}
+    first, second = network_settings(configured), network_settings(configured)
+    first['connect'][0]['ports'].append(8443)
+    assert configured['connect'][0]['ports'] == second['connect'][0]['ports'] == [8080]
+    assert second['expose'][0]['from'] == [{'namespace': 'team'}]
+    assert second['blocked_cidrs'] == []
+
+
+def test_duplicate_exposure_service_requires_combining_its_peer_rules():
+    config = {'pod_to_pod': 'selected', 'expose': [
+        {'service': 'api', 'from': [{'namespace': 'team-a'}]},
+        {'service': 'api', 'from': [{'namespace': 'team-b'}]},
+    ]}
+    with pytest.raises(PodgroveError, match='duplicate service'):
+        network_settings(config)
+
+
+@pytest.fixture
+def selected_network():
+    return {'pod_to_pod': 'selected', 'expose': [{'service': 'api', 'from': [{'namespace': 'team', 'worktree': 'web-*'}]}]}
+
+
+def test_expose_model_resolves_published_not_container_ports_offline(selected_network):
+    model = {'services': {'api': {'ports': [{'target': 8080, 'published': '18080'},
+                                          {'target': 8443, 'published': 18443, 'protocol': 'tcp', 'host_ip': '0.0.0.0'}]},
+                          'private': {'ports': [{'target': 9000}]}}}
+    assert validate_model(selected_network, model) == [
+        {'service': 'api', 'target': 8080, 'published': 18080},
+        {'service': 'api', 'target': 8443, 'published': 18443},
+    ]
+    assert model['services']['api']['ports'][0]['published'] == '18080'
+
+
+INVALID_EXPOSED_SERVICES = [
+    ({}, 'publish at least one'), ({'expose': ['8080']}, 'publish at least one'),
+    ({'ports': [{'target': 8080}]}, 'stable published'),
+    ({'ports': [{'target': 8080, 'published': 18080, 'protocol': 'udp'}]}, '0.0.0.0 TCP'),
+    ({'ports': [{'target': 8080, 'published': 18080}, {'target': 8080, 'published': 18081}]}, 'ambiguous'),
+    ({'scale': 2, 'ports': [{'target': 8080, 'published': 18080}]}, 'one service replica'),
+    ({'deploy': {'replicas': 0}, 'ports': [{'target': 8080, 'published': 18080}]}, 'one service replica'),
+]
+INVALID_EXPOSED_SERVICES += [
+    ({'ports': [{'target': 8080, 'published': value}]}, 'stable published')
+    for value in (0, '0', '18080-18090', -1, 65536, 'junk', None, True, 80.0)
+]
+INVALID_EXPOSED_SERVICES += [
+    ({'ports': [{'target': 8080, 'published': 18080, 'host_ip': value}]}, '0.0.0.0 TCP')
+    for value in ('127.0.0.1', '::', '::1', '192.168.1.2')
+]
+INVALID_EXPOSED_SERVICES += [
+    ({'ports': [{'target': 8080, 'published': value}]}, 'reserved') for value in (2375, 2376)
+]
+
+
+@pytest.mark.parametrize('service,match', INVALID_EXPOSED_SERVICES)
+def test_invalid_local_exposure_refused_without_remote_discovery(selected_network, service, match):
+    with pytest.raises(PodgroveError, match=match):
+        validate_model(selected_network, {'services': {'api': service}})
+
+
+def test_inactive_profile_service_cannot_be_exposed(selected_network):
+    with pytest.raises(PodgroveError, match='not active'):
+        validate_model(selected_network, {'services': {'worker': {}}})
+
+
+@pytest.mark.parametrize('settings', [None, {'pod_to_pod': 'disabled'}, {'pod_to_pod': 'open'}])
+def test_exposure_restrictions_do_not_change_other_modes_compose_ports(settings):
+    assert validate_model(settings, {'services': {'api': {'ports': [{'target': 8080}]}}}) == []
+
+
+def test_exposure_port_inventory_is_bounded(selected_network):
+    ports = [{'target': index + 10000, 'published': index + 20000} for index in range(129)]
+    with pytest.raises(PodgroveError, match='at most 128'):
+        validate_model(selected_network, {'services': {'api': {'ports': ports}}})
+
+
+def test_peer_namespace_bound_applies_across_connect_and_expose():
+    configured = {'pod_to_pod': 'selected', 'expose': [
+        {'service': 'api', 'from': [{'namespace': f'team-{index}'} for index in range(32)]},
+    ]}
+    assert len(network_settings(configured)['expose'][0]['from']) == 32
+    configured['connect'] = [{'namespace': 'one-more', 'worktree': '*', 'ports': [80]}]
+    with pytest.raises(PodgroveError, match='at most 32 distinct peer namespaces'):
+        network_settings(configured)

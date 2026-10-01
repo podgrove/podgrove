@@ -1,6 +1,6 @@
 # Connecting development environments
 
-Compose services within one worktree already communicate over their Compose networks. Connections to your laptop or another worktree must be declared in `podgrove.yml`. These features use the configured cluster and namespace; they never create nodes, namespaces or cluster-wide permissions.
+Compose services within one worktree already communicate over their Compose networks. Connections to your laptop or another worktree must be declared in `podgrove.yml`. Reverse forwards use the configured engine. Pod-to-Pod rules can select peers in explicitly named namespaces of the same cluster; neither feature creates nodes, namespaces or cluster-wide permissions.
 
 ## Reach a service on your laptop
 
@@ -22,30 +22,85 @@ The supervisor opens an authenticated Kubernetes exec channel and a restricted h
 
 The local service must be running. Reverse forwarding stops when its local supervisor stops or your laptop is offline. A broken channel reconnects within a bounded retry budget; interrupted TCP streams close and are never replayed. Applications should reconnect their own requests. `status --json` includes `connectivity_status` and channel errors.
 
-## Reach another engine in the same namespace
-
-First start the target environment using this release, then copy its `identity` from `podgrove status --json`. Its requested Compose service must publish a TCP port on `0.0.0.0`; target-only declarations such as `ports: ["8080"]` are supported.
-
-In the source worktree:
+## Choose a Pod-to-Pod mode
 
 ```yaml
-connect:
-  - name: api
-    environment: abcdef123456
-    service: gateway
-    port: 8080
+network:
+  pod_to_pod: disabled
 ```
 
-Replace the example identity with the target's real 12-character identity. After `podgrove up`, use `http://api.podgrove:8080` from the source's Compose containers. `port` is the target service's container port, even when Docker chooses a different published port. A link does not require the target's local application port-forward to remain open.
+`disabled` is the default: Podgrove adds no peer-traffic allowance. Compose services within the same engine and laptop port-forwards keep working. The independent DNS and public-web rules described below remain in effect.
 
-Each link creates a source-owned namespaced Service and two narrow NetworkPolicies: source egress to the target engine's published TCP port, and target ingress from that exact source engine. Other engines, ports and namespaces receive no allowance. The base isolation policies remain in place. Cluster DNS and permitted public HTTP/HTTPS egress keep their existing rules.
+Set `open` to allow any port to or from Pods labelled as Podgrove-managed in any namespace. Both endpoints must permit a connection; an open source cannot override a disabled destination. Open does not grant access to arbitrary unlabelled Pods, expose a public load balancer, or remove filtered public-egress exclusions.
 
-Names are unique DNS labels exposed as `<name>.podgrove`; at most 32 links are accepted. Self-links, namespace/context overrides, unpublished or loopback-only target ports, ambiguous service containers and conflicting Compose host aliases are refused. Targets from older releases need one `up` to record their Compose project before they can be linked.
+Use `selected` for explicit server/client rules. Both endpoints must use selected mode and declare matching permissions, each enforced by that environment's own policy. An open/selected pair does not receive a selected grant; use open at both ends or matching selected rules at both ends. A client never writes a server's ingress allowance.
 
-The link follows replacement Pods belonging to the same target StatefulSet. The source supervisor periodically verifies the recorded Compose project, service and actual published port, and updates the narrow rules when a Docker-assigned port changes. Failed verification revokes link policies when the API is reachable. A replaced controller or Service IP requires explicit reconciliation; the problem is reported instead of adopting another environment. These checks are periodic, not per-packet identity checks.
+## Connect selected worktrees
 
-Remove the declaration and run `up` to remove the allowance. `down` and scoped reaping remove source-owned link resources without deleting the target environment. Existing declared links can remain usable while the source laptop is disconnected, but automatic verification and port updates require its supervisor. NetworkPolicies are additive and CNI enforcement varies; an administrator must verify the real packet path and ensure other policies do not reopen it.
+Suppose a server worktree is named `apis-checkout` and a client is `web-checkout`. Use the actual stable worktree names reported by Podgrove; these derive from checkout directory names, not branches. Replace the example namespace with the prepared target. The two worktrees may use the same namespace or different approved namespaces in the same cluster.
 
-## Choosing between them
+In the server's original Compose file, publish a fixed TCP port:
 
-Use `reverse` for a natively running local service or a localhost endpoint you already use. Use `connect` for direct communication between two engines in the same namespace. Set your application's proxy target to the documented stable address; Podgrove does not change application environment variables automatically.
+```yaml
+services:
+  api-gateway:
+    image: your-api-image
+    ports:
+      - "0.0.0.0:18080:8080"
+```
+
+Keep the application's real image, command and other settings. The application must listen on container port `8080`; this mapping makes it reachable at the **engine's published port `18080`**.
+
+In the server's `podgrove.yml`:
+
+```yaml
+network:
+  pod_to_pod: selected
+  expose:
+    - service: api-gateway
+      from:
+        - namespace: your-development-namespace
+          worktree: "web-*"
+```
+
+In the client's `podgrove.yml`:
+
+```yaml
+network:
+  pod_to_pod: selected
+  connect:
+    - namespace: your-development-namespace
+      worktree: "apis-*"
+      ports: [18080]
+```
+
+The client's rule names the **server namespace**; the server's `from` rule names the **client namespace**. Patterns are case-sensitive worktree-name globs. Omitting `worktree` within `from` allows every managed worktree in that exact namespace. The client must provide a worktree pattern. Namespace globs are not supported.
+
+Validate both worktrees before cluster changes:
+
+```sh
+podgrove validate
+podgrove up --dry-run --json
+```
+
+These checks are offline: they validate local YAML and Compose declarations, but cannot prove the peer exists, consents, is reachable or grants discovery access. `selected` exposure requires an existing enabled service, one replica, and fixed wildcard TCP publications. Target-only, zero, ranged, loopback-only, UDP and ambiguous publications are refused. Docker API ports 2375 and 2376 are reserved. Dynamic publications remain supported for ordinary localhost forwarding outside selected exposure.
+
+Run `up` in both worktrees, then inspect `status --json`. `worktree_name` is the stable name used by patterns. `pod_network_status` reports the mode, state (`ready`, `waiting` or `unavailable`), endpoints and pending matches; an unmatched or inaccessible peer is not a confirmed connection. The server's top-level `peer_endpoints` lists its advertised service, container `target`, engine-published `port`, DNS `host` and convenience `url`. Use that host with port `18080` from the client, for example `http://<reported-peer-dns>:18080`.
+
+The DNS name belongs to the engine's headless Kubernetes Service; it is not the Compose service name, a laptop endpoint, or the old `<alias>.podgrove` host mapping. Reported names currently end in `.svc.cluster.local`: this assumes the cluster uses `cluster.local`. Custom cluster DNS suffixes are not discovered or configurable in this version. The target's local port-forward need not remain open. Podgrove does not change your application's URL environment variables.
+
+Namespaces must already exist. The kubeconfig identity needs `get` and `list` access to Pods and ConfigMaps in every explicitly referenced peer namespace, granted through namespaced RoleBindings. No Namespace reads or cluster-wide permissions are needed. Runtime verifies peer identity, consent and the server's actual published binding before granting selected access. A discovery error is not interpreted as permission to reach a wider set of Pods. Changes reconcile through the local supervisor; inspect status after changing rules or losing discovery access.
+
+## Migrate legacy environment links
+
+The old **top-level** `connect: [{name, environment, service, port}]` feature is replaced by `network.pod_to_pod: selected`. Nonempty legacy declarations are refused with migration guidance. They are not silently translated: the old client created the target's ingress policy, while the new model requires the target's own consent.
+
+Before upgrading a worktree that has old connection resources, coordinate with its owner and save any data that must survive. Use the recorded older Podgrove installation to retire that environment with scoped `down`; **this deletes its PVC and stored data**. The new release refuses retained old connection resources instead of adopting or deleting them automatically. Do not run a broad reaper or remove another worktree's policy.
+
+Configure the server's `network.expose` and the client's `network.connect`, then start both with the new release. Replace old `<alias>.podgrove:<container-port>` application URLs with the reported engine DNS name and its fixed **published** port. Worktrees without legacy links do not need this retirement step merely to use the new modes.
+
+## Network boundaries
+
+Public IPv4 HTTP(S) and scoped cluster DNS have independent allowances in every mode. `network.blocked_cidrs` constrains the public-web rule; it is not an overriding deny on explicitly allowed engine peers. Other NetworkPolicies can widen permissions, and enforcement depends on the CNI, NAT and node-local exceptions. Existing TCP connections may outlive a policy change; verify revocation with new connections. Policy updates also need a running supervisor and successful writes to its namespace: an offline laptop or unavailable API cannot guarantee immediate removal of existing grants. Privileged engines and namespace-wide credentials are not a hostile-tenant boundary.
+
+Use `reverse` for a native laptop service. Use selected Pod-to-Pod rules for direct engine access. See [configuration](configuration.md#network-settings) for limits, the [acceptance plan](pod-network-acceptance.md) for packet checks, and [known limits](known-limits.md) before enabling open access.

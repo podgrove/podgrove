@@ -7,7 +7,7 @@ import tempfile
 import threading
 import time
 
-from .connect import EnvironmentLinks, overlay_model, validate_connectivity
+from .connect import overlay_model, validate_connectivity
 from .errors import PodgroveError
 
 
@@ -55,10 +55,7 @@ class Connectivity:
         validate_connectivity(config, self.model, self.ident)
         aliases = {}
         if config.connect or self.reconcile_connections:
-            self.links = EnvironmentLinks(self.kube, self.ident, config.connect)
-            active()
-            self.links.start()
-            aliases.update(self.links.aliases)
+            raise PodgroveError("Legacy connect grants are refused; remove them with the previous version's scoped down, then configure network.pod_to_pod")
         if config.reverse:
             self.reverse = ReverseForward(self.kube, self.ident, config.reverse, self.expected_uids)
             active()

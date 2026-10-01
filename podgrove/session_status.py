@@ -12,9 +12,11 @@ def observed(data: dict, *, connected: bool | None = None, ping: dict | None = N
         if ping.get("ok") is True and ping.get("status") in ("starting", "ready", "degraded", "unhealthy", "error", "disconnected"):
             result["status"] = ping["status"]
         for key in ("forward_status", "sync_status", "health_status", "docker_status", "heartbeat_status",
-                    "startup_status", "connectivity_status"):
+                    "startup_status", "connectivity_status", "pod_network_status"):
             if isinstance(ping.get(key), dict):
                 result[key] = dict(ping[key])
+        if isinstance(ping.get("pod_network_status"), dict):
+            result["peer_endpoints"] = list(ping["pod_network_status"].get("endpoints", []))
     forward = result.get("forward_status")
     forward = dict(forward) if isinstance(forward, dict) else {}
     current = forward.get("state", "unknown")
@@ -44,6 +46,7 @@ def observed(data: dict, *, connected: bool | None = None, ping: dict | None = N
     verification = verification if isinstance(verification, dict) else {}
     stale_ownership = verification.get("state") in ("unavailable", "expired")
     connectivity = result.get("connectivity_status", {}).get("state", "disabled")
-    if result.get("status") == "ready" and (current not in ("ready", "disabled") or retrying or stale_health or stale_ownership or stale_heartbeat or connectivity not in ("ready", "disabled")):
+    peer_unavailable = result.get("pod_network_status", {}).get("state") == "unavailable"
+    if result.get("status") == "ready" and (current not in ("ready", "disabled") or retrying or stale_health or stale_ownership or stale_heartbeat or connectivity not in ("ready", "disabled") or peer_unavailable):
         result["status"] = "degraded"
     return result

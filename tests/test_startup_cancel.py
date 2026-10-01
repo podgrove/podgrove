@@ -35,7 +35,7 @@ def block(*args):
 noop = lambda *args: None
 runtime.Kube = lambda *args, **kwargs: SimpleNamespace(wait=block if phase == "startup" else noop,
                                            heartbeat=block if phase == "heartbeat" else noop)
-config = SimpleNamespace(root=root, forward=[], ttl_seconds=3600)
+config = SimpleNamespace(root=root, forward=[], ttl_seconds=3600, network={})
 runtime.load_config = lambda *args: config
 runtime.Compose = lambda *args: SimpleNamespace(model=lambda: {"services": {"app": {}}}, validate=noop,
                                                published_ports=lambda *args: [], has_watch=lambda *args: False)

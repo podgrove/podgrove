@@ -44,7 +44,7 @@ def block(selected):
         time.sleep(60)
         raise AssertionError("The pending operation must be cancelled, not completed")
 noop = lambda *args, **kwargs: None
-config = SimpleNamespace(root=root, forward=[], ttl_seconds=3600)
+config = SimpleNamespace(root=root, forward=[], ttl_seconds=3600, network={})
 def load(*args):
     block("configuration")
     return config
