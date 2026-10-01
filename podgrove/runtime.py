@@ -580,6 +580,8 @@ def serve(path: Path) -> int:
                                 response["forward_status"] = data["forward_status"]
                             if sync_worker is not None:
                                 response["sync_status"] = sync_worker.status()
+                            elif "sync_status" in data:  # ready is published just before the sync worker exists
+                                response["sync_status"] = dict(data["sync_status"])
                             if "health_status" in data:
                                 response["health_status"] = dict(data["health_status"])
                             if "heartbeat_status" in data:
