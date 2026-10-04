@@ -70,6 +70,7 @@ include podgrove/errors.py
 include podgrove/exec_transport.py
 include podgrove/fingerprint.py
 include podgrove/forward.py
+include podgrove/initialization.py
 include podgrove/kube.py
 include podgrove/network.py
 include podgrove/placement.py
@@ -179,6 +180,7 @@ include tests/test_config.py
 include tests/test_connect.py
 include tests/test_connectivity.py
 include tests/test_deploy.py
+include tests/test_destroy.py
 include tests/test_docker_tunnel.py
 include tests/test_dogfood_cli.py
 include tests/test_dogfood_review.py
@@ -193,6 +195,7 @@ include tests/test_exec_transport.py
 include tests/test_fingerprint.py
 include tests/test_forward.py
 include tests/test_forward_recovery.py
+include tests/test_initialization.py
 include tests/test_install_release.py
 include tests/test_kube.py
 include tests/test_lane_workspace.py

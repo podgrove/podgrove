@@ -301,7 +301,11 @@ podgrove up --context cluster-name --namespace my-development --project-director
   -f compose.yml -f compose.test.yml --size large --storage 30Gi --timeout 900
 ```
 
-Repeated `-f` replaces the YAML's `compose.files` list; its order is preserved. `--size` overrides the YAML size, and `--node-mode` overrides `node_mode`. `--config PATH` selects another configuration file inside the worktree. `--timeout` defaults to 600 seconds for individual startup stages; total `up` waiting time can be longer because engine readiness, building, and service readiness are separate stages.
+Repeated `-f` replaces the YAML's `compose.files` list; its order is preserved. `--size` overrides the YAML size, and `--node-mode` overrides `node_mode`. `--config PATH` selects another configuration file inside the worktree.
+
+`up --timeout` defaults to 600 seconds for individual startup stages within a larger, bounded startup budget. `up --init-timeout` separately defaults to **300 seconds after the storage initializer starts**. A valid Kubernetes start timestamp counts time already elapsed, including before this invocation; otherwise timing begins when Podgrove observes initialization. Increasing the build/startup timeout does not extend this initializer deadline. Both flags take positive seconds and are CLI options, not YAML keys.
+
+`down --timeout` controls the Kubernetes cleanup budget, defaulting to **120 seconds after local session shutdown**. Local shutdown can add to the command's total duration. If cleanup cannot finish, Podgrove returns nonzero and retains retry state with the last observed remaining objects; rerun `down` after inspecting the cause. See [cleanup and idle expiry](operations.md#cleanup-and-idle-expiry).
 
 Use `podgrove validate` for local validation or `podgrove up --dry-run` for generated manifests without cluster writes. They require a namespace from YAML or a flag but no Kubernetes context, because they do not access the cluster. Other public lifecycle commands require an explicit context from `--context`, `cluster.context`, or the `PODGROVE_CONTEXT` fallback.
 

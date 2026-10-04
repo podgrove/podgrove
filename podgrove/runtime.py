@@ -19,6 +19,7 @@ from .compose import Compose
 from .config import load_config
 from .docker_tunnel import DockerTunnel, EngineReplacedError
 from .errors import PodgroveError
+from .initialization import DEFAULT_INIT_TIMEOUT
 from .forward import ForwardOwnershipError, PortMappingError, Tunnel, free_port, port_plan, verify_port_mappings
 from .kube import HeartbeatUnavailable, Kube
 from .process import docker_environment, run
@@ -620,7 +621,8 @@ def serve(path: Path) -> int:
         validate_network_model(config.network, model)
         compose.recover_existing = True
         recovery = (StartupRecovery(kube, data["identity"], data["startup_anchor"], data["timeout"] * 3 + 120,
-                                    cancel_event=startup_cancel)
+                                    cancel_event=startup_cancel,
+                                    init_timeout=data.get("init_timeout", DEFAULT_INIT_TIMEOUT))
                     if "startup_anchor" in data else None)
         startup_deadline = recovery.deadline if recovery else time.monotonic() + data["timeout"] * 3 + 120
         startup_failure, startup_attempts = None, 0
@@ -628,7 +630,8 @@ def serve(path: Path) -> int:
             _startup_remaining(startup_deadline, startup_cancel)
             _startup_phase("waiting for engine Pod readiness")
             if recovery is None:
-                kube.wait(data["identity"], data["timeout"])
+                kube.wait(data["identity"], data["timeout"],
+                          init_timeout=data.get("init_timeout", DEFAULT_INIT_TIMEOUT))
                 selected_uid = None
             else:
                 selected_uid = recovery.wait()

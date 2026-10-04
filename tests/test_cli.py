@@ -36,6 +36,30 @@ def test_unknown_configuration_rejected_before_kubernetes_client(project, monkey
     kube.assert_not_called()
 
 
+@pytest.mark.parametrize("extra,expected", [([], 300), (["--init-timeout", "17"], 17)])
+def test_up_records_independent_initialization_timeout(project, monkeypatch, extra, expected):
+    monkeypatch.setattr(Compose, "model", lambda *_: {"services": {"app": {"image": "busybox:1.37"}}})
+    monkeypatch.setattr(cli, "Kube", Mock())
+    def ready(path):
+        data = state.read(path)
+        assert data["init_timeout"] == expected
+        assert data["timeout"] == 600
+        data["status"] = "ready"
+        state.write(path, data)
+    monkeypatch.setattr(runtime, "spawn", ready)
+    assert cli.up(up_args(project, *extra), project) == 0
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_invalid_initialization_timeout_refused_before_cluster_access(project, monkeypatch, value):
+    monkeypatch.setattr(Compose, "model", lambda *_: {"services": {"app": {"image": "busybox:1.37"}}})
+    kube = Mock()
+    monkeypatch.setattr(cli, "Kube", kube)
+    with pytest.raises(PodgroveError, match="--init-timeout must be positive"):
+        cli.up(up_args(project, "--init-timeout", value), project)
+    kube.assert_not_called()
+
+
 def test_unsupported_compose_rejected_before_kubernetes_client(project, monkeypatch):
     monkeypatch.setattr(Compose, "model", lambda *_: {"services": {"app": {"network_mode": "host"}}})
     kube = Mock()
@@ -574,7 +598,9 @@ def test_down_removes_local_artifacts_and_is_safe_to_repeat(project, monkeypatch
     for _ in range(2):
         assert cli.execute(lifecycle_args(project, "down")) == 0
         assert not path.parent.exists()
-    assert kube.destroy.call_args_list == [((state.identity(project),),), ((state.identity(project),),)]
+    assert [call.args for call in kube.destroy.call_args_list] == [(state.identity(project),)] * 2
+    assert kube.destroy.call_args_list[0].kwargs == {}
+    assert 0 < kube.destroy.call_args_list[1].kwargs["timeout"] <= 120
 
 
 def test_down_cluster_failure_keeps_binding_and_logs_then_retry_cleans(project, monkeypatch):

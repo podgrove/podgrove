@@ -20,15 +20,27 @@ from .pod_network import check_declaration
 from .repository import worktree_name
 from .config import default_tainted_nodes, load_cluster, load_config, refuse_legacy_connect, storage_class_name
 from .errors import PodgroveError
+from .initialization import DEFAULT_INIT_TIMEOUT
 from .fingerprint import FORMAT as FINGERPRINT_FORMAT, launch_fingerprint
 from .forward import validate_port_plan
-from .kube import Kube, context_name, manifests, namespace_name, resolve_namespace
+from .kube import CleanupPending, Kube, context_name, manifests, namespace_name, resolve_namespace
 from .process import docker_environment
 from .reaper import mr_endpoint, reap
 from .repository import configuration_root, worktree_root
 from .session_status import observed
 from .resources import engine_resources, initializer_resources, quantity_text
 from .startup_recovery import capture_anchor
+
+
+def _cleanup_timeout(value: str) -> float:
+    import math
+    try:
+        seconds = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("cleanup timeout must be positive finite seconds") from error
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError("cleanup timeout must be positive finite seconds")
+    return seconds
 
 
 def _log_tail(value: str) -> int | str:
@@ -66,9 +78,14 @@ def parser() -> argparse.ArgumentParser:
             cmd.add_argument("--storage-class", help="Override cluster.storage_class")
             cmd.add_argument("--storage", help="Override storage.size in podgrove.yml (default: 20Gi)")
             cmd.add_argument("--timeout", type=int, default=600)
+            cmd.add_argument("--init-timeout", type=int, default=DEFAULT_INIT_TIMEOUT,
+                             help="Storage initialization deadline after it starts, in seconds (default: 300)")
             cmd.add_argument("--mr-url", default="")
             cmd.add_argument("--dry-run", action="store_true")
             cmd.add_argument("--refresh", action="store_true", help="Re-run Compose build/up while retaining this environment's volumes")
+        if name == "down":
+            cmd.add_argument("--timeout", type=_cleanup_timeout, default=None,
+                             help="Kubernetes cleanup budget in seconds after local shutdown (default: 120)")
         if name in ("logs", "exec"):
             cmd.add_argument("service")
         if name == "logs":
@@ -255,6 +272,8 @@ def up(args, root: Path) -> int:
         mr_endpoint(args.mr_url)
     if args.timeout < 1:
         raise PodgroveError("--timeout must be positive")
+    if args.init_timeout < 1:
+        raise PodgroveError("--init-timeout must be positive")
     namespace = args.namespace
     storage_class = (storage_class_name(args.storage_class) if args.storage_class is not None
                      else config.storage_class)
@@ -349,7 +368,7 @@ def up(args, root: Path) -> int:
                     if args.config is not None or (config_root / "podgrove.yml").exists() else None,
                 "files": [str(path) for path in config.files],
                 "compose_project": model.get("name"), "compose_services": sorted(model["services"]),
-                "timeout": args.timeout, "status": "starting", "token": token,
+                "timeout": args.timeout, "init_timeout": args.init_timeout, "status": "starting", "token": token,
                 "socket": str(Path(tempfile.gettempdir()) / f"podgrove-{os.getuid()}-{token[:16]}.sock"),
                 "ttl_seconds": config.ttl_seconds, "mr_url": args.mr_url,
                 "node_mode": node_mode,
@@ -530,6 +549,8 @@ def execute(args) -> int:
     if args.command == "down":
         from .runtime import stop_session
         with state.lock(path):
+            cleanup_budget = args.timeout if args.timeout is not None else 120
+            cleanup_remaining = None
             if path.exists():
                 data = state.read(path)
                 state.validate_binding(data, root, args.context)
@@ -538,14 +559,39 @@ def execute(args) -> int:
                 kube = Kube(args.context, data["namespace"], namespace_mode=state.namespace_mode(data))
                 stop_session(data)
             else:
-                # Never infer a cleanup namespace without explicit config/flags.
-                # A valid owned lease may recover legacy namespace lifecycle.
-                recovered_mode = kube.lease_mode(ident)
+                # Stateless lease recovery shares the same cleanup budget as subsequent deletion.
+                cleanup_deadline = time.monotonic() + cleanup_budget
+                lease = kube.get("configmap", f"pg-{ident}", timeout=cleanup_budget)
+                if time.monotonic() >= cleanup_deadline:
+                    raise CleanupPending("Cleanup deadline reached during lease recovery", [], complete=False, observed_at=None)
+                recovered_mode = kube.lease_mode(ident, lease)
+                cleanup_remaining = cleanup_deadline - time.monotonic()
+                if cleanup_remaining <= 0:
+                    raise CleanupPending("Cleanup deadline reached during lease validation", [], complete=False, observed_at=None)
                 kube = Kube(args.context, args.namespace, namespace_mode=recovered_mode)
                 data = {"identity": ident, "root": str(root), "context": args.context,
                         "namespace": kube.namespace, "namespace_mode": recovered_mode, "status": "cleanup_pending"}
                 state.write(path, data)
-            kube.destroy(data["identity"])
+            try:
+                if cleanup_remaining is not None:
+                    cleanup_remaining = cleanup_deadline - time.monotonic()
+                    if cleanup_remaining <= 0:
+                        raise CleanupPending("Cleanup deadline reached during lease recovery", [], complete=False, observed_at=None)
+                    kube.destroy(data["identity"], timeout=cleanup_remaining)
+                elif args.timeout is None:
+                    kube.destroy(data["identity"])
+                else:
+                    kube.destroy(data["identity"], timeout=args.timeout)
+            except CleanupPending as error:
+                data.update(status="cleanup_pending", error=str(error), cleanup=error.report)
+                state.write(path, data)
+                if args.json:
+                    print(json.dumps({"command": "down", "identity": data["identity"], "context": data["context"],
+                                      "namespace": data["namespace"], "status": "cleanup_pending", "error": str(error),
+                                      "namespace_retained": True, "bootstrap_retained": True, **error.report}))
+                else:
+                    print(f"podgrove: {error}", file=sys.stderr)
+                return 1
             state.cleanup(path, data)
             if args.json:
                 print(json.dumps({"identity": data["identity"], "context": data["context"],

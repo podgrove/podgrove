@@ -52,6 +52,10 @@ A Compose build or service-start failure after a successful mirror keeps the ses
 
 During startup, the session log immediately records the current phase before waiting for the engine, Docker connection, initial file copy, Compose build/readiness and application forwards. `status` supplies the log path while the environment is starting. These bounded phase messages contain no configuration or command arguments; a quiet phase does not establish a deadlock. Compose build output remains captured until that command finishes.
 
+Storage initialization has its own **300-second deadline after it starts**, independent of a longer build/startup budget. A valid Kubernetes start timestamp includes time already elapsed, so rerunning `up` does not reset that stalled initializer's clock. Use `up --init-timeout 600` only when a longer initialization is appropriate. A timeout names the last observed Pod, node and PVC and retains resources for diagnosis; it does not identify the underlying cause or authorize node changes. Initialization that has not started remains subject to the overall engine/startup deadline.
+
+This bounds observation of completion: delayed Pod status can cause a timeout even if the initializer has exited.
+
 `exec` streams stdin, stdout and stderr through an owned Kubernetes exec using WebSockets. Non-interactive exports verify separate stdout/stderr checksums and acknowledge receipt before the remote wrapper exits, so a successful transport exit alone cannot hide truncated output. Redirecting either output stream selects this binary-safe mode; fully interactive terminals keep their native terminal and resize behavior. Both paths select the exact Compose project/service container, verify the engine and PVC identities, and preserve the remote exit status when execution completes. An interrupted or unverifiable command is never replayed; inspect its effects before retrying.
 
 Existing environments created by an older version from a Git subdirectory keep their original identity. The new resolver refuses to silently adopt or merge those records: use the recorded version and original directory to inspect or retire that environment before starting from the worktree root. Keep the previous versioned installation available during upgrades.
@@ -159,7 +163,11 @@ Existing engine, initializer and PVC compatibility is checked before an active s
 "$PODGROVE_BIN" down
 ```
 
-Failed cleanup retains state for retry. Cleanup selects resources bearing both Podgrove's management label and the environment identity. All modes, including old recorded exclusive environments, retain namespaces and bootstrap resources. Podgrove never deletes a Namespace. Backing-volume cleanup depends on the administrator-approved storage provisioner and reclaim policy; a gone PVC alone is not proof that PV/cloud storage is gone, and Podgrove cannot inspect those cluster resources.
+Kubernetes cleanup has a **120-second budget after local session shutdown**. To allow more time for graceful removal, use `"$PODGROVE_BIN" down --timeout 300 --json`. Local shutdown is separate, so this is not a bound on the whole command's duration. Cleanup verifies the management/environment labels and pins object UIDs before deletion. It waits for the engine controller and Pods to disappear before deleting the PVC; it never forces Pod deletion or removes storage finalizers.
+
+Incomplete cleanup returns nonzero and preserves local state/logs for a safe rerun. `down --json` reports `status: cleanup_pending`, `remaining`, `inventory_complete` and `observed_at`; these describe the last observed inventory, not a promise that an inaccessible object is absent. Inspect the named objects and restore authorized cluster access or ask the platform owner to resolve a stuck Pod/storage condition, then rerun `down` from the same worktree and target. Do not force-delete the Pod/PVC to make the command appear successful.
+
+All modes, including old recorded exclusive environments, retain namespaces and bootstrap resources. Podgrove never deletes a Namespace. Backing-volume cleanup depends on the administrator-approved storage provisioner and reclaim policy; a gone PVC alone is not proof that PV/cloud storage is gone, and Podgrove cannot inspect those cluster resources.
 
 The connected background session checks idle TTL and, optionally, an explicitly supplied GitLab.com MR URL (`up --mr-url URL`). Local bind/config/secret/watch edits and successful `status`, `logs`, or `exec` refresh activity. **Dashboard viewing and application/test traffic do not extend TTL.** Choose enough time for unattended tests. Verified MR closure/merge triggers cleanup; API failures retain the environment.
 

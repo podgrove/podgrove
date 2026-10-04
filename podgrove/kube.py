@@ -7,11 +7,13 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from .errors import PodgroveError
+from .initialization import DEFAULT_INIT_TIMEOUT, StorageInitWatch
 from .network import policy_spec
 from .bootstrap import PROVISIONING_MARKER
 from .process import run
@@ -242,6 +244,18 @@ def manifests(namespace: str, ident: str, root: Path, size: str, ttl: int,
             lease, service, protection, controller]
 
 
+class CleanupPending(PodgroveError):
+    """Cleanup stopped safely; the attached inventory is an observation, not a deletion claim."""
+
+    def __init__(self, reason: str, remaining: list[dict], *, complete: bool, observed_at: float | None):
+        self.reason = reason
+        self.report = {"remaining": remaining, "inventory_complete": complete, "observed_at": observed_at}
+        names = ", ".join(f"{item['kind']}/{item['name']}" for item in remaining) or "not confirmed"
+        certainty = "" if complete else " Inventory incomplete; absence is not confirmed."
+        super().__init__(f"{reason}. Cleanup pending; last observed remaining objects: {names}.{certainty} "
+                         "Namespace and bootstrap retained. Retry podgrove down; never force-delete the Pod or PVC.")
+
+
 class Kube:
     def __init__(self, context: str, namespace: str, *, namespace_mode: str | None = None):
         self.context = context_name(context)
@@ -256,7 +270,7 @@ class Kube:
         return run(self.command(*args), **kwargs)
 
     def get(self, kind: str, name: str | None = None, *, selector: str | None = None,
-            ignore_missing: bool = True) -> dict:
+            ignore_missing: bool = True, timeout: float | None = None) -> dict:
         args = ["get", kind]
         if name:
             args.append(name)
@@ -265,7 +279,8 @@ class Kube:
         args += ["-o", "json"]
         if ignore_missing:
             args.append("--ignore-not-found")
-        result = self.call(*args)
+        bounded = {"timeout": timeout, "cancel_event": threading.Event()} if timeout is not None else {}
+        result = self.call(*args, **bounded)
         return json.loads(result.stdout) if result.stdout.strip() else {}
 
     def refuse_legacy_connections(self, ident: str) -> None:
@@ -771,7 +786,7 @@ class Kube:
                 # Conflict if another actor won the name, never adopt it through apply.
                 self.call("create", "-f", "-", input=json.dumps(resource))
 
-    def wait(self, ident: str, timeout: int) -> None:
+    def wait(self, ident: str, timeout: int, *, init_timeout: float = DEFAULT_INIT_TIMEOUT) -> None:
         """Wait for this owned Pod, failing promptly if it cannot become ready.
 
         A long kubectl watch can survive deletion while waiting for the original
@@ -782,8 +797,25 @@ class Kube:
             raise PodgroveError("Invalid environment identity; refusing readiness check")
         name = engine_pod_name(ident)
         deadline, uid, controller_uid = time.monotonic() + timeout, None, None
+        initialization = StorageInitWatch(self.namespace, init_timeout)
+        last_timeout = f"Timed out after {timeout}s waiting for Pod {self.namespace}/{name} readiness"
+
+        def read(kind, name):
+            remaining = initialization.limit(deadline) - time.monotonic()
+            if remaining <= 0:
+                raise PodgroveError(last_timeout)
+            try:
+                result = self.get(kind, name, timeout=min(REQUEST_PROCESS_TIMEOUT, remaining))
+            except PodgroveError:
+                initialization.check()
+                raise
+            initialization.check()
+            if time.monotonic() >= deadline:
+                raise PodgroveError(last_timeout)
+            return result
+
         while True:
-            controller = self.get("statefulset", f"pg-{ident}")
+            controller = read("statefulset", f"pg-{ident}")
             controller_meta = controller.get("metadata", {})
             controller_labels = controller_meta.get("labels", {})
             if not controller:
@@ -796,16 +828,17 @@ class Kube:
             if controller_uid is not None and controller_meta["uid"] != controller_uid:
                 raise PodgroveError(f"StatefulSet {self.namespace}/pg-{ident} was replaced while waiting for its Pod")
             controller_uid = controller_meta["uid"]
-            pod = self.get("pod", name)
+            pod = read("pod", name)
             if not pod:
                 if uid is not None:
                     raise PodgroveError(f"Pod {self.namespace}/{name} was deleted or no longer exists while waiting for readiness")
                 remaining = deadline - time.monotonic()
+                conditions = controller.get("status", {}).get("conditions", [])
+                details = "; ".join(str(item.get("message", item.get("reason", ""))) for item in conditions)[:1500]
+                last_timeout = (f"Timed out after {timeout}s waiting for StatefulSet {self.namespace}/pg-{ident} "
+                                f"to create Pod {name}: {details or 'controller has not created the Pod'}")
                 if remaining <= 0:
-                    conditions = controller.get("status", {}).get("conditions", [])
-                    details = "; ".join(str(item.get("message", item.get("reason", ""))) for item in conditions)[:1500]
-                    raise PodgroveError(f"Timed out after {timeout}s waiting for StatefulSet {self.namespace}/pg-{ident} "
-                                        f"to create Pod {name}: {details or 'controller has not created the Pod'}")
+                    raise PodgroveError(last_timeout)
                 time.sleep(min(2, remaining))
                 continue
             metadata, status = pod.get("metadata", {}), pod.get("status", {})
@@ -815,6 +848,7 @@ class Kube:
             uid = metadata.get("uid")
             if metadata.get("deletionTimestamp"):
                 raise PodgroveError(f"Pod {self.namespace}/{name} is being deleted since {metadata['deletionTimestamp']}")
+            initialization.observe(pod)
             phase = status.get("phase", "Unknown")
             details = [f"phase={phase}"]
             for field in ("reason", "message"):
@@ -829,6 +863,7 @@ class Kube:
                 if problem and problem.get("reason") != "Completed":
                     details.append(f"{container.get('name', 'container')}: {problem.get('reason', '')} {problem.get('message', '')}".strip())
             summary = "; ".join(details)[:1500]
+            last_timeout = f"Timed out after {timeout}s waiting for Pod {self.namespace}/{name} readiness: {summary}"
             if phase in ("Failed", "Succeeded"):
                 raise PodgroveError(f"Pod {self.namespace}/{name} reached terminal phase {phase}: {summary}")
             if any(condition.get("type") == "Ready" and condition.get("status") == "True"
@@ -837,7 +872,7 @@ class Kube:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise PodgroveError(f"Timed out after {timeout}s waiting for Pod {self.namespace}/{name} readiness: {summary}")
-            time.sleep(min(2, remaining))
+            time.sleep(max(0, min(2, initialization.limit(deadline) - time.monotonic())))
 
     def heartbeat(self, ident: str, timestamp: float) -> None:
         def request(*args, **kwargs):
@@ -875,20 +910,158 @@ class Kube:
         # periodic heartbeat starts with a new ownership read instead.
         request("replace", "-f", "-", input=json.dumps(lease))
 
-    def destroy(self, ident: str, *, namespace_mode: str | None = None) -> None:
-        if not re.fullmatch(r"[a-f0-9]{12}", ident):
+    def destroy(self, ident: str, *, namespace_mode: str | None = None, timeout: float = 120) -> None:
+        """Delete exact owned objects gracefully within one Kubernetes cleanup budget."""
+        import math
+        import threading
+
+        if not isinstance(ident, str) or not re.fullmatch(r"[a-f0-9]{12}", ident):
             raise PodgroveError("Invalid environment identity; refusing deletion")
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+            raise PodgroveError("Cleanup timeout must be a positive finite number of seconds")
         mode = resolve_namespace_mode(self.namespace, namespace_mode if namespace_mode is not None else self.namespace_mode)
-        lease = self.get("configmap", f"pg-{ident}")
-        if lease and self.lease_mode(ident, lease) != mode:
-            raise PodgroveError("Environment lease namespace_mode differs from cleanup authority; refusing deletion")
+        kinds = {
+            "StatefulSet": ("statefulsets", "/apis/apps/v1"), "Pod": ("pods", "/api/v1"),
+            "PersistentVolumeClaim": ("persistentvolumeclaims", "/api/v1"), "ConfigMap": ("configmaps", "/api/v1"),
+            "NetworkPolicy": ("networkpolicies", "/apis/networking.k8s.io/v1"), "Service": ("services", "/api/v1"),
+            "PodDisruptionBudget": ("poddisruptionbudgets", "/apis/policy/v1"),
+        }
         selector = f"{MANAGED}=podgrove,{ENVIRONMENT}={ident}"
-        # Stop the real controller and wait for its Pod before removing storage.
-        # No force deletion: Kubernetes' StatefulSet identity guarantee requires
-        # observing termination before a replacement can use the same PVC.
-        self.call("delete", "statefulset", "-l", selector, "--ignore-not-found", "--cascade=foreground",
-                  "--wait=true", "--timeout=120s", "--request-timeout=0", timeout=130)
-        # Retain namespace and administrator bootstrap objects in EVERY mode,
-        # including legacy exclusive records. Neither needs cluster-scoped access.
-        # Fixed resource types and a conjunctive owner selector; never delete all.
-        self.call("delete", "pod,pvc,configmap,networkpolicy,service,poddisruptionbudget", "-l", selector, "--ignore-not-found", "--wait=true", "--timeout=120s", timeout=130)
+        deadline = time.monotonic() + timeout
+        work_deadline = deadline - min(5, timeout / 4)
+        cancel = threading.Event()
+        pinned, latest, submitted = {}, [], set()
+        observed_at = None
+        complete = False
+
+        def available(*, final=False):
+            remaining = (deadline if final else work_deadline) - time.monotonic()
+            if remaining <= 0:
+                raise PodgroveError("Cleanup deadline reached")
+            return remaining
+
+        def request(*args, final=False, **kwargs):
+            budget = min(10, available(final=final))
+            result = self.call(*args, f"--request-timeout={max(.001, budget * .8):.3f}s",
+                               timeout=budget, cancel_event=cancel, **kwargs)
+            available(final=final)
+            return result.stdout
+
+        def read(*args, missing=False, final=False):
+            raw = request("get", *args, "-o", "json", *(["--ignore-not-found"] if missing else []), final=final)
+            try:
+                value = json.loads(raw) if raw.strip() else ({} if missing else None)
+            except (ValueError, TypeError) as error:
+                raise PodgroveError("Cleanup inventory returned invalid JSON") from error
+            if not isinstance(value, dict):
+                raise PodgroveError("Cleanup inventory returned an invalid object")
+            available(final=final)
+            return value
+
+        def checked(item):
+            try:
+                kind, meta = item["kind"], item["metadata"]
+                name, uid, version = (meta[key] for key in ("name", "uid", "resourceVersion"))
+                labels = meta["labels"]
+                if (kind not in kinds or meta["namespace"] != self.namespace
+                        or labels.get(MANAGED) != "podgrove" or labels.get(ENVIRONMENT) != ident
+                        or not isinstance(name, str) or len(name) > 253
+                        or not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", name)
+                        or any(not isinstance(value, str) or not value or len(value) > 256
+                               or any(ord(char) < 32 or ord(char) == 127 for char in value) for value in (uid, version))):
+                    raise ValueError()
+                finalizers = meta.get("finalizers", [])
+                if (not isinstance(finalizers, list) or len(finalizers) > 32
+                        or any(not isinstance(value, str) or len(value) > 256
+                               or any(ord(char) < 32 or ord(char) == 127 for char in value) for value in finalizers)):
+                    raise ValueError()
+                if kind == "ConfigMap" and name == f"pg-{ident}" and self.lease_mode(ident, item) != mode:
+                    raise PodgroveError("Environment lease namespace_mode changed; refusing deletion")
+                key = kind, name
+                if key in pinned and pinned[key] != uid:
+                    raise PodgroveError(f"Cleanup identity changed for {kind}/{name}; refusing replacement deletion")
+                return key
+            except (KeyError, ValueError, TypeError, AttributeError) as error:
+                raise PodgroveError("Cleanup inventory ownership or metadata is invalid; refusing deletion") from error
+
+        def observe(*, final=False):
+            nonlocal latest, observed_at, complete
+            complete = False
+            value = read(",".join(value[0] for value in kinds.values()), "-l", selector, final=final)
+            items = value.get("items")
+            metadata = value.get("metadata", {})
+            if (not isinstance(items, list) or len(items) > 256 or not isinstance(metadata, dict)
+                    or metadata.get("continue")):
+                raise PodgroveError("Cleanup inventory is incomplete or exceeds 256 objects")
+            found = {}
+            for item in items:
+                key = checked(item)
+                if key in found:
+                    raise PodgroveError("Cleanup inventory contains duplicate objects")
+                found[key] = item
+            for kind, name in pinned.keys() - found.keys():
+                item = read(kinds[kind][0], name, missing=True, final=final)
+                if item:
+                    if checked(item) != (kind, name):
+                        raise PodgroveError("Cleanup named lookup returned a different resource; refusing deletion")
+                    found[kind, name] = item
+            available(final=final)
+            for key, item in found.items():
+                pinned[key] = item["metadata"]["uid"]
+            latest = list(found.values())
+            observed_at, complete = time.time(), True
+            return latest
+
+        def remove(item):
+            kind, meta = item["kind"], item["metadata"]
+            key = kind, meta["name"]
+            if meta.get("deletionTimestamp") or key in submitted:
+                return False
+            plural, base = kinds[kind]
+            options = {"apiVersion": "v1", "kind": "DeleteOptions", "preconditions": {
+                "uid": meta["uid"], "resourceVersion": meta["resourceVersion"]}}
+            if kind == "StatefulSet":
+                options["propagationPolicy"] = "Foreground"
+            submitted.add(key)
+            request("delete", "--raw", f"{base}/namespaces/{self.namespace}/{plural}/{meta['name']}",
+                    "-f", "-", input=json.dumps(options))
+            return True
+
+        try:
+            lease = read("configmaps", f"pg-{ident}", missing=True)
+            if lease:
+                if self.lease_mode(ident, lease) != mode:
+                    raise PodgroveError("Environment lease namespace_mode differs from cleanup authority; refusing deletion")
+                key = checked(lease)
+                pinned[key] = lease["metadata"]["uid"]
+                latest, observed_at = [lease], time.time()
+            while True:
+                items = observe()
+                if not items:
+                    return
+                controllers = [item for item in items if item["kind"] == "StatefulSet"]
+                pods = [item for item in items if item["kind"] == "Pod"]
+                # Preserve storage and the lease until every observed controller and Pod is absent.
+                eligible = controllers or pods or [item for item in items if item["kind"] != "ConfigMap"] or items
+                changed = False
+                for item in eligible:
+                    changed = remove(item) or changed
+                remaining = work_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise PodgroveError("Cleanup deadline reached")
+                if not changed:
+                    time.sleep(min(1, remaining))
+        except PodgroveError as error:
+            first_error = str(error)
+            try:
+                observe(final=True)
+            except PodgroveError:
+                complete = False
+            remaining = []
+            for item in latest:
+                meta = item["metadata"]
+                remaining.append({"kind": item["kind"], "name": meta["name"], "uid": meta["uid"],
+                                  "deleting": bool(meta.get("deletionTimestamp")),
+                                  "finalizers": meta.get("finalizers", [])})
+            raise CleanupPending(first_error, sorted(remaining, key=lambda item: (item["kind"], item["name"])),
+                                 complete=complete, observed_at=observed_at) from error

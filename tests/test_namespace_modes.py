@@ -18,7 +18,7 @@ def lease(namespace, mode="shared", ident=IDENT):
     data = {"last_activity": "100", "ttl_seconds": "1"}
     if mode is not None:
         data["namespace_mode"] = mode
-    return {"metadata": {"name": f"pg-{ident}", "namespace": namespace, "resourceVersion": "1",
+    return {"kind": "ConfigMap", "metadata": {"uid": "lease-uid", "name": f"pg-{ident}", "namespace": namespace, "resourceVersion": "1",
                          "labels": {MANAGED: "podgrove", ENVIRONMENT: ident}}, "data": data}
 
 
@@ -32,7 +32,18 @@ def fake_kube(namespace, mode, current=None, labels=None):
         assert kind == "configmap", "Lifecycle must not inspect cluster-scoped objects"
         return marker if name == PROVISIONING_MARKER else current or {}
     kube.get = Mock(side_effect=get)
-    kube.call = Mock()
+    remaining = [current] if current else []
+    def transport(*args, **kwargs):
+        if args[0] == "delete":
+            assert args[1] == "--raw" and args[2] == f"/api/v1/namespaces/{namespace}/configmaps/pg-{IDENT}"
+            options = json.loads(kwargs["input"])
+            assert options["preconditions"] == {key: current["metadata"][key] for key in ("uid", "resourceVersion")}
+            remaining.clear()
+            return SimpleNamespace(stdout="", returncode=0)
+        assert args[0] == "get"
+        value = {"items": remaining} if "-l" in args else (remaining[0] if remaining else None)
+        return SimpleNamespace(stdout=json.dumps(value) if value is not None else "", returncode=0)
+    kube.call = Mock(side_effect=transport)
     return kube, marker
 
 
@@ -74,8 +85,9 @@ def test_shared_marker_is_verified_without_namespace_reads_or_metadata_changes(n
     kube.get.assert_called_once_with("configmap", PROVISIONING_MARKER)
     kube.destroy(IDENT)
     assert marker == before
-    assert [call.args[1] for call in kube.call.call_args_list] == ["statefulset", "pod,pvc,configmap,networkpolicy,service,poddisruptionbudget"]
-    assert all(f"{MANAGED}=podgrove,{ENVIRONMENT}={IDENT}" in call.args for call in kube.call.call_args_list)
+    assert len([call for call in kube.call.call_args_list if call.args[0] == "delete"]) == 1
+    assert all(f"{MANAGED}=podgrove,{ENVIRONMENT}={IDENT}" in call.args
+               for call in kube.call.call_args_list if "-l" in call.args)
 
 
 @pytest.mark.parametrize("owner", [IDENT, "abcdef123456", ""])
@@ -87,7 +99,7 @@ def test_shared_mode_cannot_repurpose_worktree_marker(owner):
     kube.call.assert_not_called()
     # Existing owned resources remain cleanable when bootstrap metadata is wrong.
     kube.destroy(IDENT)
-    assert kube.call.call_count == 2
+    assert len([call for call in kube.call.call_args_list if call.args[0] == "delete"]) == 1
 
 
 @pytest.mark.parametrize("mode", ["shared", "worktree"])
@@ -138,7 +150,7 @@ def test_worktree_mode_refuses_foreign_or_malformed_marker_before_start(change):
         kube.ensure_namespace(IDENT)
     kube.call.assert_not_called()
     kube.destroy(IDENT)
-    assert kube.call.call_count == 2
+    assert len([call for call in kube.call.call_args_list if call.args[0] == "delete"]) == 1
 
 
 @pytest.mark.parametrize("mode", ["shared", "worktree", "exclusive"])
@@ -170,8 +182,8 @@ def test_malformed_persisted_mode_is_rejected(mode):
 def test_legacy_cleanup_retains_namespace_and_does_not_require_marker_or_lease(namespace):
     kube, _ = fake_kube(namespace, "exclusive")
     kube.destroy(IDENT)
-    assert [call.args[1] for call in kube.call.call_args_list] == ["statefulset", "pod,pvc,configmap,networkpolicy,service,poddisruptionbudget"]
-    kube.get.assert_called_once_with("configmap", f"pg-{IDENT}")
+    assert all(call.args[0] == "get" for call in kube.call.call_args_list)
+    kube.get.assert_not_called()
 
 
 @pytest.mark.parametrize("change", ["namespace", "name", "manager", "identity", "null-mode", "invalid-mode"])
@@ -186,13 +198,14 @@ def test_lease_mode_recovery_refuses_foreign_or_malformed_lease(change):
     kube, _ = fake_kube("wt-team", "shared", current)
     with pytest.raises(PodgroveError):
         kube.destroy(IDENT)
-    kube.call.assert_not_called()
+    assert all(call.args[0] == "get" for call in kube.call.call_args_list)
 
 
 def test_lease_mode_change_refuses_heartbeat_reconnect_and_cleanup():
     current = lease("wt-team", "shared")
     current["metadata"]["uid"] = "lease-uid"
     kube, _ = fake_kube("wt-team", "exclusive", current)
+    kube.call.side_effect = None
     kube.call.return_value = SimpleNamespace(returncode=0, stdout=json.dumps(current))
     expected = lease("wt-team", "exclusive")
     expected["kind"] = "ConfigMap"
@@ -200,7 +213,7 @@ def test_lease_mode_change_refuses_heartbeat_reconnect_and_cleanup():
                       lambda: kube._validate_existing(expected, current, IDENT)):
         with pytest.raises(PodgroveError, match="namespace_mode"):
             operation()
-    assert kube.call.call_count == 1 and kube.call.call_args.args[0] == "get"
+    assert all(call.args[0] == "get" for call in kube.call.call_args_list)
 
 
 @pytest.mark.parametrize("mode", ["shared", "worktree", "exclusive"])
