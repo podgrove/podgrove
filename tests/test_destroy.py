@@ -199,18 +199,54 @@ def test_request_budgets_shrink_with_one_absolute_deadline(cluster):
 
 
 def test_actual_blocked_kubectl_child_is_reaped_within_cleanup_budget(tmp_path, monkeypatch):
-    marker = tmp_path / "pid"
     script = tmp_path / "blocked.py"
-    script.write_text("import os,pathlib,time\npathlib.Path(" + repr(str(marker)) + ").write_text(str(os.getpid()))\ntime.sleep(30)\n")
+    script.write_text("import os,pathlib,sys,time\ntime.sleep(.6)\n"
+                      "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\ntime.sleep(30)\n")
+    command = [sys.executable, "-I", "-B", str(script)]
     kube = Kube("test-context", "team")
-    monkeypatch.setattr(kube, "command", lambda *args: [sys.executable, "-I", "-B", str(script)])
-    started = time.monotonic()
-    with pytest.raises(CleanupPending) as captured:
-        kube.destroy(IDENT, timeout=.5)
-    assert time.monotonic() - started < 2
-    assert captured.value.report["inventory_complete"] is False
-    pid = int(marker.read_text())
-    assert subprocess.run(["ps", "-p", str(pid), "-o", "stat="], capture_output=True).returncode == 1
+    monkeypatch.setattr(kube, "command", lambda *args: command)
+    original = subprocess.Popen
+    children, used = [], []
+
+    def launch(args, **kwargs):
+        if args == command:
+            assert len(used) < len(children), "Unexpected additional cleanup request"
+            child = children[len(used)]
+            used.append(child)
+            return child
+        return original(args, **kwargs)
+
+    try:
+        markers = [tmp_path / f"pid-{index}" for index in range(2)]
+        for marker in markers:
+            children.append(original([*command, str(marker)], text=True, start_new_session=True,
+                                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE))
+        deadline = time.monotonic() + 5
+        for marker, child in zip(markers, children):
+            while time.monotonic() < deadline:
+                if marker.exists() and marker.read_text().strip() == str(child.pid):
+                    break
+                time.sleep(.01)
+            else:
+                pytest.fail("Blocked kubectl fixture did not become ready")
+            assert child.poll() is None
+        monkeypatch.setattr(subprocess, "Popen", launch)
+        started = time.monotonic()
+        with pytest.raises(CleanupPending) as captured:
+            kube.destroy(IDENT, timeout=.5)
+        assert time.monotonic() - started < 2
+        assert captured.value.report["inventory_complete"] is False
+        assert used
+        for child in used:
+            assert child.poll() is not None
+            assert subprocess.run(["ps", "-p", str(child.pid), "-o", "stat="], capture_output=True).returncode == 1
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=2)
+            child.stdout.close()
+            child.stderr.close()
 
 
 @pytest.mark.parametrize("change", ["namespace", "mode", "uid", "rv", "name", "finalizer"])
