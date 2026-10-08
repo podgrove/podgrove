@@ -92,3 +92,22 @@ python3 scripts/soak_forwarding.py \
 ```
 
 All paths and the identity/endpoint must match that fixture. The default duration is 14,460 seconds (four hours plus one minute). Every observation verifies the selected installed payload against the receipt-bound wheel and preserves the exact resource UIDs. HTTP probes run every ten seconds and status observations every minute; status extends the fixture's TTL. The optional fault terminates one proven supervisor-owned `kubectl port-forward` child and requires recovery on the same endpoint. No node or cluster-scoped API is used. A short `--duration` is a smoke test and cannot produce `four_hour_proof: true`; interrupted runs, unexpected failures, changed identities/runtime bytes, and excessive sampling gaps fail the proof. The private JSON/JSONL evidence distinguishes injected recovery from unplanned errors.
+
+## Startup diagnostics and restricted permissions
+
+`scripts/check_startup_diagnostics.py` uses one fresh 2 GiB engine to test a non-root
+service reading a `0700` directory and `0600` files, two failed services’ diagnostics,
+streamed build output, startup status, and plain `up` recovery after a missing file
+is created. It checks every recovered endpoint and removes its own environment.
+Use the same explicit target and installed-binary prerequisites as the startup lane:
+
+```sh
+python3 scripts/check_startup_diagnostics.py \
+  --podgrove-bin "$PODGROVE_BIN" \
+  --context your-development-context --namespace your-development-namespace \
+  --storage-class your-approved-storage-class \
+  --output /path/to/new-private-diagnostics-evidence --execute
+```
+
+Without `--execute`, it prints the plan and creates nothing. Consult `result.json`
+and the captured command output; a failed or unconfirmed cleanup fails acceptance.

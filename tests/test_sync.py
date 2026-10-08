@@ -8,6 +8,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import tarfile
@@ -128,6 +129,157 @@ def test_single_file_edits_modes_rename_and_deletion(tmp_path):
     app.rmdir()
     assert sync.sync_once() == 2
     assert control(sync, "deleted") == ["app/new.py", "app"]
+
+
+@pytest.mark.parametrize("directory_mode,file_mode", [(0o700, 0o600), (0o750, 0o640), (0o770, 0o751)])
+def test_initial_sync_normalizes_remote_permissions_without_changing_sources(tmp_path, directory_mode, file_mode):
+    directory = tmp_path / "shared" / "middleware"
+    directory.mkdir(parents=True)
+    source = directory / "module.py"
+    source.write_text("value = 42")
+    for path in (tmp_path, directory.parent, directory):
+        path.chmod(directory_mode)
+    source.chmod(file_mode)
+    sync = FakeSynchronizer(tmp_path, [source])
+    sync.start()
+    metadata = sync.transfer_metadata[-1]
+    for relative in (".", "shared", "shared/middleware"):
+        assert metadata[f"podgrove-transfer/payload/{relative}"][2] == directory_mode | 0o755
+        assert (tmp_path / relative).stat().st_mode & 0o7777 == directory_mode
+    assert metadata["podgrove-transfer/payload/shared/middleware/module.py"][2] == file_mode | 0o644
+    assert source.stat().st_mode & 0o7777 == file_mode
+    assert sync.sync_once() == 0
+
+
+def test_incremental_sync_normalizes_new_paths_and_chmod_only_changes(tmp_path):
+    source = tmp_path / "app.py"
+    source.write_text("value = 1")
+    sync = FakeSynchronizer(tmp_path, [tmp_path])
+    sync.start()
+    directory = tmp_path / "private"
+    directory.mkdir(mode=0o700)
+    child = directory / "secret.py"
+    child.write_text("value = 2")
+    child.chmod(0o600)
+    source.chmod(0o700)
+    sync.sync_once()
+    metadata = sync.transfer_metadata[-1]
+    assert metadata["podgrove-transfer/payload/private"][2] == 0o755
+    assert metadata["podgrove-transfer/payload/private/secret.py"][2] == 0o644
+    assert metadata["podgrove-transfer/payload/app.py"][2] == 0o744
+    directory.chmod(0o750)
+    child.chmod(0o740)
+    source.chmod(0o600)
+    assert sync.sync_once() == 3
+    metadata = sync.transfer_metadata[-1]
+    assert metadata["podgrove-transfer/payload/private"][2] == 0o755
+    assert metadata["podgrove-transfer/payload/private/secret.py"][2] == 0o744
+    assert metadata["podgrove-transfer/payload/app.py"][2] == 0o644
+    assert sync.sync_once() == 0
+
+
+@pytest.mark.parametrize("missing_path", [".", "shared", "shared/module.py", "all"])
+@pytest.mark.parametrize("directory_mode,file_mode", [(0o700, 0o600), (0o755, 0o644)])
+def test_missing_remote_mode_invalidates_entire_baseline_and_resyncs(tmp_path, missing_path,
+                                                                  directory_mode, file_mode):
+    tmp_path.chmod(directory_mode)
+    directory = tmp_path / "shared"
+    directory.mkdir(mode=directory_mode)
+    source = directory / "module.py"
+    source.write_text("original local contents")
+    source.chmod(file_mode)
+    other = directory / "other.py"
+    other.write_text("unchanged other contents")
+    other.chmod(file_mode)
+    first = FakeSynchronizer(tmp_path, [directory])
+    first.start()
+    saved = json.loads(first.remote_baseline)
+    missing_paths = saved["entries"] if missing_path == "all" else [missing_path]
+    for path in missing_paths:
+        del saved["entries"][path]["remote_mode"]
+    second = FakeSynchronizer(tmp_path, [directory])
+    second.remote_baseline = json.dumps(saved).encode()
+    second.start()
+    assert len(second.transfers) == 1
+    assert control(second, "files") == ["shared/module.py", "shared/other.py"]
+    assert control(second, "directory_modes") == [".", "shared"]
+    assert control(second, "deleted") == []
+    assert second.transfers[-1]["podgrove-transfer/payload/shared/module.py"] == b"original local contents"
+    assert second.transfers[-1]["podgrove-transfer/payload/shared/other.py"] == b"unchanged other contents"
+    assert second.transfer_metadata[-1]["podgrove-transfer/payload/shared/module.py"][2] == file_mode | 0o644
+    assert second.transfer_metadata[-1]["podgrove-transfer/payload/shared"][2] == directory_mode | 0o755
+    assert all("remote_mode" in entry for entry in json.loads(second.remote_baseline)["entries"].values())
+    assert source.stat().st_mode & 0o777 == file_mode
+    assert directory.stat().st_mode & 0o777 == directory_mode
+    assert second.sync_once() == 0
+
+
+@pytest.mark.parametrize("invalidate_baseline", [False, True])
+def test_real_apply_resyncs_invalid_baseline_but_preserves_valid_remote_edits(tmp_path, monkeypatch,
+                                                                          invalidate_baseline):
+    from podgrove.sync import _APPLY, _RECEIVE
+    gnu_stat = shutil.which("gstat") or (shutil.which("stat") if sys.platform.startswith("linux") else None)
+    if not gnu_stat:
+        pytest.skip("GNU stat is required to run the production Linux apply script locally")
+    local, remote, metadata, stage = (tmp_path / name for name in ("local", "remote", "metadata", "stage"))
+    for path in (local, remote, metadata):
+        path.mkdir()
+        os.chown(path, -1, os.getgid())
+    directory = local / "middleware"
+    directory.mkdir(mode=0o700)
+    source = directory / "module.py"
+    source.write_text("initial")
+    source.chmod(0o600)
+    script = (_RECEIVE + _APPLY).replace("/tmp/podgrove-transfer", "${TEST_STAGE}")
+    script = script.replace("/tmp/podgrove-incoming.", "${TEST_METADATA}/podgrove-incoming.")
+    script = script.replace("/workspace", "${TEST_WORKSPACE}").replace("/metadata", "${TEST_METADATA}")
+    script = script.replace("!= ${TEST_WORKSPACE}", '!= "${TEST_WORKSPACE}"')
+    script = script.replace("stat -c", shlex.quote(gnu_stat) + " -c")
+    env = dict(os.environ, TEST_STAGE=str(stage), TEST_WORKSPACE=str(remote), TEST_METADATA=str(metadata))
+
+    def apply_with(sync):
+        send = sync._send_archive
+        def send_and_apply(archive):
+            content = archive.read()
+            archive.seek(0)
+            result = subprocess.run(["bash", "-c", script], input=content, capture_output=True, env=env, timeout=10)
+            assert result.returncode == 0, result.stderr.decode()
+            send(archive)
+        monkeypatch.setattr(sync, "_send_archive", send_and_apply)
+
+    first = FakeSynchronizer(local, [directory])
+    apply_with(first)
+    first.start()
+    target = remote / "middleware" / "module.py"
+    assert target.read_text() == "initial"
+    assert target.stat().st_mode & 0o777 == 0o644
+    assert target.parent.stat().st_mode & 0o777 == 0o755
+    inode = target.stat().st_ino
+    target.write_text("retained remote edit")
+    target.chmod(0o600)
+    target.parent.chmod(0o700)
+    saved = json.loads(first.remote_baseline)
+    if invalidate_baseline:
+        del saved["entries"]["middleware/module.py"]["remote_mode"]
+    remote_only = target.parent / "generated.txt"
+    remote_only.write_text("remote-only contents")
+    resumed = FakeSynchronizer(local, [directory])
+    resumed.remote_baseline = json.dumps(saved).encode()
+    apply_with(resumed)
+    resumed.start()
+    assert target.read_text() == ("initial" if invalidate_baseline else "retained remote edit")
+    assert target.stat().st_ino == inode
+    assert target.stat().st_mode & 0o777 == (0o644 if invalidate_baseline else 0o600)
+    assert target.parent.stat().st_mode & 0o777 == (0o755 if invalidate_baseline else 0o700)
+    assert remote_only.read_text() == "remote-only contents"
+    assert source.stat().st_mode & 0o777 == 0o600
+    source.write_text("local update")
+    source.chmod(0o700)
+    resumed.sync_once()
+    assert target.read_text() == "local update"
+    assert target.stat().st_ino == inode
+    assert target.stat().st_mode & 0o777 == 0o744
+    assert source.stat().st_mode & 0o777 == 0o700
 
 
 def test_failed_streamed_apply_keeps_baseline_and_next_edit_can_retry(tmp_path, monkeypatch):
@@ -484,6 +636,9 @@ def test_docker_real_transport_inode_deletes_modes_and_remote_data(tmp_path):
     if os.getuid() == 0:
         for source in (tmp_path, tmp_path / "file", directory, directory / "tracked", tmp_path / odd):
             os.chown(source, 1000, 1000)
+    tmp_path.chmod(0o700)
+    directory.chmod(0o700)
+    (tmp_path / "file").chmod(0o600)
     owner = f"{(tmp_path / 'file').stat().st_uid}:{(tmp_path / 'file').stat().st_gid}"
     assert not owner.startswith("0:")
     identity = "integration-" + uuid.uuid4().hex
@@ -494,6 +649,10 @@ def test_docker_real_transport_inode_deletes_modes_and_remote_data(tmp_path):
         assert sync._docker("exec", sync.container, "cat", "/workspace/file").stdout == b"initial"
         for path in ("/workspace", "/workspace/file", "/workspace/directory"):
             assert sync._docker("exec", sync.container, "stat", "-c", "%u:%g", path).stdout.strip() == owner.encode()
+        for path in ("/workspace", "/workspace/directory"):
+            assert sync._docker("exec", sync.container, "stat", "-c", "%a", path).stdout.strip() == b"755"
+        assert sync._docker("exec", "--user", "65534:65534", sync.container,
+                            "cat", "/workspace/file").stdout == b"initial"
         sync._docker("exec", "--user", owner, sync.container, "sh", "-c",
                      "test -w /workspace/file && echo owner-write > /workspace/directory/owner-created")
         assert sync._docker("exec", sync.container, "cat", "/workspace/" + odd).stdout == b"special"
@@ -508,7 +667,7 @@ def test_docker_real_transport_inode_deletes_modes_and_remote_data(tmp_path):
         sync.sync_once()
         assert sync._docker("exec", consumer, "cat", "/observed").stdout == b"edited"
         assert sync._docker("exec", consumer, "stat", "-c", "%i", "/observed").stdout == before_inode
-        assert sync._docker("exec", consumer, "stat", "-c", "%a", "/observed").stdout.strip() == b"751"
+        assert sync._docker("exec", consumer, "stat", "-c", "%a", "/observed").stdout.strip() == b"755"
         assert sync._docker("exec", consumer, "stat", "-c", "%u:%g", "/observed").stdout.strip() == owner.encode()
         sync._docker("exec", sync.container, "sh", "-c", "echo retained > /workspace/directory/remote-data")
         shutil.rmtree(directory)

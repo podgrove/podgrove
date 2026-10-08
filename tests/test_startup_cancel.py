@@ -29,10 +29,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from podgrove import runtime
 root, phase = Path(sys.argv[2]), sys.argv[3]
-def block(*args):
+def block(*args, **kwargs):
     (root / "blocked").write_text(phase)
     time.sleep(60)
-noop = lambda *args: None
+noop = lambda *args, **kwargs: None
 runtime.Kube = lambda *args, **kwargs: SimpleNamespace(wait=block if phase == "startup" else noop,
                                            heartbeat=block if phase == "heartbeat" else noop)
 config = SimpleNamespace(root=root, forward=[], ttl_seconds=3600, network={})

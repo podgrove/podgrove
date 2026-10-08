@@ -175,3 +175,85 @@ def test_cancellation_prevents_reads_and_is_passed_to_each_process(bound):
     with pytest.raises(PodgroveError, match="cancelled"):
         guard.wait()
     assert len(kube.calls) == before
+
+
+def initializing(kube):
+    pod = kube.objects["pod"]
+    pod["spec"]["nodeName"] = "node-fixture"
+    pod["status"] = {"phase": "Pending", "initContainerStatuses": [
+        {"name": "storage", "state": {"running": {}}}]}
+    return pod
+
+
+def test_running_init_is_bounded_independently_of_32_minute_startup_budget(bound):
+    kube, anchor, clock = bound
+    initializing(kube)
+    proof = recovery.StartupRecovery(kube, IDENT, anchor, 1920, init_timeout=1)
+    with pytest.raises(PodgroveError, match="Storage initialization timed out after 1s") as error:
+        proof.wait()
+    assert clock.now == 101
+    assert "node node-fixture" in str(error.value) and "PVC test-namespace/pg-" + IDENT in str(error.value)
+    assert all(args[0] == "get" for args, _ in kube.calls)
+
+
+def test_init_completion_allows_later_engine_readiness(bound, monkeypatch):
+    kube, anchor, clock = bound
+    pod = initializing(kube)
+    call = kube.call
+    def changing(*args, **kwargs):
+        if clock.now >= 100.5:
+            pod["status"]["initContainerStatuses"][0]["state"] = {"terminated": {"exitCode": 0}}
+        if clock.now >= 102:
+            pod["status"].update(phase="Running", conditions=[{"type": "Ready", "status": "True"}])
+        return call(*args, **kwargs)
+    monkeypatch.setattr(kube, "call", changing)
+    proof = recovery.StartupRecovery(kube, IDENT, anchor, 10, init_timeout=1)
+    assert proof.wait() == "pod-original"
+    assert clock.now == 102.25
+
+
+def test_known_init_deadline_clips_blocked_api_read_and_keeps_diagnostic(bound, monkeypatch):
+    kube, anchor, clock = bound
+    initializing(kube)
+    proof = recovery.StartupRecovery(kube, IDENT, anchor, 1920, init_timeout=1)
+    assert proof._observe() is None
+    def blocked(*args, **kwargs):
+        assert kwargs["timeout"] == 1
+        clock.now += kwargs["timeout"]
+        raise PodgroveError("kubectl timed out")
+    monkeypatch.setattr(kube, "call", blocked)
+    with pytest.raises(PodgroveError, match="Storage initialization timed out"):
+        proof.wait()
+    assert clock.now == 101
+
+
+def test_readiness_after_init_deadline_is_not_accepted(bound, monkeypatch):
+    kube, anchor, clock = bound
+    pod = initializing(kube)
+    proof = recovery.StartupRecovery(kube, IDENT, anchor, 1920, init_timeout=1)
+    assert proof._observe() is None
+    original = kube.call
+    def late(*args, **kwargs):
+        clock.now += 1
+        pod["status"] = {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}]}
+        return original(*args, **kwargs)
+    monkeypatch.setattr(kube, "call", late)
+    with pytest.raises(PodgroveError, match="Storage initialization timed out"):
+        proof.wait()
+
+
+def test_late_missing_pod_cannot_clear_an_expired_init_deadline(bound, monkeypatch):
+    kube, anchor, clock = bound
+    initializing(kube)
+    proof = recovery.StartupRecovery(kube, IDENT, anchor, 1920, init_timeout=1)
+    assert proof._observe() is None
+    original = kube.call
+    def late(*args, **kwargs):
+        if args[1] == "pod":
+            clock.now += 1
+            kube.objects["pod"] = None
+        return original(*args, **kwargs)
+    monkeypatch.setattr(kube, "call", late)
+    with pytest.raises(PodgroveError, match="Storage initialization timed out"):
+        proof.wait()
+    assert clock.now == 101

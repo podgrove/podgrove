@@ -290,7 +290,7 @@ Omitting `forward` selects all published ports. An explicit list restricts the l
 
 Application ports use `kubectl port-forward`. The Docker API uses a separate loopback proxy over `kubectl exec -i` and the engine's `docker system dial-stdio` Unix-socket connection. This preserves output after stdin EOF for exec, bind sync, and Compose watch hooks. New Pods expose their UID through the downward API; each connection checks it and full ownership is revalidated every 30 seconds. Legacy Pods without that binding use full checks per connection. These are transport details, not additional YAML fields.
 
-Bind/config/secret sources are mirrored through one persistent owned helper exec stream, preserving numeric ownership, modes, and existing file-bind inodes. Startup prepares this connection even when a reconnect has no changed files. Each batch is length-framed and acknowledged after apply; the local baseline advances only on its matching acknowledgement. Uncertain acknowledgement fails without blind replay; explicit `up` resumes from the committed baseline. Compose watch keeps its own `CopyToContainer` sync and declared actions. Neither path uses `kubectl cp`. See [file-sync architecture](architecture.md#storage-and-file-sync).
+Bind/config/secret sources are mirrored through one persistent owned helper exec stream, preserving numeric ownership, executable bits, and existing file-bind inodes. Remote directory permissions are at least `0755` and remote file permissions at least `0644`, so a non-root service can read the mirror. Local permissions remain unchanged. A saved baseline without remote permissions is discarded, triggering a full resync of configured sources that overwrites their remote content. Startup prepares this connection even when a reconnect has no changed files. Each batch is length-framed and acknowledged after apply; the local baseline advances only on its matching acknowledgement. Uncertain acknowledgement fails without blind replay; explicit `up` resumes from the committed baseline. Compose watch keeps its own `CopyToContainer` sync and declared actions. Neither path uses `kubectl cp`. See [file-sync architecture](architecture.md#storage-and-file-sync).
 
 ## CLI overrides
 
@@ -301,7 +301,11 @@ podgrove up --context cluster-name --namespace my-development --project-director
   -f compose.yml -f compose.test.yml --size large --storage 30Gi --timeout 900
 ```
 
-Repeated `-f` replaces the YAML's `compose.files` list; its order is preserved. `--size` overrides the YAML size, and `--node-mode` overrides `node_mode`. `--config PATH` selects another configuration file inside the worktree. `--timeout` defaults to 600 seconds for individual startup stages; total `up` waiting time can be longer because engine readiness, building, and service readiness are separate stages.
+Repeated `-f` replaces the YAML's `compose.files` list; its order is preserved. `--size` overrides the YAML size, and `--node-mode` overrides `node_mode`. `--config PATH` selects another configuration file inside the worktree.
+
+`up --timeout` defaults to 600 seconds for individual startup stages within a larger, bounded startup budget. `up --init-timeout` separately defaults to **300 seconds after the storage initializer starts**. A valid Kubernetes start timestamp counts time already elapsed, including before this invocation; otherwise timing begins when Podgrove observes initialization. Increasing the build/startup timeout does not extend this initializer deadline. Both flags take positive seconds and are CLI options, not YAML keys.
+
+`down --timeout` controls the Kubernetes cleanup budget, defaulting to **120 seconds after local session shutdown**. Local shutdown can add to the command's total duration. If cleanup cannot finish, Podgrove returns nonzero and retains retry state with the last observed remaining objects; rerun `down` after inspecting the cause. See [cleanup and idle expiry](operations.md#cleanup-and-idle-expiry).
 
 Use `podgrove validate` for local validation or `podgrove up --dry-run` for generated manifests without cluster writes. They require a namespace from YAML or a flag but no Kubernetes context, because they do not access the cluster. Other public lifecycle commands require an explicit context from `--context`, `cluster.context`, or the `PODGROVE_CONTEXT` fallback.
 
