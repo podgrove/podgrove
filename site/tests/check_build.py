@@ -8,6 +8,7 @@ from html.parser import HTMLParser
 import json
 from pathlib import Path
 import re
+import struct
 from urllib.parse import unquote, urljoin, urlsplit
 
 SITE = Path(__file__).resolve().parents[1]
@@ -24,12 +25,18 @@ class Document(HTMLParser):
         self.ids: set[str] = set()
         self.references: list[tuple[str, str]] = []
         self.styles: list[str] = []
+        self.metadata: dict[str, list[str]] = {}
+        self.icons: list[dict[str, str]] = []
         self.in_style = False
         self.feed(text)
         self.close()
 
     def handle_starttag(self, tag, attrs):
         values = dict(attrs)
+        if tag == "meta" and (key := values.get("property") or values.get("name")):
+            self.metadata.setdefault(key, []).append(values.get("content", ""))
+        if tag == "link" and values.get("rel") in ("icon", "apple-touch-icon"):
+            self.icons.append(values)
         if values.get("id"):
             self.ids.add(values["id"])
         if tag == "a" and values.get("name"):
@@ -131,11 +138,35 @@ def check_build(dist: Path) -> dict:
                 errors.append(f"{path.relative_to(dist)}: missing anchor: {reference}")
 
     for path, document in documents.items():
+        if path.suffix == ".html":
+            preview = ORIGIN + BASE + "brand/share.png"
+            required = {"og:image": preview, "twitter:image": preview, "og:image:type": "image/png",
+                        "og:image:width": "1200", "og:image:height": "630", "twitter:card": "summary_large_image"}
+            for key, expected in required.items():
+                if document.metadata.get(key) != [expected]:
+                    errors.append(f"{path.relative_to(dist)}: expected one {key} with value {expected}")
+            for key in ("og:image:alt", "twitter:image:alt"):
+                values = document.metadata.get(key, [])
+                if len(values) != 1 or not values[0].strip():
+                    errors.append(f"{path.relative_to(dist)}: missing or ambiguous {key}")
+            for rel, size in (("icon", 48), ("apple-touch-icon", 180)):
+                expected = ORIGIN + BASE + f"brand/icon-{size}.png"
+                if not any(icon.get("rel") == rel and icon.get("href") == expected for icon in document.icons):
+                    errors.append(f"{path.relative_to(dist)}: missing {rel} PNG: {expected}")
+            for key in ("og:image", "twitter:image"):
+                for reference in document.metadata.get(key, []):
+                    check_reference(path, key, reference)
         for kind, reference in document.references:
             check_reference(path, kind, reference)
         for style in document.styles:
             for _, reference in CSS_URL.findall(style):
                 check_reference(path, "inline CSS url", reference)
+    for name, dimensions in (("share", (1200, 630)), ("icon-48", (48, 48)), ("icon-180", (180, 180))):
+        path = dist / "brand" / f"{name}.png"
+        content = path.read_bytes() if path.is_file() else b""
+        if (len(content) < 24 or content[:8] != b"\x89PNG\r\n\x1a\n" or content[12:16] != b"IHDR"
+                or struct.unpack(">II", content[16:24]) != dimensions):
+            errors.append(f"brand/{name}.png: expected a PNG with dimensions {dimensions[0]}x{dimensions[1]}")
     for path in sorted(dist.rglob("*.css")):
         text = re.sub(r"/\*.*?\*/", "", path.read_text(), flags=re.S)
         for _, reference in CSS_URL.findall(text) + CSS_IMPORT.findall(text):

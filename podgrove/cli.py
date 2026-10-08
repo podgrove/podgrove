@@ -13,7 +13,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import __version__, state
+from . import package_version, state
 from .compose import Compose
 from .connect import validate_connectivity
 from .pod_network import check_declaration
@@ -30,6 +30,7 @@ from .repository import configuration_root, worktree_root
 from .session_status import observed
 from .resources import engine_resources, initializer_resources, quantity_text
 from .startup_recovery import capture_anchor
+from .startup_progress import StartupLog
 
 
 def _cleanup_timeout(value: str) -> float:
@@ -57,7 +58,7 @@ def _log_tail(value: str) -> int | str:
 
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="podgrove", description="Run unchanged Docker Compose worktrees on Kubernetes")
-    p.add_argument("--version", action="version", version=__version__)
+    p.add_argument("--version", action="version", version=package_version())
     commands = p.add_subparsers(dest="command", required=True)
     for name in ("up", "status", "env", "logs", "exec", "down", "validate", "doctor", "reap"):
         cmd = commands.add_parser(name)
@@ -126,6 +127,11 @@ def parser() -> argparse.ArgumentParser:
 
 
 def print_state(data: dict, as_json=False) -> None:
+    progress = data.get("startup_progress")
+    if isinstance(progress, dict) and data.get("status") == "starting":
+        started = progress.get("started_at", data.get("created_at", time.time()))
+        if isinstance(started, (float, int)):
+            data = {**data, "startup_progress": {**progress, "elapsed_seconds": round(max(0, time.time() - started), 1)}}
     public = {k: v for k, v in data.items() if k not in ("token", "socket", "docker_host", "startup_anchor")}
     if as_json:
         print(json.dumps(public, indent=2))
@@ -133,6 +139,12 @@ def print_state(data: dict, as_json=False) -> None:
     label = data.get("identity", "unknown")
     root = data.get("root", "")
     print(f"{data['namespace']} / {label}: {data.get('status', 'unknown')}" + (f"  {root}" if root else ""))
+    if data.get("status") == "starting":
+        progress = data.get("startup_progress", {})
+        print(f"  Startup: {progress.get('phase', 'preparing environment')} ({progress.get('elapsed_seconds', 0):g}s elapsed)")
+        for service in progress.get("services", []):
+            detail = f" — {service['progress']}" if service.get("progress") else ""
+            print(f"  {service['service']}: {service['state']}{detail}")
     for port in data.get("ports", []):
         readiness = port.get("status", "unknown")
         print(f"  {port['service']}:{port['target']}  {port['url']}  [{readiness}]")
@@ -146,6 +158,25 @@ def print_state(data: dict, as_json=False) -> None:
         print(f"  Peer access: {data['pod_network_status']['error']}")
     if data.get("error"):
         print(f"  {data['error']}")
+    for diagnostic in data.get("startup_diagnostics", []):
+        print(f"  Startup failure: {diagnostic['service']}")
+        for container in diagnostic["containers"]:
+            health = f"/{container['health']}" if container.get("health") else ""
+            exit_code = container.get("exit_code")
+            restarts = container.get("restart_count")
+            print(f"    {container.get('name') or diagnostic['service']}: {container['state']}{health}; "
+                  f"exit={exit_code if exit_code is not None else 'unknown'}; "
+                  f"restarts={restarts if restarts is not None else 'unknown'}")
+            if container.get("observation_error"):
+                print(f"    Container details unavailable: {container['observation_error']}")
+        if diagnostic.get("logs_error"):
+            print(f"    Logs unavailable: {diagnostic['logs_error']}")
+        elif not diagnostic.get("logs"):
+            print("    No log lines available; the service may not have been created.")
+        for line in diagnostic.get("logs", []):
+            print(f"    {line}")
+    if data.get("startup_status", {}).get("state") == "failed":
+        print("  Fix the service errors above, then run podgrove up again; diagnostics and source sync remain available.")
     if data.get("health_status", {}).get("state") == "unavailable":
         print(f"  Service observations are stale: {data['health_status'].get('error', 'temporarily unavailable')}")
     if data.get("session_log"):
@@ -379,9 +410,13 @@ def up(args, root: Path) -> int:
                 "resources": budget, "init_resources": init_budget,
                 "storage": {"size": storage_size, "storage_class": effective_storage_class},
                 "compose_fingerprint": fingerprint.digest, "compose_fingerprint_format": FINGERPRINT_FORMAT,
-                "podgrove_version": __version__,
+                "podgrove_version": package_version(),
                 "created_at": time.time()}
+        data["startup_progress"] = {"phase": "creating engine resources", "started_at": data["created_at"],
+                                    "updated_at": data["created_at"], "elapsed_seconds": 0,
+                                    "services": [{"service": name, "state": "pending"} for name in sorted(model["services"])]}
         state.write(path, data)
+        startup_log = StartupLog(path.with_suffix(".log"))
         try:
             kube.create_environment(resources, ident)
             data["startup_anchor"] = capture_anchor(kube, ident)
@@ -395,6 +430,13 @@ def up(args, root: Path) -> int:
         deadline = time.monotonic() + args.timeout * 3 + 120
         while time.monotonic() < deadline:
             data = state.read(path)
+            final = data["status"] != "starting"
+            while True:
+                output = startup_log.read(final=final)
+                if output:
+                    print(output, file=sys.stderr, end="", flush=True)
+                if not final or not startup_log.has_more:
+                    break
             if data["status"] == "ready":
                 print_state(data, args.json)
                 return 0
@@ -612,11 +654,24 @@ def execute(args) -> int:
     if data.get("status") == "starting" or (connected and not data.get("docker_host")):
         starting = data.get("status") == "starting"
         data["session_log"] = str(path.with_suffix(".log"))
+        if starting and not connected:
+            created = data.get("created_at")
+            budget = data.get("timeout", 600)
+            provisioning = ("pid" not in data and isinstance(created, (float, int))
+                            and isinstance(budget, (float, int)) and 0 < budget < float("inf")
+                            and -5 <= time.time() - created <= budget)
+            if not provisioning:
+                phase = data.get("startup_progress", {}).get("phase", "startup")
+                detail = ("Startup supervisor is unreachable" if "pid" in data else
+                          "Startup supervisor did not become available within the provisioning timeout")
+                data.update(status="error", error=f"{detail} during {phase}; inspect the session log. "
+                            "Resources are retained; run podgrove up to reconnect.")
+                starting = False
         if not starting and data.get("status") != "error":
             data.update(status="error", error="Session Docker endpoint is not available")
         if args.command == "status":
             print_state(data, args.json)
-            return 1
+            return 0 if starting and data.get("startup_status", {}).get("state") != "failed" else 1
         detail = "Environment is still starting" if starting else "Session Docker endpoint is not available"
         raise PodgroveError(f"{detail}; inspect the session log at {data['session_log']} and run podgrove status")
     try:
@@ -663,6 +718,12 @@ def execute(args) -> int:
             return 1
         data["health_status"] = {"state": "ready", "checked_at": time.time(), "last_success_at": time.time()}
         ready, problems = readiness(compose.model(), data["services"])
+        if ready and data.get("startup_status", {}).get("state") == "failed":
+            startup_error = data["startup_status"].get("error")
+            data["startup_status"] = {**data["startup_status"], "state": "ready", "error": None}
+            data.pop("startup_diagnostics", None)
+            if data.get("error") == startup_error:
+                data.pop("error", None)
         data["status"] = "ready" if ready else "unhealthy"
         data = observed(data, connected=True)
         data["problems"] = problems

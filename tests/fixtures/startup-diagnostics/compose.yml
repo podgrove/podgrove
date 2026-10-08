@@ -1,0 +1,31 @@
+x-service: &service
+  image: python:3.12-alpine
+  user: "1000:1000"
+  volumes:
+    - ./server.py:/server.py:ro
+    - ./content:/fixture:ro
+  ports:
+    - "8080"
+  healthcheck:
+    test: ["CMD", "test", "-f", "/tmp/startup-ready"]
+    interval: 1s
+    timeout: 1s
+    retries: 1
+services:
+  readable:
+    <<: *service
+    image: podgrove-diagnostics-fixture
+    build: .
+    command: ["python", "-u", "/server.py", "readable"]
+  exited:
+    <<: *service
+    depends_on:
+      readable:
+        condition: service_healthy
+    command: ["python", "-u", "/server.py", "exited"]
+  unhealthy:
+    <<: *service
+    depends_on:
+      readable:
+        condition: service_healthy
+    command: ["python", "-u", "/server.py", "unhealthy"]

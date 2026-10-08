@@ -83,6 +83,7 @@ include podgrove/reverse.py
 include podgrove/reverse_protocol.py
 include podgrove/runtime.py
 include podgrove/session_status.py
+include podgrove/startup_progress.py
 include podgrove/startup_recovery.py
 include podgrove/state.py
 include podgrove/sync.py
@@ -105,6 +106,7 @@ include schema/podgrove-v1.schema.json
 include scripts/check_connectivity.py
 include scripts/check_exec_stream.py
 include scripts/check_pod_network.py
+include scripts/check_startup_diagnostics.py
 include scripts/check_startup_recovery.py
 include scripts/e2e.py
 include scripts/homebrew_formula.py
@@ -128,6 +130,7 @@ include site/public/favicon.svg
 include site/scripts/links.mjs
 include site/scripts/pages.mjs
 include site/scripts/prepare.mjs
+include site/scripts/sharing.mjs
 include site/src/assets/logo-dark.svg
 include site/src/assets/logo-light.svg
 include site/src/assets/logo.svg
@@ -140,6 +143,7 @@ include site/src/styles/custom.css
 include site/tests/browser.py
 include site/tests/check_build.py
 include site/tests/links.test.mjs
+include site/tests/sharing.test.mjs
 include site/tsconfig.json
 include tests/README.md
 include tests/fixtures/invalid/compose.yml
@@ -160,6 +164,9 @@ include tests/fixtures/parity/single.txt
 include tests/fixtures/recovery/compose.yml
 include tests/fixtures/recovery/content/seed.txt
 include tests/fixtures/recovery/server.py
+include tests/fixtures/startup-diagnostics/Dockerfile
+include tests/fixtures/startup-diagnostics/compose.yml
+include tests/fixtures/startup-diagnostics/server.py
 include tests/fixtures/watch/Dockerfile
 include tests/fixtures/watch/compose.hook.yml
 include tests/fixtures/watch/compose.yml
@@ -171,6 +178,7 @@ include tests/test_activity.py
 include tests/test_bootstrap.py
 include tests/test_check_connectivity.py
 include tests/test_check_pod_network.py
+include tests/test_check_startup_diagnostics.py
 include tests/test_check_startup_recovery.py
 include tests/test_cli.py
 include tests/test_cli_portability.py
@@ -222,6 +230,7 @@ include tests/test_runtime_cleanup_review.py
 include tests/test_runtime_recovery.py
 include tests/test_soak_forwarding.py
 include tests/test_startup_cancel.py
+include tests/test_startup_observability.py
 include tests/test_startup_progress.py
 include tests/test_startup_recovery.py
 include tests/test_startup_resume.py
@@ -235,6 +244,7 @@ include tests/test_sync_recovery.py
 include tests/test_sync_transport_review.py
 include tests/test_tunnel_config.py
 include tests/test_verify_package.py
+include tests/test_version.py
 include tests/test_web.py
 include tests/test_web_browser.py
 include tests/test_web_settings.py

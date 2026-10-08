@@ -546,18 +546,51 @@ def test_matching_version_cannot_hide_modified_installation(wheel_install, chang
         soak.verify_wheel_payload(venv, wheel, receipt)
 
 
-def test_subprocess_cleanup_kills_inheriting_helper_after_leader_exits(tmp_path):
+def test_subprocess_cleanup_kills_inheriting_helper_after_leader_exits(tmp_path, monkeypatch):
     pid_file, marker = tmp_path / "pid", tmp_path / "survived"
-    script = ("import os,time,pathlib; child=os.fork();\n"
+    release = tmp_path / "release"
+    script = ("import os,time,pathlib; time.sleep(.3); child=os.fork();\n"
               "if child: os._exit(0)\n"
               f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
-              f"time.sleep(.5); pathlib.Path({str(marker)!r}).write_text('leaked')\n")
+              f"while not pathlib.Path({str(release)!r}).exists(): time.sleep(.01)\n"
+              f"pathlib.Path({str(marker)!r}).write_text('leaked'); time.sleep(60)\n")
+    command = [sys.executable, "-c", script]
+    original = subprocess.Popen
+    children, started = [], []
+
+    def launch(args, **kwargs):
+        process = original(args, **kwargs)
+        if args == command:
+            children.append(process)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    ready = pid_file.read_text().strip().isdigit()
+                except FileNotFoundError:
+                    ready = False
+                if ready and process.poll() is not None:
+                    assert process.returncode == 0
+                    started.append(time.monotonic())
+                    break
+                time.sleep(.01)
+            else:
+                pytest.fail("Inheriting-helper fixture did not start and outlive its leader")
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", launch)
     try:
         with pytest.raises(soak.Refused, match="timed out"):
-            soak.read_command([sys.executable, "-c", script], dict(os.environ), threading.Event(), timeout=.15)
-        time.sleep(.55)
-        assert pid_file.exists() and not marker.exists()
+            soak.read_command(command, dict(os.environ), threading.Event(), timeout=.15)
+        assert time.monotonic() - started[0] < 2
+        release.touch()
+        helper = int(pid_file.read_text())
+        status = subprocess.run(["ps", "-o", "stat=", "-p", str(helper)], capture_output=True, text=True, timeout=2)
+        assert status.stdout.strip() in ("", "Z", "Z+")
+        assert not marker.exists()
     finally:
+        for child in children:
+            soak.stop_process(child)
+            child.stdout.close()
         if pid_file.exists():
             try:
                 os.kill(int(pid_file.read_text()), signal.SIGKILL)

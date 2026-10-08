@@ -120,7 +120,7 @@ class TarStream:
                 if selector.select(timeout=0):
                     try:
                         chunk = os.read(self.process.stdout.fileno(), 1)
-                    except BlockingIOError:
+                    except (BlockingIOError, InterruptedError):
                         return
                     except OSError:
                         chunk = b""
@@ -172,12 +172,18 @@ class TarStream:
                                     raise self._error("local archive ended before its declared length")
                                 remaining -= len(chunk)
                                 pending = memoryview(chunk)
-                            written = os.write(self.process.stdin.fileno(), pending)
+                            try:
+                                written = os.write(self.process.stdin.fileno(), pending)
+                            except (BlockingIOError, InterruptedError):
+                                continue
                             pending = pending[written:]
                             if not pending and not remaining:
                                 selector.unregister(self.process.stdin)
                         else:
-                            chunk = os.read(self.process.stdout.fileno(), 4096)
+                            try:
+                                chunk = os.read(self.process.stdout.fileno(), 4096)
+                            except (BlockingIOError, InterruptedError):
+                                continue
                             if not chunk:
                                 self._reader.join(timeout=0.1)
                                 raise self._error("closed before acknowledging its batch; reconnect required")

@@ -12,7 +12,7 @@ def observed(data: dict, *, connected: bool | None = None, ping: dict | None = N
         if ping.get("ok") is True and ping.get("status") in ("starting", "ready", "degraded", "unhealthy", "error", "disconnected"):
             result["status"] = ping["status"]
         for key in ("forward_status", "sync_status", "health_status", "docker_status", "heartbeat_status",
-                    "startup_status", "connectivity_status", "pod_network_status"):
+                    "startup_status", "startup_progress", "connectivity_status", "pod_network_status"):
             if isinstance(ping.get(key), dict):
                 result[key] = dict(ping[key])
         if isinstance(ping.get("pod_network_status"), dict):

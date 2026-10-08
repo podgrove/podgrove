@@ -28,6 +28,7 @@ from .sync import SnapshotRace, Synchronizer
 from .sync_recovery import SyncRecoveryUnavailable, verify_engine as verify_sync_engine
 from .sync_transport import SyncStreamError
 from .startup_recovery import StartupRecovery
+from .startup_progress import StartupProgress
 
 HEALTH_INTERVAL = 30.0
 HEARTBEAT_RETRY_DELAYS = (1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
@@ -293,14 +294,14 @@ def _remote_build_output(output: str) -> str:
         r"\s*View build details:\s+docker-desktop://dashboard/build/\S+\s*", line))
 
 
-def _startup_phase(message: str) -> None:
-    # Fixed phase labels only: never print configuration, credentials or argv.
-    # The detached supervisor writes to a buffered file, so flush before work.
+def _startup_phase(message: str, progress=None) -> None:
     print(f"Startup: {message}", flush=True)
+    if progress is not None:
+        progress.set_phase(message)
 
 
 def launch_stack(compose: Compose, model: dict, env: dict, ident: str, timeout: int = 600, *,
-                 deadline=None, cancel_event=None):
+                 deadline=None, cancel_event=None, progress=None):
     deadline = deadline if deadline is not None else time.monotonic() + timeout * 3 + 120
     cancel = cancel_event if cancel_event is not None else threading.Event()
     _startup_remaining(deadline, cancel)
@@ -311,12 +312,19 @@ def launch_stack(compose: Compose, model: dict, env: dict, ident: str, timeout: 
                       for name, dependency in svc.get("depends_on", {}).items()
                       if isinstance(dependency, dict)
                       and dependency.get("condition") == "service_completed_successfully"}
+    def build_output(stream, line):
+        if _remote_build_output(line):
+            print(line, file=sys.stderr if stream == "stderr" else sys.stdout, flush=True)
+            if progress is not None:
+                progress.output(line)
+
+    build_env = dict(env, BUILDKIT_PROGRESS="plain", COMPOSE_PROGRESS="plain")
     try:
-        _startup_phase("copying the initial workspace snapshot")
+        _startup_phase("copying the initial workspace snapshot", progress)
         _initial_sync(sync, min(deadline, time.monotonic() + timeout), cancel)
         mirrored = True
         if getattr(compose, "recover_existing", False) is True:
-            _startup_phase("checking existing Compose services")
+            _startup_phase("checking existing Compose services", progress)
             previous = service_status(compose, env, deadline=deadline, cancel_event=cancel)
             failed = sorted({row["Service"] for row in previous
                              if row.get("Service") in model["services"]
@@ -325,24 +333,22 @@ def launch_stack(compose: Compose, model: dict, env: dict, ident: str, timeout: 
                              and not (row["Service"] in completed_jobs and row.get("State") == "exited"
                                       and int(row.get("ExitCode", 1)) == 0)})
             if failed:
-                _startup_phase("recreating failed Compose services after source synchronization")
+                _startup_phase("recreating failed Compose services after source synchronization", progress)
                 run(compose.command("up", "--detach", "--build", "--force-recreate", "--no-deps", *failed),
-                    env=env, cwd=compose.config.root, timeout=min(timeout, _startup_remaining(deadline, cancel)),
-                    cancel_event=cancel)
-        _startup_phase("building and starting Compose services")
-        result = run(compose.command("up", "--detach", "--build"), env=env, cwd=compose.config.root,
-                     timeout=min(timeout, _startup_remaining(deadline, cancel)), cancel_event=cancel)
-        stdout, stderr = _remote_build_output(result.stdout), _remote_build_output(result.stderr)
-        if stdout:
-            print(stdout, flush=True)
-        if stderr:
-            print(stderr, file=sys.stderr, flush=True)
+                    env=build_env, cwd=compose.config.root, timeout=min(timeout, _startup_remaining(deadline, cancel)),
+                    cancel_event=cancel, on_output=build_output)
+        _startup_phase("building and starting Compose services", progress)
+        run(compose.command("up", "--detach", "--build"), env=build_env, cwd=compose.config.root,
+            timeout=min(timeout, _startup_remaining(deadline, cancel)), cancel_event=cancel,
+            on_output=build_output)
         _startup_remaining(deadline, cancel)
-        _startup_phase("waiting for Compose service readiness")
+        _startup_phase("waiting for Compose service readiness", progress)
         health_deadline = min(deadline, time.monotonic() + timeout)
         while True:
             rows = service_status(compose, env, deadline=health_deadline, cancel_event=cancel)
             _startup_remaining(health_deadline, cancel)
+            if progress is not None:
+                progress.observe(rows)
             ready, problems = readiness(model, rows)
             if ready:
                 return sync, time.monotonic() - started, rows
@@ -365,6 +371,53 @@ def launch_stack(compose: Compose, model: dict, env: dict, ident: str, timeout: 
         except Exception as cleanup_error:
             print(f"Sync cleanup after stack failure: {cleanup_error}", file=sys.stderr, flush=True)
         raise
+
+
+def startup_diagnostics(compose, model, env, rows, *, cancel_event=None):
+    """Bound diagnostic reads while retaining every failed or missing service."""
+    deadline = time.monotonic() + 30
+    diagnostics = []
+    jobs = {name for service in model["services"].values() for name, dependency in service.get("depends_on", {}).items()
+            if isinstance(dependency, dict) and dependency.get("condition") == "service_completed_successfully"}
+    for name, service in model["services"].items():
+        replicas = service.get("deploy", {}).get("replicas", service.get("scale", 1))
+        if replicas == 0:
+            continue
+        matches = [row for row in rows if row.get("Service") == name]
+        failed = [row for row in matches if not (
+            name in jobs and row.get("State") == "exited" and row.get("ExitCode") == 0
+            or name not in jobs and row.get("State") == "running" and row.get("Health", "") in ("", "healthy"))]
+        if len(matches) < replicas:
+            failed.append({"State": "not created", "MissingReplicas": replicas - len(matches)})
+        if not failed:
+            continue
+        item = {"service": name, "containers": [], "logs": []}
+        for row in failed:
+            container = {"name": row.get("Name"), "state": row.get("State", "unknown"),
+                         "health": row.get("Health", ""), "exit_code": row.get("ExitCode"),
+                         "restart_count": row.get("RestartCount"), "missing_replicas": row.get("MissingReplicas", 0)}
+            ident = row.get("ID")
+            if ident:
+                try:
+                    output = run(["docker", "inspect", "--format",
+                                  '{"restart_count":{{json .RestartCount}},"exit_code":{{json .State.ExitCode}}}', ident],
+                                 env=env, timeout=min(5, _startup_remaining(deadline, cancel_event)),
+                                 cancel_event=cancel_event).stdout
+                    inspected = json.loads(output)
+                    container.update({key: inspected[key] for key in ("restart_count", "exit_code")})
+                except (PodgroveError, ValueError, TypeError, KeyError) as error:
+                    container["observation_error"] = str(error)
+            item["containers"].append(container)
+        try:
+            result = run(compose.command("logs", "--no-color", "--tail", "40", name), env=env,
+                         cwd=compose.config.root, timeout=min(5, _startup_remaining(deadline, cancel_event)),
+                         cancel_event=cancel_event)
+            output = result.stdout if isinstance(result.stdout, str) else ""
+            item["logs"] = output.splitlines()[-40:]
+        except PodgroveError as error:
+            item["logs_error"] = str(error)
+        diagnostics.append(item)
+    return diagnostics
 
 
 def partial_port_plan(compose, model, rows, ident):
@@ -523,6 +576,13 @@ def serve(path: Path) -> int:
                     or data.get("docker_status", {}).get("verification", {}).get("state") in ("unavailable", "expired"))
         data["status"] = "degraded" if degraded else "ready" if services_ready else "unhealthy"
 
+    def startup_changed(current):
+        with activity_lock:
+            data["startup_progress"] = current
+            persist()
+
+    progress = StartupProgress(startup_changed, data.get("created_at"))
+
     def forward_changed(current):
         with activity_lock:
             data["forward_status"] = current
@@ -583,6 +643,8 @@ def serve(path: Path) -> int:
                                 response["sync_status"] = sync_worker.status()
                             elif "sync_status" in data:  # ready is published just before the sync worker exists
                                 response["sync_status"] = dict(data["sync_status"])
+                            if "startup_progress" in data:
+                                response["startup_progress"] = dict(data["startup_progress"])
                             if "health_status" in data:
                                 response["health_status"] = dict(data["health_status"])
                             if "heartbeat_status" in data:
@@ -611,12 +673,13 @@ def serve(path: Path) -> int:
         persist()
         controller = threading.Thread(target=handle_control, name="podgrove-control", daemon=True)
         controller.start()
-        _startup_phase("loading and validating Compose configuration")
+        _startup_phase("loading and validating Compose configuration", progress)
         config = load_config(state.configuration_root(data), Path(data["config_path"]) if data.get("config_path") else None,
                              data.get("files"))
         compose = Compose(config)
         model = compose.model()
         compose.validate(model)
+        progress.configure(model)
         from .network import validate_model as validate_network_model
         validate_network_model(config.network, model)
         compose.recover_existing = True
@@ -628,7 +691,7 @@ def serve(path: Path) -> int:
         startup_failure, startup_attempts = None, 0
         while True:
             _startup_remaining(startup_deadline, startup_cancel)
-            _startup_phase("waiting for engine Pod readiness")
+            _startup_phase("waiting for engine Pod readiness", progress)
             if recovery is None:
                 kube.wait(data["identity"], data["timeout"],
                           init_timeout=data.get("init_timeout", DEFAULT_INIT_TIMEOUT))
@@ -638,7 +701,7 @@ def serve(path: Path) -> int:
             try:
                 _startup_remaining(startup_deadline, startup_cancel)
                 api_port = free_port()
-                _startup_phase("opening the Docker API connection")
+                _startup_phase("opening the Docker API connection", progress)
                 opening = DockerTunnel(_StartupKube(kube, startup_deadline, startup_cancel), data["identity"], api_port)
                 try:
                     api_tunnel = opening.start()
@@ -663,7 +726,7 @@ def serve(path: Path) -> int:
                                                   (observed.get("statefulset_uid"), observed.get("pod_uid")))
                 persist()
                 env = docker_environment(f"tcp://127.0.0.1:{api_port}")
-                _startup_phase("checking Docker engine readiness")
+                _startup_phase("checking Docker engine readiness", progress)
                 run(["docker", "info"], env=env,
                     timeout=min(30, _startup_remaining(startup_deadline, startup_cancel)),
                     cancel_event=startup_cancel)
@@ -680,7 +743,7 @@ def serve(path: Path) -> int:
                     data["connectivity_status"] = {"state": "disabled"}
                 timeout = min(data["timeout"], recovery.remaining()) if recovery else data["timeout"]
                 sync, elapsed, rows = launch_stack(compose, model, env, data["identity"], timeout,
-                                                   deadline=startup_deadline, cancel_event=startup_cancel)
+                                                   deadline=startup_deadline, cancel_event=startup_cancel, progress=progress)
                 observed_uid = recovery.wait() if recovery else selected_uid
                 if observed_uid != selected_uid:
                     raise EngineReplacedError((recovery.anchor["statefulset_uid"], selected_uid),
@@ -714,7 +777,7 @@ def serve(path: Path) -> int:
                                               "error": "Owned engine Pod replaced during startup; remirroring before retry"}
                     data.pop("error", None)
                     persist()
-                    _startup_phase("retrying startup on the verified replacement engine Pod")
+                    _startup_phase("retrying startup on the verified replacement engine Pod", progress)
                     continue
                 if changed:
                     raise PodgroveError("Startup engine was replaced repeatedly; bounded startup retries exhausted") from error
@@ -723,6 +786,10 @@ def serve(path: Path) -> int:
                     startup_failure = str(error)
                     break
                 raise
+        if startup_failure:
+            data["startup_diagnostics"] = startup_diagnostics(compose, model, env, rows, cancel_event=startup_cancel)
+            progress.observe(rows)
+            persist()
         # Capture the original engine proof, not a later same-name replacement.
         # The sync event cancels these reads before the worker is joined.
         captured_identity = getattr(api_tunnel, "identity_snapshot", lambda: {})()
@@ -744,7 +811,7 @@ def serve(path: Path) -> int:
                            observed=rows, project=model.get("name")))
         _startup_remaining(startup_deadline, startup_cancel)
         if ports:
-            _startup_phase("opening application port forwards")
+            _startup_phase("opening application port forwards", progress)
             app_tunnel = Tunnel(kube, data["identity"], [(p["local"], p["published"]) for p in ports])
             app_tunnel.on_change = forward_changed
             try:
@@ -770,7 +837,7 @@ def serve(path: Path) -> int:
                                       "changed_at": time.time(), "checked_at": time.time()}
         _startup_remaining(startup_deadline, startup_cancel)
         if compose.has_watch(model) and startup_failure is None:
-            _startup_phase("starting Compose watch")
+            _startup_phase("starting Compose watch", progress)
             watch = subprocess.Popen(compose.command("watch", "--no-up"), env=env, cwd=config.root,
                                      stdin=subprocess.DEVNULL)
         watch_activity = WatchActivity(model)
@@ -890,6 +957,7 @@ def serve(path: Path) -> int:
                         if ready and data.get("startup_status", {}).get("state") == "failed":
                             data["startup_status"].update(state="ready", error=None)
                             data.pop("error", None)
+                            data.pop("startup_diagnostics", None)
                         data["health_status"] = {"state": "ready", "checked_at": time.time(),
                                                  "last_success_at": time.time()}
                         data["problems"] = problems

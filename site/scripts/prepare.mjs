@@ -2,6 +2,7 @@ import { mkdir, readFile, rm, writeFile, copyFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { resolve, dirname } from 'node:path';
 import { pages, repository } from './pages.mjs';
+import { prepareSharingAssets } from './sharing.mjs';
 
 const site = fileURLToPath(new URL('../', import.meta.url));
 const root = resolve(site, '..');
@@ -32,4 +33,5 @@ for (const [name, directory] of [
   await mkdir(dirname(output), { recursive: true });
   await copyFile(resolve(root, 'docs/assets', name), output);
 }
+await prepareSharingAssets(root, resolve(site, 'public'));
 console.log(`Prepared ${pages.length} documentation pages from repository Markdown.`);

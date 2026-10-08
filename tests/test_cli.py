@@ -249,7 +249,7 @@ def test_starting_commands_report_startup_before_compose_or_docker(project, monk
     monkeypatch.setattr(cli, "Kube", Mock())
     flags = ["--json"] if command == "status" else ["app", *(["--", "true"] if command == "exec" else [])]
     if command == "status":
-        assert cli.execute(lifecycle_args(project, command, *flags)) == 1
+        assert cli.execute(lifecycle_args(project, command, *flags)) == 0
         result = json.loads(capsys.readouterr().out)
         assert result["status"] == "starting"
         assert result["session_log"] == str(path.with_suffix(".log"))
