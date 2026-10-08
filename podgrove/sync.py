@@ -110,13 +110,6 @@ while IFS= read -r -d '' rel; do
 done < "$stage/control/files"
 while IFS= read -r -d '' rel; do
     check_path "$rel"
-    [ ! -e "$target" ] || [ -f "$target" ] || fail "Remote non-file blocks sync: $rel"
-    if [ -f "$target" ]; then
-        chmod "$(stat -c %a "$stage/payload/$rel")" "$target"
-    fi
-done < "$stage/control/file_modes"
-while IFS= read -r -d '' rel; do
-    check_path "$rel"
     chown "$(stat -c %u:%g "$stage/payload/$rel")" "$target"
     chmod "$(stat -c %a "$stage/payload/$rel")" "$target"
 done < "$stage/control/directory_modes"
@@ -560,6 +553,8 @@ class Synchronizer:
                     for path, entry in self._baseline.items():
                         if not isinstance(entry, dict) or entry.get("kind") not in ("file", "directory"):
                             raise ValueError(f"invalid baseline entry: {path}")
+                    if any("remote_mode" not in entry for entry in self._baseline.values()):
+                        self._baseline = {}
                 except (ValueError, KeyError, AttributeError, TypeError) as exc:
                     raise PodgroveError("Invalid remote sync baseline; recreate this environment") from exc
             self._started = True
@@ -588,7 +583,7 @@ class Synchronizer:
     @staticmethod
     def _content_equal(before: dict, after: dict) -> bool:
         return (all(before.get(key) == after.get(key) for key in ("kind", "mode", "digest", "uid", "gid"))
-                and before.get("remote_mode", before.get("mode")) == after.get("remote_mode", after.get("mode")))
+                and before["remote_mode"] == after["remote_mode"])
 
     def sync_once(self) -> int:
         """Apply local edits, additions and tracked deletions; return their count."""
@@ -616,11 +611,7 @@ class Synchronizer:
             self.activity_callback()
         directories = sorted((p for p, e in current.items() if e["kind"] == "directory"),
                              key=lambda p: (p.count("/"), p))
-        # Repair old mirror permissions without replaying unchanged file contents.
-        file_modes = sorted(p for p in changed if current[p]["kind"] == "file" and p in self._baseline
-                            and all(current[p].get(key) == self._baseline[p].get(key)
-                                    for key in ("kind", "mode", "digest", "uid", "gid")))
-        files = sorted({p for p in changed if current[p]["kind"] == "file"} - set(file_modes))
+        files = sorted(p for p in changed if current[p]["kind"] == "file")
         directory_modes = sorted((p for p in changed if current[p]["kind"] == "directory"),
                                  key=lambda p: (-p.count("/"), p))
         removed = sorted(deleted, key=lambda p: (-p.count("/"), p))
@@ -629,7 +620,7 @@ class Synchronizer:
         with tempfile.TemporaryFile() as archive:
             with tarfile.open(fileobj=archive, mode="w") as tar:
                 for name, paths in (("deleted", removed), ("directories", directories),
-                                    ("files", files), ("file_modes", file_modes), ("directory_modes", directory_modes)):
+                                    ("files", files), ("directory_modes", directory_modes)):
                     data = b"".join(os.fsencode(path) + b"\0" for path in paths)
                     self._add_bytes(tar, f"podgrove-transfer/control/{name}", data)
                 self._add_bytes(tar, "podgrove-transfer/control/baseline.json", metadata)
@@ -644,9 +635,6 @@ class Synchronizer:
                 for relative in files:
                     self._check_cancelled()
                     self._add_file(tar, relative, current[relative])
-                for relative in file_modes:
-                    self._check_cancelled()
-                    self._add_file(tar, relative, current[relative], contents=False)
             archive.seek(0)
             # Reuse the UID-guarded Docker exec stream for the whole session.
             # Only a matching post-commit acknowledgement advances our baseline.
@@ -667,7 +655,7 @@ class Synchronizer:
         info.mode = 0o600
         tar.addfile(info, io.BytesIO(data))
 
-    def _add_file(self, tar: tarfile.TarFile, relative: str, entry: dict, *, contents: bool = True) -> None:
+    def _add_file(self, tar: tarfile.TarFile, relative: str, entry: dict) -> None:
         path = self.root / relative
         try:
             fd = self._open_file(path)
@@ -678,13 +666,13 @@ class Synchronizer:
                 ):
                     raise SnapshotRace(f"File changed while preparing sync; retry: {path}")
                 info = tarfile.TarInfo(f"podgrove-transfer/payload/{relative}")
-                info.size = actual.st_size if contents else 0
+                info.size = actual.st_size
                 info.mode = entry["remote_mode"]
                 info.uid = entry["uid"]
                 info.gid = entry["gid"]
                 info.mtime = actual.st_mtime
                 try:
-                    tar.addfile(info, stream if contents else None)
+                    tar.addfile(info, stream)
                 except OSError as exc:
                     if self._fingerprint(os.fstat(stream.fileno())) != self._fingerprint(actual):
                         raise SnapshotRace(f"File changed while preparing sync; retry: {path}") from exc

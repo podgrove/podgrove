@@ -178,47 +178,45 @@ def test_incremental_sync_normalizes_new_paths_and_chmod_only_changes(tmp_path):
     assert sync.sync_once() == 0
 
 
-def test_reconnect_repairs_old_private_modes_without_resending_unchanged_contents(tmp_path):
-    tmp_path.chmod(0o755)
+@pytest.mark.parametrize("missing_path", [".", "shared", "shared/module.py", "all"])
+@pytest.mark.parametrize("directory_mode,file_mode", [(0o700, 0o600), (0o755, 0o644)])
+def test_missing_remote_mode_invalidates_entire_baseline_and_resyncs(tmp_path, missing_path,
+                                                                  directory_mode, file_mode):
+    tmp_path.chmod(directory_mode)
     directory = tmp_path / "shared"
-    directory.mkdir(mode=0o700)
+    directory.mkdir(mode=directory_mode)
     source = directory / "module.py"
     source.write_text("original local contents")
-    source.chmod(0o600)
+    source.chmod(file_mode)
+    other = directory / "other.py"
+    other.write_text("unchanged other contents")
+    other.chmod(file_mode)
     first = FakeSynchronizer(tmp_path, [directory])
     first.start()
     saved = json.loads(first.remote_baseline)
-    for entry in saved["entries"].values():
-        entry.pop("remote_mode", None)
+    missing_paths = saved["entries"] if missing_path == "all" else [missing_path]
+    for path in missing_paths:
+        del saved["entries"][path]["remote_mode"]
     second = FakeSynchronizer(tmp_path, [directory])
     second.remote_baseline = json.dumps(saved).encode()
     second.start()
-    assert control(second, "files") == []
-    assert control(second, "file_modes") == ["shared/module.py"]
-    assert control(second, "directory_modes") == ["shared"]
-    assert second.transfers[-1]["podgrove-transfer/payload/shared/module.py"] == b""
-    assert second.transfer_metadata[-1]["podgrove-transfer/payload/shared/module.py"][2] == 0o644
-    assert second.transfer_metadata[-1]["podgrove-transfer/payload/shared"][2] == 0o755
+    assert len(second.transfers) == 1
+    assert control(second, "files") == ["shared/module.py", "shared/other.py"]
+    assert control(second, "directory_modes") == [".", "shared"]
+    assert control(second, "deleted") == []
+    assert second.transfers[-1]["podgrove-transfer/payload/shared/module.py"] == b"original local contents"
+    assert second.transfers[-1]["podgrove-transfer/payload/shared/other.py"] == b"unchanged other contents"
+    assert second.transfer_metadata[-1]["podgrove-transfer/payload/shared/module.py"][2] == file_mode | 0o644
+    assert second.transfer_metadata[-1]["podgrove-transfer/payload/shared"][2] == directory_mode | 0o755
+    assert all("remote_mode" in entry for entry in json.loads(second.remote_baseline)["entries"].values())
+    assert source.stat().st_mode & 0o777 == file_mode
+    assert directory.stat().st_mode & 0o777 == directory_mode
     assert second.sync_once() == 0
 
 
-def test_reconnect_keeps_an_already_readable_old_mirror_unchanged(tmp_path):
-    tmp_path.chmod(0o755)
-    source = tmp_path / "module.py"
-    source.write_text("original local contents")
-    source.chmod(0o644)
-    first = FakeSynchronizer(tmp_path, [source])
-    first.start()
-    saved = json.loads(first.remote_baseline)
-    for entry in saved["entries"].values():
-        entry.pop("remote_mode", None)
-    second = FakeSynchronizer(tmp_path, [source])
-    second.remote_baseline = json.dumps(saved).encode()
-    second.start()
-    assert second.transfers == []
-
-
-def test_real_apply_normalizes_modes_and_upgrades_without_overwriting_remote_edits(tmp_path, monkeypatch):
+@pytest.mark.parametrize("invalidate_baseline", [False, True])
+def test_real_apply_resyncs_invalid_baseline_but_preserves_valid_remote_edits(tmp_path, monkeypatch,
+                                                                          invalidate_baseline):
     from podgrove.sync import _APPLY, _RECEIVE
     gnu_stat = shutil.which("gstat") or (shutil.which("stat") if sys.platform.startswith("linux") else None)
     if not gnu_stat:
@@ -261,16 +259,19 @@ def test_real_apply_normalizes_modes_and_upgrades_without_overwriting_remote_edi
     target.chmod(0o600)
     target.parent.chmod(0o700)
     saved = json.loads(first.remote_baseline)
-    for entry in saved["entries"].values():
-        entry.pop("remote_mode", None)
+    if invalidate_baseline:
+        del saved["entries"]["middleware/module.py"]["remote_mode"]
+    remote_only = target.parent / "generated.txt"
+    remote_only.write_text("remote-only contents")
     resumed = FakeSynchronizer(local, [directory])
     resumed.remote_baseline = json.dumps(saved).encode()
     apply_with(resumed)
     resumed.start()
-    assert target.read_text() == "retained remote edit"
+    assert target.read_text() == ("initial" if invalidate_baseline else "retained remote edit")
     assert target.stat().st_ino == inode
-    assert target.stat().st_mode & 0o777 == 0o644
-    assert target.parent.stat().st_mode & 0o777 == 0o755
+    assert target.stat().st_mode & 0o777 == (0o644 if invalidate_baseline else 0o600)
+    assert target.parent.stat().st_mode & 0o777 == (0o755 if invalidate_baseline else 0o700)
+    assert remote_only.read_text() == "remote-only contents"
     assert source.stat().st_mode & 0o777 == 0o600
     source.write_text("local update")
     source.chmod(0o700)
@@ -768,7 +769,7 @@ def test_framed_truncation_after_tar_eof_never_applies_or_commits(tmp_path):
         before = sync._docker("exec", sync.container, "cat", "/metadata/baseline.json").stdout
         archive = io.BytesIO()
         with tarfile.open(fileobj=archive, mode="w") as tar:
-            for name, content in (("deleted", b""), ("directories", b".\0"), ("files", b"file\0"), ("file_modes", b""),
+            for name, content in (("deleted", b""), ("directories", b".\0"), ("files", b"file\0"),
                                   ("directory_modes", b""), ("baseline.json", b"must not commit")):
                 sync._add_bytes(tar, "podgrove-transfer/control/" + name, content)
             sync._add_bytes(tar, "podgrove-transfer/payload/file", b"must not apply")
