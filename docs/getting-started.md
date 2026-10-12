@@ -59,6 +59,8 @@ export PODGROVE_BIN="$(command -v podgrove)"
 
 If the executable is not on your PATH, run `uv tool update-shell` and open a new shell. Pip users can create a separate virtual environment and run `python -m pip install /absolute/path/to/podgrove` in it. Avoid editable installations for shared automation: source edits must not change the runtime used by other worktrees. [Release pinning and upgrades](releasing.md).
 
+When installing from source, use an up-to-date checkout of the public repository or a release tag. `uv tool install .` installs the version declared by that checkout; it does not download a newer release. Check `pyproject.toml` and `.release-please-manifest.json` if an old checkout installs an unexpected version. `podgrove --version` reports the installed package version.
+
 ### Homebrew distribution
 
 The planned install command is:

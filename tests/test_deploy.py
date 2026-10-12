@@ -1,7 +1,6 @@
 """Offline namespace-only installation and ownership fences."""
 from pathlib import Path
 import re
-from unittest.mock import Mock
 
 import pytest
 import yaml
@@ -147,6 +146,8 @@ def test_managed_pod_default_deny_never_selects_unrelated_ci_pods(mode):
 
 @pytest.mark.parametrize("mode", ["shared", "worktree"])
 def test_runtime_create_and_cleanup_leave_provisioning_marker_and_baseline(tmp_path, mode):
+    from test_namespace_only_runtime import NamespaceOnlyAPI
+
     ident = "012345abcdef"
     bootstrap = [item for values in render_bootstrap(NAMESPACE, namespace_mode=mode,
                  identity=ident if mode == "worktree" else None).values() for item in values]
@@ -155,23 +156,19 @@ def test_runtime_create_and_cleanup_leave_provisioning_marker_and_baseline(tmp_p
     runtime = manifests(NAMESPACE, ident, tmp_path, "small", 3600, namespace_mode=mode)
     assert not {(item["kind"], item["metadata"]["name"]) for item in bootstrap} & {
         (item["kind"], item["metadata"]["name"]) for item in runtime}
-    lease, = [item for item in runtime if item["kind"] == "ConfigMap"]
     kube = Kube("offline-context", NAMESPACE, namespace_mode=mode)
-    def get(kind, name=None, **kwargs):
-        assert kind == "configmap", "Cleanup may not read cluster objects"
-        return marker if name == PROVISIONING_MARKER else lease
-    kube.get = Mock(side_effect=get)
-    removed = []
-    def delete(*args, **kwargs):
-        assert args[0] == "delete" and args[1] != "namespace"
-        selector = dict(pair.split("=", 1) for pair in args[args.index("-l") + 1].split(","))
-        assert selector == {MANAGED: "podgrove", ENVIRONMENT: ident}
-        removed.extend(item for item in bootstrap + runtime if all(
-            item["metadata"].get("labels", {}).get(key) == value for key, value in selector.items()))
-    kube.call = Mock(side_effect=delete)
+    api = NamespaceOnlyAPI(mode, ident=ident, namespace=NAMESPACE, context=kube.context)
+    for item in bootstrap + runtime:
+        api.add(item)
+    retained = {key: item for key, item in api.objects.items()
+                if item["metadata"].get("labels", {}).get(ENVIRONMENT) != ident}
+    kube.call = lambda *args, **kwargs: api(kube.command(*args), **kwargs)
     kube.destroy(ident)
-    assert baseline not in removed and marker not in removed
-    assert next(item for item in runtime if item["kind"] == "NetworkPolicy") in removed
+    assert api.objects == retained
+    assert ("NetworkPolicy", baseline["metadata"]["name"]) in api.objects
+    assert ("ConfigMap", marker["metadata"]["name"]) in api.objects
+    policy = next(item for item in runtime if item["kind"] == "NetworkPolicy")
+    assert ("NetworkPolicy", policy["metadata"]["name"]) not in api.objects
 
 
 def test_optional_reaper_is_namespaced_and_uses_its_projected_cleanup_identity():

@@ -2,7 +2,7 @@ import copy
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, call
+from unittest.mock import Mock
 
 import pytest
 
@@ -28,7 +28,7 @@ def existing_controller(resources=None):
 def readiness_reads(pods, controller=None):
     controller = controller or existing_controller()
     sequence = iter(pods) if isinstance(pods, list) else None
-    def get(kind, name):
+    def get(kind, name, **kwargs):
         if kind == "statefulset":
             assert name == f"pg-{IDENT}"
             return controller
@@ -175,6 +175,21 @@ def test_readiness_accepts_same_owned_pod_once_ready(readiness_clock):
     kube.call.assert_not_called()
 
 
+def test_legacy_readiness_bounds_running_storage_with_node_and_pvc_diagnostic(readiness_clock):
+    pod = waiting_pod()
+    pod["spec"]["nodeName"] = "fixture-node"
+    pod["status"]["initContainerStatuses"] = [{"name": "storage", "state": {"running": {}}}]
+    kube = Kube("test-context", "default")
+    kube.get = readiness_reads(pod)
+    with pytest.raises(PodgroveError, match="Storage initialization timed out after 3s") as error:
+        kube.wait(IDENT, 900, init_timeout=3)
+    assert readiness_clock["now"] == 3
+    assert f"Pod default/pg-{IDENT}-0" in str(error.value)
+    assert f"PVC default/pg-{IDENT}" in str(error.value)
+    assert "node fixture-node" in str(error.value)
+    assert all(call.kwargs["timeout"] <= 3 for call in kube.get.call_args_list[2:])
+
+
 def test_readiness_waits_for_initial_controller_creation_without_creating_pod(readiness_clock):
     kube = Kube("test-context", "default")
     kube.get = readiness_reads([{}, {}, waiting_pod(phase="Running", ready=True)])
@@ -211,16 +226,14 @@ def test_readiness_requires_genuine_statefulset_owner_reference(mismatch, readin
 @pytest.mark.parametrize("labels", [{}, {MANAGED: "cluster-admin"}, {MANAGED: "podgrove"}])
 def test_default_cleanup_never_deletes_namespace_and_requires_both_resource_owner_labels(labels):
     kube = Kube("test-context", "default")
-    kube.get = Mock(side_effect=lambda kind, name: {"metadata": {"name": "default", "labels": labels}}
-                    if kind == "namespace" else {})
-    kube.call = Mock()
+    kube.get = Mock(side_effect=AssertionError("No unbounded or cluster-scoped cleanup reads"))
+    kube.call = Mock(side_effect=lambda *args, **kwargs: SimpleNamespace(
+        stdout=json.dumps({"items": []}) if "-l" in args else ""))
     kube.destroy(IDENT)
-    assert kube.call.call_args_list == [
-        call("delete", "statefulset", "-l", f"{MANAGED}=podgrove,{ENVIRONMENT}={IDENT}",
-             "--ignore-not-found", "--cascade=foreground", "--wait=true", "--timeout=120s", "--request-timeout=0", timeout=130),
-        call("delete", "pod,pvc,configmap,networkpolicy,service,poddisruptionbudget", "-l", f"{MANAGED}=podgrove,{ENVIRONMENT}={IDENT}",
-             "--ignore-not-found", "--wait=true", "--timeout=120s", timeout=130),
-    ]
+    assert all(item.args[0] == "get" for item in kube.call.call_args_list)
+    listing = next(item for item in kube.call.call_args_list if "-l" in item.args)
+    assert listing.args[listing.args.index("-l") + 1] == f"{MANAGED}=podgrove,{ENVIRONMENT}={IDENT}"
+    assert all("namespace" not in item.args for item in kube.call.call_args_list)
 
 
 @pytest.mark.parametrize("kind", ["NetworkPolicy", "PersistentVolumeClaim", "ConfigMap", "Service", "PodDisruptionBudget", "StatefulSet"])
@@ -255,12 +268,10 @@ def test_default_manifest_is_namespaced_owned_and_policy_does_not_select_foreign
 
 def test_legacy_exclusive_cleanup_always_retains_namespace():
     kube = Kube("test-context", "wt-test")
-    kube.get = Mock(return_value={})
-    kube.call = Mock()
+    kube.call = Mock(side_effect=lambda *args, **kwargs: SimpleNamespace(
+        stdout=json.dumps({"items": []}) if "-l" in args else ""))
     kube.destroy(IDENT)
-    assert [item.args[1] for item in kube.call.call_args_list] == [
-        "statefulset", "pod,pvc,configmap,networkpolicy,service,poddisruptionbudget"]
-    kube.get.assert_called_once_with("configmap", f"pg-{IDENT}")
+    assert all(item.args[0] == "get" and "namespace" not in item.args for item in kube.call.call_args_list)
 
 
 @pytest.mark.parametrize("mode", ["shared", "tainted"])
@@ -291,25 +302,22 @@ def test_missing_stream_permission_fails_before_creation(resource, verb):
                                      {MANAGED: "podgrove", ENVIRONMENT: "different-owner"}])
 def test_destroy_never_deletes_when_lease_is_foreign(labels):
     kube = Kube("test-context", "wt-test")
-    kube.get = Mock(return_value={"metadata": {"name": f"pg-{IDENT}", "namespace": "wt-test", "labels": labels}})
-    kube.call = Mock()
+    kube.call = Mock(side_effect=lambda *args, **kwargs: SimpleNamespace(stdout=json.dumps(
+        {"items": []} if "-l" in args else {"metadata": {"name": f"pg-{IDENT}", "namespace": "wt-test", "labels": labels}})))
     with pytest.raises(PodgroveError, match="foreign"):
         kube.destroy(IDENT)
-    kube.call.assert_not_called()
+    assert all(item.args[0] == "get" for item in kube.call.call_args_list)
 
 
 def test_testing_namespace_cleanup_selects_only_owned_environment():
     kube = Kube("test-context", "podgrove-testing")
-    kube.get = Mock(side_effect=lambda kind, name: {"metadata": {"name": "podgrove-testing", "labels": {
-        MANAGED: "podgrove"}}} if kind == "namespace" else {})
-    kube.call = Mock()
+    kube.call = Mock(side_effect=lambda *args, **kwargs: SimpleNamespace(
+        stdout=json.dumps({"items": []}) if "-l" in args else ""))
     kube.destroy(IDENT)
     args = kube.call.call_args.args
-    assert args[0] == "delete"
-    assert args[1] == "pod,pvc,configmap,networkpolicy,service,poddisruptionbudget"
+    assert args[0] == "get"
     assert args[args.index("-l") + 1] == f"{MANAGED}=podgrove,{ENVIRONMENT}={IDENT}"
-    assert "namespace" not in args
-    assert "--all" not in args
+    assert "namespace" not in args and "--all" not in args
 
 
 def test_existing_resource_ownership_checked_before_modification():
@@ -477,16 +485,12 @@ def test_controller_creation_race_during_admission_accepts_only_its_owned_pod():
     assert submitted["metadata"]["ownerReferences"][0]["uid"] == controller["metadata"]["uid"]
 
 
-def test_foreground_controller_failure_prevents_storage_deletion():
+def test_cleanup_inventory_failure_prevents_storage_deletion():
     kube = Kube("test-context", "default")
-    kube.get = Mock(side_effect=lambda kind, name: {"metadata": {"name": "default"}} if kind == "namespace" else {})
-    kube.call = Mock(side_effect=PodgroveError("Pod did not terminate"))
-    with pytest.raises(PodgroveError, match="did not terminate"):
+    kube.call = Mock(side_effect=PodgroveError("inventory unavailable"))
+    with pytest.raises(PodgroveError, match="inventory unavailable"):
         kube.destroy(IDENT)
-    assert kube.call.call_count == 1
-    args = kube.call.call_args.args
-    assert args[1] == "statefulset"
-    assert "--cascade=foreground" in args and "--wait=true" in args and "--force" not in args
+    assert all(item.args[0] == "get" for item in kube.call.call_args_list)
 
 
 @pytest.mark.parametrize("change", ["capacity", "class", "access", "mode", "deleting"])

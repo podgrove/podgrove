@@ -291,6 +291,9 @@ class Synchronizer:
                         "uid": info.st_uid, "gid": info.st_gid
                     }
             visit(path)
+        # Retain raw local modes for race detection while making the remote copy readable.
+        for entry in snapshot.values():
+            entry["remote_mode"] = entry["mode"] | (0o755 if entry["kind"] == "directory" else 0o644)
         return snapshot
 
     def _same_path(self, path: Path, before: os.stat_result) -> None:
@@ -550,6 +553,8 @@ class Synchronizer:
                     for path, entry in self._baseline.items():
                         if not isinstance(entry, dict) or entry.get("kind") not in ("file", "directory"):
                             raise ValueError(f"invalid baseline entry: {path}")
+                    if any("remote_mode" not in entry for entry in self._baseline.values()):
+                        self._baseline = {}
                 except (ValueError, KeyError, AttributeError, TypeError) as exc:
                     raise PodgroveError("Invalid remote sync baseline; recreate this environment") from exc
             self._started = True
@@ -577,7 +582,8 @@ class Synchronizer:
 
     @staticmethod
     def _content_equal(before: dict, after: dict) -> bool:
-        return all(before.get(key) == after.get(key) for key in ("kind", "mode", "digest", "uid", "gid"))
+        return (all(before.get(key) == after.get(key) for key in ("kind", "mode", "digest", "uid", "gid"))
+                and before["remote_mode"] == after["remote_mode"])
 
     def sync_once(self) -> int:
         """Apply local edits, additions and tracked deletions; return their count."""
@@ -622,7 +628,7 @@ class Synchronizer:
                     self._check_cancelled()
                     info = tarfile.TarInfo(f"podgrove-transfer/payload/{relative}")
                     info.type = tarfile.DIRTYPE
-                    info.mode = current[relative]["mode"]
+                    info.mode = current[relative]["remote_mode"]
                     info.uid = current[relative]["uid"]
                     info.gid = current[relative]["gid"]
                     tar.addfile(info)
@@ -661,7 +667,7 @@ class Synchronizer:
                     raise SnapshotRace(f"File changed while preparing sync; retry: {path}")
                 info = tarfile.TarInfo(f"podgrove-transfer/payload/{relative}")
                 info.size = actual.st_size
-                info.mode = entry["mode"]
+                info.mode = entry["remote_mode"]
                 info.uid = entry["uid"]
                 info.gid = entry["gid"]
                 info.mtime = actual.st_mtime
