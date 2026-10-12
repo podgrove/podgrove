@@ -2,6 +2,27 @@
 
 User-visible changes are recorded here. Release Please manages versioned entries after the first public release.
 
+## [0.4.3](https://github.com/podgrove/podgrove/compare/v0.4.2...v0.4.3) (2026-10-12)
+
+### Bug Fixes
+
+* Bound storage initialization and Kubernetes cleanup waits with `up --init-timeout` and `down --timeout`; retain diagnostics and retry state when work cannot finish. ([#13](https://github.com/podgrove/podgrove/pull/13))
+* Stream Compose build progress and report startup phases, service states, exit codes, and recent logs when startup fails. ([#13](https://github.com/podgrove/podgrove/pull/13))
+* Resync saved baselines that lack remote permission metadata so non-root services can read mirrored files, while leaving local permissions unchanged. ([#13](https://github.com/podgrove/podgrove/pull/13))
+* Report the installed distribution version from the CLI, with the source version as a fallback for uninstalled checkouts. ([#13](https://github.com/podgrove/podgrove/pull/13))
+
+### Documentation
+
+* Add generated PNG social previews and icons, with metadata and asset checks for every documentation page. ([#13](https://github.com/podgrove/podgrove/pull/13))
+* Explain startup diagnostics, initialization and cleanup timeouts, sync permissions, and source-install version selection. ([#13](https://github.com/podgrove/podgrove/pull/13))
+
+### Maintenance
+
+* Update Astro to 7.3.7, markdown-remark to 7.3.2, and Starlight to 0.42.5. ([#14](https://github.com/podgrove/podgrove/pull/14), [#15](https://github.com/podgrove/podgrove/pull/15), [#17](https://github.com/podgrove/podgrove/pull/17))
+* Update Ruff to 0.16.10 and the websockets test dependency to 17.2. ([#16](https://github.com/podgrove/podgrove/pull/16), [#18](https://github.com/podgrove/podgrove/pull/18))
+* Wait for documentation page loads before checking sidebar visibility, preventing the browser test from selecting the mobile menu during desktop navigation. ([#17](https://github.com/podgrove/podgrove/pull/17))
+* Upgrade the pinned setup-python, download-artifact, release-please, create-pull-request, and checkout GitHub Actions. ([#1](https://github.com/podgrove/podgrove/pull/1), [#2](https://github.com/podgrove/podgrove/pull/2), [#3](https://github.com/podgrove/podgrove/pull/3), [#4](https://github.com/podgrove/podgrove/pull/4), [#5](https://github.com/podgrove/podgrove/pull/5))
+
 ## [0.4.2](https://github.com/podgrove/podgrove/compare/v0.4.1...v0.4.2) (2026-10-01)
 
 
