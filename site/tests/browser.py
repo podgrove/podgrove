@@ -171,6 +171,8 @@ def run(dist: Path, output: Path):
                             start = page.locator(f'a[href="{BASE}getting-started/"]:visible').first
                             start.click()
                             expect(page).to_have_url(origin + BASE + "getting-started/")
+                            # The URL can update before the new sidebar is ready for the visibility probe.
+                            page.wait_for_load_state("load", timeout=15000)
                             configuration = page.locator(f'a[href="{BASE}configuration/"]:visible').first
                             if not configuration.count():
                                 page.get_by_role("button", name="Menu", exact=True).click()
