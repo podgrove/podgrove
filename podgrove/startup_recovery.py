@@ -9,6 +9,7 @@ import threading
 import time
 
 from .errors import PodgroveError
+from .initialization import DEFAULT_INIT_TIMEOUT, StorageInitWatch
 from .kube import ENVIRONMENT, MANAGED, Kube, engine_pod_name
 
 
@@ -39,6 +40,7 @@ def _read(kube, kind, name, ident, deadline, cancel):
     try:
         value = json.loads(result.stdout) if result.stdout.strip() else None
         if value is None:
+            _remaining(deadline, cancel)
             return None
         metadata = value["metadata"]
         labels = metadata["labels"]
@@ -72,11 +74,13 @@ def capture_anchor(kube, ident: str, timeout: float = 15, *, cancel_event=None) 
 class StartupRecovery:
     """Permit a ready owned Pod only while its controller and PVC remain unchanged."""
 
-    def __init__(self, kube, ident: str, anchor: dict, timeout: float, *, cancel_event=None):
+    def __init__(self, kube, ident: str, anchor: dict, timeout: float, *, cancel_event=None,
+                 init_timeout: float = DEFAULT_INIT_TIMEOUT):
         self.kube, self.ident = kube, ident
         self.anchor = dict(anchor)
         self.deadline = time.monotonic() + _timeout(timeout)
         self.cancel = cancel_event if cancel_event is not None else threading.Event()
+        self.initialization = StorageInitWatch(kube.namespace, init_timeout)
         expected = {"identity", "context", "namespace", "statefulset_uid", "pvc_uid", "controller_spec_sha256"}
         if (set(anchor) != expected or anchor.get("identity") != ident or anchor.get("context") != kube.context
                 or anchor.get("namespace") != kube.namespace
@@ -88,16 +92,20 @@ class StartupRecovery:
         return _remaining(self.deadline, self.cancel)
 
     def _observe(self):
-        controller = _read(self.kube, "statefulset", "pg-" + self.ident, self.ident, self.deadline, self.cancel)
-        pvc = _read(self.kube, "pvc", "pg-" + self.ident, self.ident, self.deadline, self.cancel)
+        controller = _read(self.kube, "statefulset", "pg-" + self.ident, self.ident,
+                           self.initialization.limit(self.deadline), self.cancel)
+        pvc = _read(self.kube, "pvc", "pg-" + self.ident, self.ident,
+                    self.initialization.limit(self.deadline), self.cancel)
         if (not controller or not pvc or controller["metadata"].get("deletionTimestamp")
                 or pvc["metadata"].get("deletionTimestamp")
                 or controller["metadata"]["uid"] != self.anchor["statefulset_uid"]
                 or pvc["metadata"]["uid"] != self.anchor["pvc_uid"]
                 or _digest(controller.get("spec")) != self.anchor["controller_spec_sha256"]):
             raise PodgroveError("Startup controller, storage or engine settings changed; refusing replay")
-        pod = _read(self.kube, "pod", engine_pod_name(self.ident), self.ident, self.deadline, self.cancel)
+        pod = _read(self.kube, "pod", engine_pod_name(self.ident), self.ident,
+                    self.initialization.limit(self.deadline), self.cancel)
         if not pod:
+            self.initialization.observe(None)
             return None
         Kube._validate_pod_controller(pod, controller, self.ident)
         claims = [volume["persistentVolumeClaim"].get("claimName")
@@ -105,7 +113,9 @@ class StartupRecovery:
         if claims != ["pg-" + self.ident]:
             raise PodgroveError("Replacement startup Pod does not use the original owned volume")
         if pod["metadata"].get("deletionTimestamp"):
+            self.initialization.observe(None)
             return None
+        self.initialization.observe(pod)
         status = pod.get("status", {})
         ready = status.get("phase") == "Running" and any(
             condition.get("type") == "Ready" and condition.get("status") == "True"
@@ -119,10 +129,14 @@ class StartupRecovery:
             self.remaining()
             try:
                 observed = self._observe()
+            except PodgroveError:
+                self.initialization.check()
+                raise
             except (TypeError, KeyError, AttributeError) as exc:
                 raise PodgroveError("Startup engine resource is malformed; refusing recovery") from exc
             self.remaining()
             if observed is not None and observed == previous:
                 return observed
             previous = observed
-            self.cancel.wait(min(0.25, self.remaining()))
+            deadline = self.initialization.limit(self.deadline)
+            self.cancel.wait(min(0.25, _remaining(deadline, self.cancel)))

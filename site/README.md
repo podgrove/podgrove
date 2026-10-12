@@ -29,6 +29,12 @@ uv run --no-sync python site/tests/browser.py --output artifacts/site
 
 The browser check starts its own loopback server and tests the built site. It writes screenshots and results to the chosen evidence folder, then closes its server and browser. These checks do not require Kubernetes credentials or a Docker daemon.
 
+## Link previews
+
+Every page includes absolute Open Graph and Twitter image URLs. `scripts/sharing.mjs` renders the approved logo into a 1200×630 PNG preview and PNG icons during preparation; generated images stay in `public/brand/`. `check_build.py` verifies the metadata, image dimensions and asset links for every built page. Chat services can cache an older preview until they fetch the page again.
+
+These tags apply to the documentation URL. GitHub repository links use GitHub's own social preview setting; the generated `dist/brand/share.png` can also be uploaded there by a repository administrator.
+
 ## Publish
 
 The Documentation workflow checks pull requests and deploys successful `main` builds to GitHub Pages. Only `site/dist` is uploaded. The repository's Pages source is **GitHub Actions**, and the deployment uses the `github-pages` environment. Workflow actions and npm dependencies are pinned; Dependabot proposes updates.

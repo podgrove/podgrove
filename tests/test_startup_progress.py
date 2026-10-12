@@ -53,7 +53,7 @@ model = {"services": {"app": {"environment": {"TOKEN": "unlogged-test-value"}}}}
 runtime.Compose = lambda *args: SimpleNamespace(config=config, model=lambda: model, validate=noop,
     sync_paths=lambda *_: [], command=lambda *args: ["docker", "compose", *args],
     published_ports=lambda *_: [], has_watch=lambda *_: False)
-runtime.Kube = lambda *args, **kwargs: SimpleNamespace(wait=lambda *_: block("engine"), heartbeat=noop)
+runtime.Kube = lambda *args, **kwargs: SimpleNamespace(wait=lambda *_, **kw: block("engine"), heartbeat=noop)
 api = SimpleNamespace(check=noop, close=noop, snapshot=lambda: {"verification": {"state": "verified"}})
 def api_start():
     block("docker_api")

@@ -1,7 +1,7 @@
 import copy
 import io
 import json
-from unittest.mock import Mock, call
+from unittest.mock import Mock
 
 import pytest
 
@@ -149,12 +149,19 @@ def test_default_reaper_removes_only_owned_environment_and_retains_namespace_and
         assert name == owned["metadata"]["name"]
         return owned
     kube.get = Mock(side_effect=get)
-    kube.call = Mock()
+    owned["kind"] = "ConfigMap"
+    owned["metadata"].update(uid="owned-uid", resourceVersion="1")
+    remaining = [owned]
+    def transport(*args, **kwargs):
+        if args[0] == "delete":
+            assert args[1:3] == ("--raw", "/api/v1/namespaces/default/configmaps/pg-123456abcdef")
+            assert json.loads(kwargs["input"])["preconditions"] == {"uid": "owned-uid", "resourceVersion": "1"}
+            remaining.clear()
+            return Mock(stdout="")
+        assert args[0] == "get"
+        value = {"items": remaining} if "-l" in args else (remaining[0] if remaining else None)
+        return Mock(stdout=json.dumps(value) if value is not None else "")
+    kube.call = Mock(side_effect=transport)
     assert reaper.reap(kube) == [{"identity": "123456abcdef", "reason": "idle TTL expired", "deleted": True}]
-    assert kube.call.call_args_list == [
-        call("delete", "statefulset", "-l", f"{MANAGED}=podgrove,{ENVIRONMENT}=123456abcdef",
-             "--ignore-not-found", "--cascade=foreground", "--wait=true", "--timeout=120s", "--request-timeout=0", timeout=130),
-        call("delete", "pod,pvc,configmap,networkpolicy,service,poddisruptionbudget", "-l", f"{MANAGED}=podgrove,{ENVIRONMENT}=123456abcdef",
-             "--ignore-not-found", "--wait=true", "--timeout=120s", timeout=130),
-    ]
+    assert len([call for call in kube.call.call_args_list if call.args[0] == "delete"]) == 1
     assert namespace == before

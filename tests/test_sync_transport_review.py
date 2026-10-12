@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import errno
 import hashlib
 import io
 import os
@@ -142,12 +143,55 @@ def test_cancellation_while_waiting_for_commit_kills_child_and_joins_owned_reade
 
 def test_ack_deadline_is_absolute_even_while_stderr_continues_arriving():
     script = PREAMBLE + READ_FRAME + "\nwhile True:\n sys.stderr.write('still alive\\n');sys.stderr.flush();time.sleep(.01)\n"
-    with stream(script, timeout=.15) as (connection, _):
+    with stream(script, timeout=2) as (connection, _):
         connection.ready()
+        connection.timeout = .15
         started = time.monotonic()
         with pytest.raises(PodgroveError, match="timed out"):
             connection.transfer(io.BytesIO(b"awaiting-ack"))
         assert time.monotonic() - started < 2
+
+
+@pytest.mark.parametrize("operation", ["read", "write"])
+@pytest.mark.parametrize("error_type,error_number", [(BlockingIOError, errno.EAGAIN), (InterruptedError, errno.EINTR)])
+def test_ready_pipe_retry_keeps_the_same_frame(operation, error_type, error_number, tmp_path, monkeypatch):
+    observed = tmp_path / "received"
+    script = PREAMBLE + READ_FRAME + f"""
+open({str(observed)!r},'wb').write(payload)
+emit(('ACK '+nonce+' 0000000000000001\\n').encode());time.sleep(60)
+"""
+    with stream(script, timeout=2) as (connection, _):
+        connection.ready()
+        target = connection.process.stdout if operation == "read" else connection.process.stdin
+        original = getattr(os, operation)
+        retried = []
+        def retry_once(fd, data):
+            if fd == target.fileno() and not retried:
+                retried.append(True)
+                raise error_type(error_number, "temporary pipe readiness race")
+            return original(fd, data)
+        monkeypatch.setattr(os, operation, retry_once)
+        content = bytes(range(256)) * 100
+        connection.transfer(io.BytesIO(content))
+        assert retried and observed.read_bytes() == content
+        assert connection.sequence == 2 and connection._failure is None
+
+
+def test_repeated_pipe_backpressure_does_not_extend_batch_deadline(monkeypatch):
+    with stream(PREAMBLE + "time.sleep(60)\n", timeout=2) as (connection, _):
+        connection.ready()
+        original = os.write
+        def blocked(fd, data):
+            if fd == connection.process.stdin.fileno():
+                raise BlockingIOError(errno.EAGAIN, "pipe remains full")
+            return original(fd, data)
+        monkeypatch.setattr(os, "write", blocked)
+        connection.timeout = .1
+        started = time.monotonic()
+        with pytest.raises(SyncStreamError, match="timed out"):
+            connection.transfer(io.BytesIO(b"not sent"))
+        assert time.monotonic() - started < 2
+        assert connection.sequence == 1
 
 
 def test_idle_unsolicited_ack_is_rejected_without_sending_another_frame(tmp_path):

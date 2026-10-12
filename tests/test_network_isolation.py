@@ -6,11 +6,9 @@ behavior, DNS proxy behavior, or safety against a privileged workload escape.
 """
 from __future__ import annotations
 
-import copy
 import ipaddress
 import json
 from pathlib import Path
-from unittest.mock import Mock
 
 import pytest
 
@@ -287,32 +285,25 @@ def test_ipv6_exclusions_are_not_inserted_into_an_ipv4_ipblock():
 
 @pytest.mark.parametrize("mode", ["shared", "worktree"])
 def test_actual_cleanup_retains_bootstrap_policy_and_namespace_but_removes_owned_engine_policy(mode):
+    from test_namespace_only_runtime import NamespaceOnlyAPI
+
     namespace, bootstrap, resources, _, _ = rendered(mode)
-    remaining = copy.deepcopy([*bootstrap, *resources])
-    baseline = [item for item in remaining if item["kind"] == "NetworkPolicy"
+    baseline = [item for item in bootstrap if item["kind"] == "NetworkPolicy"
                 and ENVIRONMENT not in item["metadata"].get("labels", {})]
     assert baseline
     kube = Kube("mock-context", namespace, namespace_mode=mode)
-    def get(kind, name=None, **kwargs):
-        canonical = {"configmap": "ConfigMap"}[kind]
-        return next((item for item in remaining if item["kind"] == canonical and item["metadata"]["name"] == name), {})
-    aliases = {"statefulset": "StatefulSet", "pod": "Pod", "pvc": "PersistentVolumeClaim",
-               "configmap": "ConfigMap", "networkpolicy": "NetworkPolicy", "service": "Service", "poddisruptionbudget": "PodDisruptionBudget"}
-    def delete(*args, **kwargs):
-        assert args[0] == "delete" and args[1] != "namespace"
-        assert "--all" not in args
-        labels = dict(piece.split("=", 1) for piece in args[args.index("-l") + 1].split(","))
-        kinds = {aliases[kind] for kind in args[1].split(",")}
-        remaining[:] = [item for item in remaining if not (
-            item["kind"] in kinds and matches({"matchLabels": labels}, item["metadata"].get("labels", {})))]
-    kube.get = Mock(side_effect=get)
-    kube.call = Mock(side_effect=delete)
+    api = NamespaceOnlyAPI(mode, ident=IDENT, namespace=namespace, context=kube.context)
+    for item in [*bootstrap, *resources]:
+        api.add(item)
+    retained = {key: item for key, item in api.objects.items()
+                if item["metadata"].get("labels", {}).get(ENVIRONMENT) != IDENT}
+    kube.call = lambda *args, **kwargs: api(kube.command(*args), **kwargs)
     kube.destroy(IDENT)
-    assert all(item in remaining for item in baseline)
-    assert all(item in remaining for item in bootstrap)
+    assert api.objects == retained
+    assert all((item["kind"], item["metadata"]["name"]) in api.objects for item in baseline + bootstrap)
     assert all(item["kind"] != "Namespace" for item in bootstrap)
     assert not any(item["kind"] == "NetworkPolicy" and item["metadata"].get("labels", {}).get(ENVIRONMENT) == IDENT
-                   for item in remaining)
+                   for item in api.objects.values())
 
 
 def open_policy(peer, namespaces=None):

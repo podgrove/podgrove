@@ -23,30 +23,38 @@ class NamespaceOnlyAPI:
 
     aliases = {
         "pod": "Pod", "pods": "Pod", "pods/exec": "Pod", "pods/portforward": "Pod",
-        "statefulset": "StatefulSet", "statefulsets.apps": "StatefulSet",
+        "statefulset": "StatefulSet", "statefulsets": "StatefulSet", "statefulsets.apps": "StatefulSet",
         "pvc": "PersistentVolumeClaim", "persistentvolumeclaim": "PersistentVolumeClaim",
         "persistentvolumeclaims": "PersistentVolumeClaim", "configmap": "ConfigMap", "configmaps": "ConfigMap",
         "service": "Service", "services": "Service", "networkpolicy": "NetworkPolicy",
-        "networkpolicies.networking.k8s.io": "NetworkPolicy",
-        "poddisruptionbudget": "PodDisruptionBudget", "poddisruptionbudgets.policy": "PodDisruptionBudget",
+        "networkpolicies": "NetworkPolicy", "networkpolicies.networking.k8s.io": "NetworkPolicy",
+        "poddisruptionbudget": "PodDisruptionBudget", "poddisruptionbudgets": "PodDisruptionBudget",
+        "poddisruptionbudgets.policy": "PodDisruptionBudget",
     }
 
-    def __init__(self, mode):
+    delete_paths = {
+        "pods": "/api/v1", "persistentvolumeclaims": "/api/v1", "configmaps": "/api/v1",
+        "services": "/api/v1", "statefulsets": "/apis/apps/v1",
+        "networkpolicies": "/apis/networking.k8s.io/v1", "poddisruptionbudgets": "/apis/policy/v1",
+    }
+
+    def __init__(self, mode, *, ident=IDENT, namespace=NAMESPACE, context=CONTEXT):
+        self.ident, self.namespace, self.context = ident, namespace, context
         self.calls = []
         self.objects = {}
         marker = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {
-            "name": "podgrove-bootstrap", "namespace": NAMESPACE,
+            "name": "podgrove-bootstrap", "namespace": namespace,
             "labels": {MANAGED: "podgrove", "podgrove.dev/component": "bootstrap"}},
             "data": {"version": "1", "namespace_mode": mode}}
         if mode == "worktree":
-            marker["data"]["environment"] = IDENT
+            marker["data"]["environment"] = ident
         self.add(marker)
         self.add({"apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy", "metadata": {
-            "name": "podgrove-default-deny", "namespace": NAMESPACE,
+            "name": "podgrove-default-deny", "namespace": namespace,
             "labels": {MANAGED: "podgrove", "podgrove.dev/component": "bootstrap"}},
             "spec": {"podSelector": {}, "policyTypes": ["Ingress", "Egress"], "ingress": [], "egress": []}})
         self.add({"apiVersion": "v1", "kind": "PersistentVolumeClaim", "metadata": {
-            "name": "pg-" + OTHER, "namespace": NAMESPACE,
+            "name": "pg-" + OTHER, "namespace": namespace,
             "labels": {MANAGED: "podgrove", ENVIRONMENT: OTHER}}})
 
     def add(self, item):
@@ -62,40 +70,60 @@ class NamespaceOnlyAPI:
         return cls.aliases[value.lower()]
 
     def __call__(self, command, **kwargs):
-        assert command[:6] == ["kubectl", "--context", CONTEXT, "--namespace", NAMESPACE, "--request-timeout=30s"]
+        assert command[:6] == ["kubectl", "--context", self.context, "--namespace", self.namespace,
+                               "--request-timeout=30s"]
         args = command[6:]
         assert "--all-namespaces" not in args and "-A" not in args
-        assert not any(arg.startswith(("--context", "--namespace", "--as", "--kubeconfig", "--raw")) for arg in args)
+        assert not any(arg.startswith(("--context", "--namespace", "--as", "--kubeconfig")) for arg in args)
+        assert "--raw" not in args or args[0] == "delete"
         self.calls.append((args, kwargs))
         if args[0] == "auth":
             assert args[:2] == ["auth", "can-i"] and len(args) == 4
             self.kind(args[3])
             return SimpleNamespace(returncode=0, stdout="yes", stderr="")
         if args[0] == "get":
-            kind = self.kind(args[1])
+            kinds = {self.kind(part) for part in args[1].split(",")}
             if len(args) > 2 and not args[2].startswith("-"):
+                assert len(kinds) == 1
+                kind, = kinds
                 value = self.objects.get((kind, args[2]), {})
             else:
                 wanted = dict(pair.split("=", 1) for pair in args[args.index("-l") + 1].split(",")) if "-l" in args else {}
-                value = {"items": [item for (key, _), item in self.objects.items() if key == kind and all(
+                value = {"items": [item for (key, _), item in self.objects.items() if key in kinds and all(
                     item["metadata"].get("labels", {}).get(label) == val for label, val in wanted.items())]}
             return SimpleNamespace(returncode=0, stdout=json.dumps(value), stderr="")
         if args[0] in ("create", "replace"):
             item = json.loads(kwargs["input"])
             self.kind(item["kind"])
-            assert item["metadata"]["namespace"] == NAMESPACE
+            assert item["metadata"]["namespace"] == self.namespace
             if "--dry-run=server" not in args:
-                assert item["metadata"]["labels"].get(ENVIRONMENT) == IDENT
+                assert item["metadata"]["labels"].get(ENVIRONMENT) == self.ident
                 self.add(item)
             return SimpleNamespace(returncode=0, stdout="{}", stderr="")
         assert args[0] == "delete", f"Unexpected operation: {args}"
-        kinds = {self.kind(part) for part in args[1].split(",")}
-        assert "--all" not in args
-        wanted = dict(pair.split("=", 1) for pair in args[args.index("-l") + 1].split(","))
-        assert wanted == {MANAGED: "podgrove", ENVIRONMENT: IDENT}
-        self.objects = {key: item for key, item in self.objects.items() if not (key[0] in kinds and all(
-            item["metadata"].get("labels", {}).get(label) == val for label, val in wanted.items()))}
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
+        assert len(args) == 6 and args[:2] == ["delete", "--raw"] and args[3:5] == ["-f", "-"]
+        assert args[-1].startswith("--request-timeout=") and kwargs["timeout"] > 0
+        targets = [(plural, args[2].removeprefix(prefix)) for plural, base in self.delete_paths.items()
+                   if args[2].startswith(prefix := f"{base}/namespaces/{self.namespace}/{plural}/")]
+        assert len(targets) == 1, "Raw deletion must target an allowed resource in this exact namespace"
+        plural, name = targets[0]
+        assert name and "/" not in name and "?" not in name
+        key = self.kind(plural), name
+        item = self.objects[key]
+        metadata = item["metadata"]
+        assert metadata["namespace"] == self.namespace
+        assert metadata["labels"].get(MANAGED) == "podgrove"
+        assert metadata["labels"].get(ENVIRONMENT) == self.ident
+        expected = {"apiVersion": "v1", "kind": "DeleteOptions", "preconditions": {
+            "uid": metadata["uid"], "resourceVersion": metadata["resourceVersion"]}}
+        if key[0] == "StatefulSet":
+            expected["propagationPolicy"] = "Foreground"
+        assert json.loads(kwargs["input"]) == expected
+        if key[0] in ("PersistentVolumeClaim", "ConfigMap"):
+            assert not any(kind in ("StatefulSet", "Pod") and value["metadata"].get("labels", {}).get(
+                ENVIRONMENT) == self.ident for (kind, _), value in self.objects.items())
+        del self.objects[key]
+        return SimpleNamespace(returncode=0, stdout=json.dumps({"kind": "Status", "status": "Success"}), stderr="")
 
 
 @pytest.mark.parametrize("mode", ["shared", "worktree"])
@@ -142,4 +170,4 @@ def test_legacy_cleanup_needs_no_marker_namespace_or_cluster_permissions(monkeyp
     before = deepcopy(api.objects)
     kube.destroy(IDENT)
     assert api.objects == before
-    assert [args[0] for args, _ in api.calls] == ["get", "delete", "delete"]
+    assert [args[0] for args, _ in api.calls] == ["get", "get"]

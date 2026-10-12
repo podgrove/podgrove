@@ -433,23 +433,48 @@ def test_cli_exec_uses_native_tty_only_with_all_terminal_streams(
     compose.command.assert_not_called()
 
 
-def test_discovery_timeout_cleans_helpers_after_kubectl_leader_exits(tmp_path):
+def test_discovery_timeout_cleans_helpers_after_kubectl_leader_exits(tmp_path, monkeypatch):
     import os
     import signal
     marker = tmp_path / "auth-helper-pid"
-    started = time.monotonic()
+    command = [sys.executable, "-c",
+               "import os,pathlib,sys,time;time.sleep(.4);pid=os.fork();"
+               "os._exit(0) if pid else None;"
+               "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()));time.sleep(60)", str(marker)]
+    original = subprocess.Popen
+    children, started = [], []
+
+    def launch(args, **kwargs):
+        process = original(args, **kwargs)
+        if args == command:
+            children.append(process)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    ready = marker.read_text().strip().isdigit()
+                except FileNotFoundError:
+                    ready = False
+                if ready and process.poll() is not None:
+                    assert process.returncode == 0
+                    started.append(time.monotonic())
+                    break
+                time.sleep(.01)
+            else:
+                pytest.fail("Auth-helper fixture did not start and outlive its leader")
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", launch)
     try:
         with pytest.raises(PodgroveError, match="timed out"):
-            transport._read([sys.executable, "-c",
-                             "import os,pathlib,sys,time;pid=os.fork();"
-                             "os._exit(0) if pid else None;"
-                             "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()));time.sleep(60)", str(marker)],
-                            timeout=.3)
-        assert time.monotonic() - started < 2
+            transport._read(command, timeout=.3)
+        assert time.monotonic() - started[0] < 2
         helper = int(marker.read_text())
         status = subprocess.run(["ps", "-o", "stat=", "-p", str(helper)], capture_output=True, text=True, timeout=2)
         assert status.stdout.strip() in ("", "Z", "Z+")
     finally:
+        for child in children:
+            transport._stop(child)
+            child.stdout.close()
         if marker.exists():
             try:
                 os.kill(int(marker.read_text()), signal.SIGKILL)

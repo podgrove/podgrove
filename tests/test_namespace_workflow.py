@@ -88,7 +88,10 @@ class MemoryCluster:
         self.calls.append((kube.namespace, args))
         verb = args[0]
         assert "--all-namespaces" not in args and "-A" not in args
-        assert not any(arg.startswith(("--context", "--namespace", "--as", "--kubeconfig", "--raw")) for arg in args)
+        assert not any(arg.startswith(("--context", "--namespace", "--as", "--kubeconfig")) for arg in args)
+        if args[-1].startswith("--request-timeout="):
+            assert kwargs["timeout"] > 0
+            args = args[:-1]
         def result(value="", code=0):
             return SimpleNamespace(stdout=value, stderr="", returncode=code)
         if verb == "auth":
@@ -98,20 +101,29 @@ class MemoryCluster:
             permitted = self.allowed(kube.namespace, args[2], resource, group)
             return result("yes\n" if permitted else "no\n", 0 if permitted else 1)
         if verb == "get":
-            assert args[1].lower() in ALIASES, "No cluster-scoped or unreviewed resource reads"
-            kind = ALIASES[args[1].lower()]
+            aliases = args[1].lower().split(",")
+            assert all(alias in ALIASES for alias in aliases), "No cluster-scoped or unreviewed resource reads"
+            kinds = {ALIASES[alias] for alias in aliases}
             name = args[2]
-            resource, group = RESOURCES[kind]
             if name == "-l":
-                selector = {MANAGED: "podgrove", "podgrove.dev/component": "connection"}
-                assert kind == "NetworkPolicy" and args[2:] == (
-                    "-l", f"{MANAGED}=podgrove,podgrove.dev/component=connection", "-o", "json")
-                assert self.allowed(kube.namespace, "list", resource, group), "Missing generated LIST grant: NetworkPolicy"
+                selector = dict(value.split("=", 1) for value in args[3].split(","))
+                if "podgrove.dev/component" in selector:
+                    assert kinds == {"NetworkPolicy"}
+                    assert selector == {MANAGED: "podgrove", "podgrove.dev/component": "connection"}
+                else:
+                    assert kinds == set(RESOURCES)
+                    assert set(selector) == {MANAGED, ENVIRONMENT} and selector[MANAGED] == "podgrove"
+                assert args[4:] == ("-o", "json")
+                for kind in kinds:
+                    resource, group = RESOURCES[kind]
+                    assert self.allowed(kube.namespace, "list", resource, group), f"Missing generated LIST grant: {kind}"
                 items = [body for (current_kind, namespace, _), body in self.objects.items()
-                         if current_kind == kind and namespace == kube.namespace
+                         if current_kind in kinds and namespace == kube.namespace
                          and all(body["metadata"].get("labels", {}).get(key) == value for key, value in selector.items())]
                 return result(json.dumps({"apiVersion": "v1", "kind": "List", "items": items}))
-            assert not name.startswith("-")
+            assert len(kinds) == 1 and not name.startswith("-")
+            kind = kinds.pop()
+            resource, group = RESOURCES[kind]
             assert self.allowed(kube.namespace, "get", resource, group, name), f"Missing generated GET grant: {kind}/{name}"
             body = self.objects.get((kind, kube.namespace, name))
             return result(json.dumps(body) if body else "")
@@ -132,27 +144,29 @@ class MemoryCluster:
                 self.add(engine_pod_manifest(self.objects[self.key(body)]))
             return result()
         assert verb == "delete", f"Unexpected transport operation {args}"
-        assert "-l" in args and "namespace" not in args, "Normal cleanup must retain platform namespaces"
-        selector = dict(part.split("=", 1) for part in args[args.index("-l") + 1].split(","))
-        assert set(selector) == {MANAGED, ENVIRONMENT} and selector[MANAGED] == "podgrove"
-        kinds = {ALIASES[alias] for alias in args[1].split(",")}
-        for kind in kinds:
-            assert kind not in CLUSTER_KINDS
-            resource, group = RESOURCES[kind]
-            assert self.allowed(kube.namespace, "delete", resource, group)
-        doomed = [key for key, body in self.objects.items()
-                  if key[0] in kinds and key[1] == kube.namespace
-                  and all(body["metadata"].get("labels", {}).get(k) == v for k, v in selector.items())]
-        for key in doomed:
-            body = self.objects.pop(key)
-            self.mutations.append((kube.namespace, "delete", key[0], key[2]))
-            if key[0] == "StatefulSet":
-                assert "--cascade=foreground" in args
-                for child, pod in list(self.objects.items()):
-                    if child[0] == "Pod" and child[1] == kube.namespace and any(
-                        owner.get("uid") == body["metadata"]["uid"] for owner in pod["metadata"].get("ownerReferences", [])
-                    ):
-                        del self.objects[child]
+        assert args[1] == "--raw" and args[3:] == ("-f", "-")
+        parts = args[2].split("/")
+        assert parts[-4:-2] == ["namespaces", kube.namespace]
+        kind = ALIASES[parts[-2]]
+        resource, group = RESOURCES[kind]
+        expected_prefix = f"/apis/{group}/v1" if group else "/api/v1"
+        assert args[2] == f"{expected_prefix}/namespaces/{kube.namespace}/{resource}/{parts[-1]}"
+        assert self.allowed(kube.namespace, "delete", resource, group)
+        key = kind, kube.namespace, parts[-1]
+        body = self.objects[key]
+        options = json.loads(kwargs["input"])
+        assert options["preconditions"] == {field: body["metadata"][field] for field in ("uid", "resourceVersion")}
+        assert body["metadata"]["labels"][MANAGED] == "podgrove"
+        assert "gracePeriodSeconds" not in options and "finalizers" not in options
+        del self.objects[key]
+        self.mutations.append((kube.namespace, "delete", key[0], key[2]))
+        if kind == "StatefulSet":
+            assert options["propagationPolicy"] == "Foreground"
+            for child, pod in list(self.objects.items()):
+                if child[0] == "Pod" and child[1] == kube.namespace and any(
+                    owner.get("uid") == body["metadata"]["uid"] for owner in pod["metadata"].get("ownerReferences", [])
+                ):
+                    del self.objects[child]
         return result()
 
 
