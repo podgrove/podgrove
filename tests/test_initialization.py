@@ -102,6 +102,29 @@ def test_crash_loop_keeps_original_initializer_deadline(clock):
         watch.observe(value)
 
 
+def test_crash_loop_timeout_names_the_failed_attempt(clock):
+    watch, value = StorageInitWatch("fixture", 5), pod()
+    watch.observe(value)
+    status = value["status"]["initContainerStatuses"][0]
+    status["lastState"] = {"terminated": {"exitCode": 1, "startedAt": "1970-01-01T00:18:20Z",
+                                          "message": "mkdir: can't create directory '/data/worktree': I/O error\n"}}
+    status["state"] = {"waiting": {"reason": "CrashLoopBackOff"}}
+    clock[0] = 105
+    with pytest.raises(StorageInitTimeout) as error:
+        watch.observe(value)
+    assert ("storage initializer waiting (CrashLoopBackOff); last attempt exited 1: "
+            "mkdir: can't create directory '/data/worktree': I/O error.") in str(error.value)
+
+
+def test_failed_attempt_without_message_names_its_reason(clock):
+    watch, value = StorageInitWatch("fixture", 5), pod()
+    value["status"]["initContainerStatuses"][0]["state"] = {"terminated": {
+        "exitCode": 137, "reason": "OOMKilled", "startedAt": "1970-01-01T00:18:20Z"}}
+    clock[0] = 105
+    with pytest.raises(StorageInitTimeout, match="last attempt exited 137: OOMKilled"):
+        watch.observe(value)
+
+
 def test_verified_new_pod_gets_its_own_init_budget(clock):
     watch, original = StorageInitWatch("fixture", 5), pod()
     watch.observe(original)
