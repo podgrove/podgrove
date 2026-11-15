@@ -1,7 +1,7 @@
 """Podgrove: one isolated Docker engine per working directory."""
 from importlib import metadata
 
-__version__ = "0.4.3"
+__version__ = "0.4.4"
 
 
 def package_version() -> str:

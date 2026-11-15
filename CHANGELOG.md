@@ -2,6 +2,13 @@
 
 User-visible changes are recorded here. Release Please manages versioned entries after the first public release.
 
+## [0.4.4](https://github.com/podgrove/podgrove/compare/v0.4.3...v0.4.4) (2026-11-15)
+
+
+### Bug Fixes
+
+* name the failed storage initializer attempt when its deadline expires ([#34](https://github.com/podgrove/podgrove/issues/34)) ([1564d44](https://github.com/podgrove/podgrove/commit/1564d4413a5f1bd807286f77b8fff56e6e0c2ebf))
+
 ## [0.4.3](https://github.com/podgrove/podgrove/compare/v0.4.2...v0.4.3) (2026-10-12)
 
 ### Bug Fixes
