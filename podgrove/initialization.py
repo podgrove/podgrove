@@ -67,6 +67,13 @@ class StorageInitWatch:
         self.context = (f"Pod {self.namespace}/{metadata['name']}; node {spec.get('nodeName', 'unassigned')}; "
                         f"PVC {', '.join(self.namespace + '/' + name for name in claims) or 'unknown'}; "
                         f"storage initializer {next(iter(state), 'unknown')}")
+        if reason := state.get("waiting", {}).get("reason"):
+            self.context += f" ({reason})"
+        # The kubelet keeps the failed attempt's log tail as its message (FallbackToLogsOnError).
+        failed = state.get("terminated") or storage.get("lastState", {}).get("terminated") or {}
+        if failed.get("exitCode") not in (None, 0):
+            detail = str(failed.get("message") or failed.get("reason") or "no message").strip()[-300:]
+            self.context += f"; last attempt exited {failed['exitCode']}: {detail}"
         self.contexts[uid] = self.context
         self.check()
 
